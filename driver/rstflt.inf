@@ -1,0 +1,42 @@
+;
+; RstFlt.inf — Storage upper filter driver
+; Registrado como Intel(R) RST Storage Filter
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = DiskDrive
+ClassGuid   = {4d36e967-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = rstflt.cat
+DriverVer   = 08/20/2026,3.3.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %windir%\System32\drivers
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc% = RstFlt_Install
+
+[RstFlt_Install]
+CopyFiles = RstFlt_CopyFiles
+
+[RstFlt_CopyFiles]
+rstflt.sys
+
+[RstFlt_Install.Services]
+AddService = RstFlt,,RstFlt_Service
+
+[RstFlt_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 0               ; SERVICE_BOOT_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\rstflt.sys
+
+[Strings]
+ManufacturerName = "Intel Corporation"
+DeviceDesc       = "Intel(R) RST Storage Filter"
+ServiceDesc      = "Intel(R) Rapid Storage Technology Filter"

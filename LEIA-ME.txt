@@ -1,0 +1,170 @@
+========================================================
+  HW TOOLKIT v3.1
+  Sistema centralizado de profile + storage filter
+========================================================
+
+OBJETIVO:
+  Toolkit completo de spoofing de identificadores de hardware.
+  Todos os componentes leem de um profile centralizado para
+  garantir consistencia entre si.
+
+========================================================
+  ESTRUTURA
+========================================================
+
+HWToolkit/
+  LEIA-ME.txt               <- Este arquivo
+  00-gerar-profile.bat      <- Gera profile de hardware (1x)
+  01-instalar-ferramentas.bat <- VS Build Tools + WDK (1x)
+  02-compilar-driver.bat     <- Compila rstflt.sys
+  03-instalar-driver.bat     <- Instala + registra driver
+  04-aplicar-hwid.bat        <- GUIDs, MACs, Product ID, EDID
+  05-aplicar-smbios.bat      <- UUID + strings SMBIOS
+  06-verificar.bat           <- Verifica tudo
+  07-limpar-traces.bat       <- Limpeza de 12 categorias
+  08-desinstalar-driver.bat  <- Remove o driver
+  09-recuperar-boot.bat      <- Emergencia (WinRE)
+  scripts/
+    hwprofile.ps1            <- Gerador de profile
+    change-hwid-easy.ps1     <- HWID + MAC + EDID changer
+    spoof-uuid.ps1           <- SMBIOS blob modifier
+  driver/
+    rstflt.c                 <- Driver v3.1 (source)
+    rstflt.inf               <- INF do driver
+    makefile.mak             <- Makefile para compilacao
+
+Profile:
+  C:\ProgramData\.hwcfg\profile.json
+
+========================================================
+  ORDEM DE EXECUCAO
+========================================================
+
+  PRIMEIRA VEZ (setup completo):
+    00 -> 01 -> reboot -> 02 -> 03 -> reboot
+    -> 04 -> 05 -> 06 -> 07
+
+  DEPOIS (quando quiser novos IDs):
+    00 -> 02 -> 03 -> reboot -> 04 -> 05 -> 06 -> 07
+
+  EMERGENCIA (Windows nao inicia):
+    WinRE > Prompt de Comando > 09
+
+========================================================
+  O QUE CADA PASSO FAZ
+========================================================
+
+  00 - GERAR PROFILE
+       Detecta CPU, seleciona board compativel, gera
+       todos os IDs de uma vez. Salva em profile.json.
+       Roda 1x (ou quando quiser IDs novos).
+
+  01 - INSTALAR FERRAMENTAS
+       VS 2022 Build Tools + WDK via winget.
+       So precisa rodar 1x. Reboot depois.
+
+  02 - COMPILAR DRIVER
+       Compila rstflt.c -> rstflt.sys via nmake.
+
+  03 - INSTALAR DRIVER
+       Copia .sys, cria servico boot-start, registra
+       como upper filter de DiskDrive, escreve seed.
+       Reboot obrigatorio.
+
+  04 - APLICAR HWID
+       Altera Machine GUID, SQM, Product ID, MACs
+       (com OUI real), e EDID do monitor (bytes 12-15).
+       Tudo lido do profile.
+
+  05 - APLICAR SMBIOS
+       Modifica blob SMBIOS no registro (Types 1/2/3):
+       UUID, Manufacturer, Product, Serial, Version.
+       Opcao de instalar task agendada para persistir.
+
+  06 - VERIFICAR
+       Mostra todos os IDs atuais + roda validacao
+       do profile (fabricantes, socket, UUID, MACs).
+
+  07 - LIMPAR TRACES
+       12 etapas: processos, arquivos, registro HKCU/HKLM,
+       UserAssist ROT13, AppCompat, Jump Lists, Prefetch,
+       BAM/SRUM/ShimCache, DNS, GameConfigStore, Event Logs.
+
+  08 - DESINSTALAR DRIVER
+       Remove servico, restaura UpperFilters, deleta .sys.
+
+  09 - RECUPERAR BOOT
+       Para WinRE. Carrega registry offline, remove driver
+       de ambos ControlSets, restaura UpperFilters.
+
+========================================================
+  COBERTURA DE FINGERPRINT
+========================================================
+
+  Surface               Componente       Metodo
+  -------------------   --------------   ----------------------
+  Disk serial (ATA)     Driver RstFlt    IOCTL intercept (STORAGE_QUERY,
+                                          SMART IDENTIFY, ATA_PASS_THROUGH,
+                                          ATA_PASS_THROUGH_DIRECT)
+  Disk serial (NVMe)    Driver RstFlt    STORAGE_QUERY + STORAGE_PROTOCOL_
+                                          COMMAND (Identify Controller)
+  SMBIOS UUID           spoof-uuid.ps1   Rebuild + cache no driver
+  SMBIOS strings        spoof-uuid.ps1   Types 1/2/3 completos
+  SMBIOS boot replay    Driver RstFlt    DriverEntry copia blob cacheado
+                                          para mssmbios\Data\SMBiosData
+                                          antes de winmgmt/anti-cheat
+  Machine GUID          change-hwid      Registry
+  SQM Machine ID        change-hwid      Registry
+  Product ID            change-hwid      Registry (formato OEM)
+  MAC address           change-hwid      Registry (OUI real)
+  EDID monitor serial   change-hwid      Registry (bytes 12-15)
+  GameConfigStore       limpar-traces    Registry delete
+  Event Logs            limpar-traces    wevtutil cl (6 logs)
+  BAM/DAM               limpar-traces    Registry values
+  SRUM                  limpar-traces    DB delete
+  ShimCache             limpar-traces    Registry delete
+  Prefetch              limpar-traces    File delete
+  UserAssist            limpar-traces    ROT13 decode + delete
+
+========================================================
+  LIMITACOES CONHECIDAS
+========================================================
+
+  - Test signing mode: anti-cheats kernel-level detectam
+    a CI policy. Sem DSE bypass, o watermark fica visivel.
+
+  - NVMe Identify Namespace (CNS=0x00) e Namespace Identification
+    Descriptor List (CNS=0x03) nao sao spoofados. Contem NGUID/EUI64
+    que sao identificadores por-namespace, raramente usados por
+    anti-cheat de jogo. Apenas Identify Controller (CNS=0x01, o
+    campo Serial Number) e reescrito.
+
+  - GPU Device ID nao esta coberto (filtro PCI arriscado,
+    pode causar tela preta com driver NVIDIA).
+
+  - EDID spoof so altera bytes 12-15 (serial de fabricacao).
+    Bytes do descriptor block (offset 0x48+) nao sao tocados.
+    Suficiente para a maioria dos anti-cheats.
+
+  - Amcache.hve esta locked pelo kernel. Limpar requer
+    boot no WinRE.
+
+  - Hostname/ComputerName nao e alterado automaticamente.
+    Se necessario, mude via:
+    Rename-Computer -NewName "DESKTOP-XXXXXXX" -Restart
+
+========================================================
+  REQUISITOS
+========================================================
+
+  - Windows 10/11 x64
+  - Conta de administrador
+  - Secure Boot DESABILITADO na BIOS
+  - ~10 GB livres (para VS Build Tools + WDK)
+
+========================================================
+
+
+
+EXECUTAR SCRIPTS NO POWERSHELL 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass

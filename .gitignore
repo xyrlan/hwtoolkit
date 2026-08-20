@@ -1,0 +1,40 @@
+# ==========================================================
+#  HW Toolkit - .gitignore
+# ==========================================================
+
+# --- Build artifacts do driver ---
+driver/*.sys
+driver/*.obj
+driver/*.pdb
+driver/*.ilk
+driver/*.exp
+driver/*.lib
+driver/*.cat
+driver/rstflt.res
+
+# --- Backups / arquivos temporarios ---
+*.bak
+*~
+*.tmp
+*.orig
+
+# --- Windows shell metadata ---
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Editores ---
+.vscode/
+.vs/
+*.suo
+*.user
+.idea/
+
+# --- Diretorios NAO-toolkit presentes no projeto local ---
+# (mantidos localmente pra teu uso mas fora do repo publico)
+linuxmint/
+setup-format/
+
+# --- Snapshots / dados sensiveis locais ---
+pre-boot-snapshot.txt
+*.local.json
