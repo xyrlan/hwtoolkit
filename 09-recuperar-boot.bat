@@ -43,7 +43,8 @@ powershell -ExecutionPolicy Bypass -Command ^
   "$orig = $null;" ^
   "if ($swOk) { try { $orig = (Get-ItemProperty -Path 'HKLM:\OFFSW\HWToolkit' -Name OrigUpperFilters -ErrorAction Stop).OrigUpperFilters } catch {} }" ^
   "foreach ($cs in @('ControlSet001','ControlSet002')) {" ^
-  "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\RstFlt\" -f $cs) -Recurse -Force -ErrorAction SilentlyContinue;" ^
+  "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\RstFlt\" -f $cs)     -Recurse -Force -ErrorAction SilentlyContinue;" ^
+  "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\VolFlt\" -f $cs)     -Recurse -Force -ErrorAction SilentlyContinue;" ^
   "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\DiskFilter\" -f $cs) -Recurse -Force -ErrorAction SilentlyContinue;" ^
   "  $classKey = \"HKLM:\OFFSYS\{0}\Control\Class\{1}\" -f $cs, $classGuid;" ^
   "  if ($orig) {" ^
@@ -59,6 +60,16 @@ powershell -ExecutionPolicy Bypass -Command ^
   "    Set-ItemProperty -Path $classKey -Name UpperFilters -Value $clean -Type MultiString;" ^
   "    Write-Host (\"[+] $cs UpperFilters limpo (sem backup): $($clean -join ', ')\");" ^
   "  }" ^
+  "  # v3.4: restaurar SMBiosData original se o driver salvou backup" ^
+  "  $paramsKey = \"HKLM:\OFFSYS\{0}\Services\RstFlt\Parameters\" -f $cs;" ^
+  "  $mssmbKey  = \"HKLM:\OFFSYS\{0}\Services\mssmbios\Data\"     -f $cs;" ^
+  "  try {" ^
+  "    $backup = (Get-ItemProperty -Path $paramsKey -Name OrigSmbiosData -ErrorAction Stop).OrigSmbiosData;" ^
+  "    if ($backup -and $backup.Length -gt 32) {" ^
+  "      Set-ItemProperty -Path $mssmbKey -Name SMBiosData -Value $backup -Type Binary;" ^
+  "      Write-Host (\"[+] $cs SMBiosData restaurado do backup ($($backup.Length) bytes)\");" ^
+  "    }" ^
+  "  } catch {}" ^
   "}" ^
   "if ($swOk) { Remove-ItemProperty -Path 'HKLM:\OFFSW\HWToolkit' -Name OrigUpperFilters -ErrorAction SilentlyContinue }" ^
   "[gc]::Collect(); Start-Sleep -Milliseconds 300;" ^
@@ -66,8 +77,9 @@ powershell -ExecutionPolicy Bypass -Command ^
   "if ($swOk) { & reg unload HKLM\OFFSW *>$null }"
 
 echo [*] Removendo arquivos do driver...
-del /f "%WINDRV%\Windows\System32\drivers\rstflt.sys" 2>nul
-del /f "%WINDRV%\Windows\System32\drivers\diskfilter.sys" 2>nul
+del /f "%WINDRV%\Windows\System32\drivers\rstflt.sys"      2>nul
+del /f "%WINDRV%\Windows\System32\drivers\volflt.sys"      2>nul
+del /f "%WINDRV%\Windows\System32\drivers\diskfilter.sys"  2>nul
 
 echo.
 echo ========================================================

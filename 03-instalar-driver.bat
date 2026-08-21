@@ -116,14 +116,26 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-rem --- Criar servico (BOOT_START) ---
-echo [*] Criando servico RstFlt (boot start)...
-sc create RstFlt type= kernel start= boot error= normal binPath= "%SystemRoot%\System32\drivers\rstflt.sys" DisplayName= "Intel(R) RST Storage Filter"
+rem --- Criar servico (SYSTEM_START) ---
+rem  v3.4: baixado de boot para system. Se DriverEntry/AddDevice
+rem  quebrar, o Windows ainda sobe (o driver simplesmente nao carrega
+rem  nesta sessao) em vez de brickar o boot como aconteceu em v3.3.
+rem  Filtragem de IOCTLs de userland (WMI, ferramentas de disco,
+rem  anti-cheat rodando pos-boot) segue funcionando com system-start.
+rem  Suba para start= boot APENAS depois do driver estar comprovadamente
+rem  estavel em uma serie de reboots.
+echo [*] Criando servico RstFlt (system start)...
+sc create RstFlt type= kernel start= system error= normal binPath= "%SystemRoot%\System32\drivers\rstflt.sys" DisplayName= "Intel(R) RST Storage Filter"
 if %errorlevel% neq 0 (
     echo [!] ERRO ao criar servico!
     pause
     goto :eof
 )
+
+rem --- v3.4: garantir que SMBIOS replay em kernel NAO herda estado de
+rem     um install anterior. O opt-in flag agora e explicito e default
+rem     off. spoof-uuid.ps1 seta este flag em 1 depois de validar via WMI.
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters" /v EnableSmbiosReplay /t REG_DWORD /d 0 /f >nul 2>&1
 
 rem --- Definir grupo de carga ---
 reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt" /v Group /t REG_SZ /d "Filter" /f >nul

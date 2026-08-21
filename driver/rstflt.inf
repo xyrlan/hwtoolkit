@@ -9,7 +9,7 @@ Class       = DiskDrive
 ClassGuid   = {4d36e967-e325-11ce-bfc1-08002be10318}
 Provider    = %ManufacturerName%
 CatalogFile = rstflt.cat
-DriverVer   = 08/20/2026,3.3.0.0
+DriverVer   = 08/20/2026,3.5.0.0
 
 [DestinationDirs]
 DefaultDestDir = 12 ; %windir%\System32\drivers
@@ -32,7 +32,10 @@ AddService = RstFlt,,RstFlt_Service
 [RstFlt_Service]
 DisplayName    = %ServiceDesc%
 ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
-StartType      = 0               ; SERVICE_BOOT_START
+StartType      = 1               ; SERVICE_SYSTEM_START (baixado de 0/BOOT_START em v3.4:
+                                 ;  se DriverEntry/AddDevice explodir, boot ainda sobe.
+                                 ;  Suficiente para filtrar IOCTLs de userland; upar
+                                 ;  para 0 só quando o driver estiver comprovadamente estável.)
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\rstflt.sys
 

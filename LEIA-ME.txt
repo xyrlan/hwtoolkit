@@ -1,6 +1,6 @@
 ========================================================
-  HW TOOLKIT v3.1
-  Sistema centralizado de profile + storage filter
+  HW TOOLKIT v3.4 + VolFlt v1.0
+  Sistema centralizado de profile + storage + volume filters
 ========================================================
 
 OBJETIVO:
@@ -16,22 +16,25 @@ HWToolkit/
   LEIA-ME.txt               <- Este arquivo
   00-gerar-profile.bat      <- Gera profile de hardware (1x)
   01-instalar-ferramentas.bat <- VS Build Tools + WDK (1x)
-  02-compilar-driver.bat     <- Compila rstflt.sys
-  03-instalar-driver.bat     <- Instala + registra driver
+  02-compilar-driver.bat     <- Compila rstflt.sys + volflt.sys
+  03-instalar-driver.bat     <- Instala + registra rstflt (storage)
+  03b-instalar-volflt.bat    <- Instala + carrega volflt (VSN)
+  pre-test-checklist.bat     <- Verifier + dump + estado driver (check/arm/disarm)
   04-aplicar-hwid.bat        <- GUIDs, MACs, Product ID, EDID
-  05-aplicar-smbios.bat      <- UUID + strings SMBIOS
+  05-aplicar-smbios.bat      <- UUID + strings SMBIOS (Types 1/2/3/4/11)
   06-verificar.bat           <- Verifica tudo
   07-limpar-traces.bat       <- Limpeza de 12 categorias
-  08-desinstalar-driver.bat  <- Remove o driver
+  08-desinstalar-driver.bat  <- Remove ambos os drivers
   09-recuperar-boot.bat      <- Emergencia (WinRE)
   scripts/
-    hwprofile.ps1            <- Gerador de profile
+    hwprofile.ps1            <- Gerador de profile (v4 schema)
     change-hwid-easy.ps1     <- HWID + MAC + EDID changer
     spoof-uuid.ps1           <- SMBIOS blob modifier
   driver/
-    rstflt.c                 <- Driver v3.1 (source)
-    rstflt.inf               <- INF do driver
-    makefile.mak             <- Makefile para compilacao
+    rstflt.c                 <- Storage filter v3.4 (source)
+    rstflt.inf               <- INF do storage filter
+    volflt.c                 <- Volume-serial minifilter v1.0
+    makefile.mak             <- Makefile para ambos
 
 Profile:
   C:\ProgramData\.hwcfg\profile.json
@@ -42,10 +45,10 @@ Profile:
 
   PRIMEIRA VEZ (setup completo):
     00 -> 01 -> reboot -> 02 -> 03 -> reboot
-    -> 04 -> 05 -> 06 -> 07
+    -> 03b -> 04 -> 05 -> 06 -> 07
 
   DEPOIS (quando quiser novos IDs):
-    00 -> 02 -> 03 -> reboot -> 04 -> 05 -> 06 -> 07
+    00 -> 02 -> 03 -> reboot -> 03b -> 04 -> 05 -> 06 -> 07
 
   EMERGENCIA (Windows nao inicia):
     WinRE > Prompt de Comando > 09
@@ -108,8 +111,13 @@ Profile:
                                           ATA_PASS_THROUGH_DIRECT)
   Disk serial (NVMe)    Driver RstFlt    STORAGE_QUERY + STORAGE_PROTOCOL_
                                           COMMAND (Identify Controller)
+  Volume Serial Number  Driver VolFlt    Minifilter post-callback em
+   (VSN das particoes)                    IRP_MJ_QUERY_VOLUME_INFORMATION
+                                          (FileFsVolumeInformation)
   SMBIOS UUID           spoof-uuid.ps1   Rebuild + cache no driver
-  SMBIOS strings        spoof-uuid.ps1   Types 1/2/3 completos
+  SMBIOS strings        spoof-uuid.ps1   Types 1/2/3 completos + Type 3 SKU
+                                          + Type 4 (proc strings) + Type 11
+                                          (OEM Strings). CPUID nao tocado.
   SMBIOS boot replay    Driver RstFlt    DriverEntry copia blob cacheado
                                           para mssmbios\Data\SMBiosData
                                           antes de winmgmt/anti-cheat

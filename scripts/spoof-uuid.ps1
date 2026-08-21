@@ -13,7 +13,11 @@
 
 param(
     [switch]$InstallTask,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # v3.4: por padrao setamos EnableSmbiosReplay=1 no driver DEPOIS de
+    # verificar via WMI. -DisableKernelReplay pula esse passo (util para
+    # depurar boot loop suspeito de vir do replay em kernel).
+    [switch]$DisableKernelReplay
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,12 +42,23 @@ if ($Uninstall) {
     Unregister-ScheduledTask -TaskName "SpoofUUID" -Confirm:$false -ErrorAction SilentlyContinue
     Write-OK "Tarefa agendada removida"
 
-    # Limpar blob cacheado do driver (replay em kernel)
+    # Limpar blob cacheado + flag opt-in do driver (replay em kernel)
     $driverParams = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
     if (Test-Path $driverParams) {
         try {
-            Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob" -ErrorAction SilentlyContinue
-            Write-OK "SmbiosBlob removido do driver (sem mais replay em kernel)"
+            Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob"          -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay"  -ErrorAction SilentlyContinue
+            Write-OK "SmbiosBlob + opt-in flag removidos (sem mais replay em kernel)"
+        } catch {}
+
+        # v3.4: restaurar SMBiosData original se o driver salvou backup
+        try {
+            $orig = Get-ItemProperty -Path $driverParams -Name "OrigSmbiosData" -ErrorAction Stop
+            if ($orig.OrigSmbiosData -and $orig.OrigSmbiosData.Length -gt 32) {
+                Set-ItemProperty -Path "HKLM:\$keyPath" -Name "SMBiosData" -Value $orig.OrigSmbiosData -Type Binary
+                Write-OK "SMBiosData restaurado do backup ($($orig.OrigSmbiosData.Length) bytes)"
+                Remove-ItemProperty -Path $driverParams -Name "OrigSmbiosData" -ErrorAction SilentlyContinue
+            }
         } catch {}
     }
     Write-Host "  Reinicie o PC para restaurar os valores originais.`n"
@@ -336,7 +351,13 @@ $type3 = $structures | Where-Object { $_.Type -eq 3 } | Select-Object -First 1
 if ($type3) {
     Write-Info "Modificando Type 3 (Chassis)..."
 
-    # [4]=Mfr(str), [5]=ChassisType(byte!), [6]=Version(str), [7]=Serial(str), [8]=AssetTag(str)
+    # [4]=Mfr(str), [5]=ChassisType(byte!), [6]=Version(str), [7]=Serial(str),
+    # [8]=AssetTag(str). Layout depois disso e variavel (bootup state, thermal
+    # state, security state, oem defined 4 bytes, height, num power cords,
+    # contained element count, contained elems...). SKUNumber e o ultimo
+    # string index e a distancia depende de contained_element_count *
+    # contained_element_record_length. Formula: offset 0x11 + n*m onde
+    # n=Formatted[0x13] e m=Formatted[0x14].
     Set-StructureString $type3 $type3.Formatted[4] $smb.chassis_manufacturer
 
     # Chassis Type e um BYTE, nao string index!
@@ -348,12 +369,89 @@ if ($type3) {
         Set-StructureString $type3 $type3.Formatted[8] $smb.chassis_asset_tag
     }
 
+    # SKUNumber (Type 3, spec 2.7+): offset 0x11 + contained*len.
+    # So mexer se o SMBIOS local expor esse campo (Length grande o bastante).
+    if ($smb.PSObject.Properties.Name -contains "chassis_sku" -and $smb.chassis_sku) {
+        $containedN   = if ($type3.Length -ge 0x14) { [int]$type3.Formatted[0x13] } else { 0 }
+        $containedLen = if ($type3.Length -ge 0x15) { [int]$type3.Formatted[0x14] } else { 0 }
+        $skuOff       = 0x11 + ($containedN * $containedLen)
+        if ($type3.Length -gt $skuOff) {
+            Set-StructureString $type3 $type3.Formatted[$skuOff] $smb.chassis_sku
+            Write-Info "  Chassis SKU: $($smb.chassis_sku) @ off=0x$($skuOff.ToString('X2'))"
+        }
+    }
+
     $modifiedTypes += "Type 3 (Chassis)"
 
     Write-Info "  Manufacturer: $($smb.chassis_manufacturer)"
     Write-OK "Type 3 modificado"
 } else {
     Write-Warn "Type 3 nao encontrado no blob!"
+}
+
+# ============================================================
+#  Step 8b: Modificar Type 4 (Processor Information) — STRINGS ONLY
+#
+#  Layout Type 4 (SMBIOS 2.0+): [4]=SocketDesignation(str), [5]=ProcType(byte),
+#  [6]=ProcFamily(byte), [7]=ProcManufacturer(str), [8..15]=ProcessorID(qword),
+#  [16]=ProcVersion(str), ... [32]=SerialNumber(str), [33]=AssetTag(str),
+#  [34]=PartNumber(str). Nao mexer em bytes 5-15 — sao familia/ID que vem do
+#  silicio (CPUID) e trocar aqui cria inconsistencia entre SMBIOS Type 4 e
+#  Win32_Processor.ProcessorId, que anti-cheats cruzam.
+# ============================================================
+$type4 = $structures | Where-Object { $_.Type -eq 4 } | Select-Object -First 1
+
+if ($type4) {
+    Write-Info "Modificando Type 4 (Processor) — apenas string fields..."
+
+    if ($type4.Length -ge 33 -and $smb.PSObject.Properties.Name -contains "processor_serial" -and $smb.processor_serial) {
+        Set-StructureString $type4 $type4.Formatted[32] $smb.processor_serial
+    }
+    if ($type4.Length -ge 34 -and $smb.PSObject.Properties.Name -contains "processor_asset_tag" -and $smb.processor_asset_tag) {
+        Set-StructureString $type4 $type4.Formatted[33] $smb.processor_asset_tag
+    }
+    if ($type4.Length -ge 35 -and $smb.PSObject.Properties.Name -contains "processor_part_num" -and $smb.processor_part_num) {
+        Set-StructureString $type4 $type4.Formatted[34] $smb.processor_part_num
+    }
+
+    $modifiedTypes += "Type 4 (Processor strings)"
+    Write-OK "Type 4 modificado (CPUID/family intactos)"
+} else {
+    Write-Warn "Type 4 nao encontrado no blob!"
+}
+
+# ============================================================
+#  Step 8c: Modificar Type 11 (OEM Strings)
+#
+#  Layout Type 11: [4]=Count(byte). Depois disso, strings enumeradas 1..Count
+#  na string table. Anti-cheats leem via Win32_OEMStringArray. Se o profile
+#  diz MSI mas a maquina real e Dell, essa area vaza service tag Dell.
+#  Sobrescrevemos com strings genericas.
+# ============================================================
+$type11 = $structures | Where-Object { $_.Type -eq 11 } | Select-Object -First 1
+
+if ($type11 -and $smb.PSObject.Properties.Name -contains "oem_strings" -and $smb.oem_strings) {
+    Write-Info "Modificando Type 11 (OEM Strings)..."
+
+    $count = [int]$type11.Formatted[4]
+    if ($count -gt 0) {
+        for ($i = 0; $i -lt $count; $i++) {
+            $newVal = if ($i -lt $smb.oem_strings.Count) { $smb.oem_strings[$i] } else { "Default string" }
+            # Type 11 nao carrega indices — strings sao lidas em ordem 1..Count.
+            # A ordem de $type11.Strings ja mapeia 1..N na tabela de string.
+            while ($type11.Strings.Count -le $i) {
+                [void]$type11.Strings.Add("Default string")
+            }
+            $type11.Strings[$i] = $newVal
+        }
+        $modifiedTypes += "Type 11 (OEM Strings, $count)"
+        Write-Info "  OEM Strings sobrescritas ($count)"
+        Write-OK "Type 11 modificado"
+    } else {
+        Write-Info "  Count=0 — nada a modificar"
+    }
+} elseif (-not $type11) {
+    Write-Info "Type 11 ausente do blob — nada a fazer (nao e vazamento em si)"
 }
 
 # ============================================================
@@ -380,23 +478,40 @@ try {
 # ============================================================
 #  Step 10b: Cachear blob para o driver replay em kernel
 #
-#  O driver RstFlt v3.3+ ao carregar em DriverEntry copia este blob
-#  para mssmbios\Data\SMBiosData, garantindo que a identidade
-#  spoofada esteja em pe antes de winmgmt/anti-cheat rodarem.
-#  Substitui a antiga tarefa agendada boot-time (que sofria race).
+#  Fluxo v3.4:
+#   - Cache do blob e feito AGORA (para o driver ter em maos).
+#   - Opt-in flag (EnableSmbiosReplay=1) e setado APENAS DEPOIS
+#     da verificacao WMI abaixo (Step 12) confirmar que o blob
+#     nao quebrou consultas basicas. Isso evita repetir o BSOD
+#     onde um blob quebrado ficava cacheado e era reaplicado a
+#     cada boot pelo driver, brickando o Windows.
+#   - -DisableKernelReplay pula tudo isso.
 # ============================================================
-$driverParams = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
-if (Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt") {
+$driverParams   = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
+$driverInstalled = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt"
+$cachedBlob     = $false
+
+if ($DisableKernelReplay) {
+    Write-Warn "-DisableKernelReplay: replay em kernel NAO sera armado"
+    if ($driverInstalled -and (Test-Path $driverParams)) {
+        Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob"         -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -ErrorAction SilentlyContinue
+    }
+} elseif ($driverInstalled) {
     try {
         if (-not (Test-Path $driverParams)) {
             New-Item -Path $driverParams -Force | Out-Null
         }
-        Set-ItemProperty -Path $driverParams -Name "SmbiosBlob" -Value $newData -Type Binary
-        Write-OK "Blob cacheado para replay em kernel ($($newData.Length) bytes)"
-        Write-Info "O driver aplicara este blob a cada boot antes de winmgmt subir"
+        # v3.4: DESLIGA opt-in flag ANTES de cachear o novo blob.
+        # Se algo falhar entre aqui e a verificacao WMI, o driver
+        # NAO vai aplicar o blob no proximo boot (opt-in ausente).
+        Set-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -Value 0 -Type DWord
+        Set-ItemProperty -Path $driverParams -Name "SmbiosBlob"         -Value $newData -Type Binary
+        $cachedBlob = $true
+        Write-OK "Blob cacheado ($($newData.Length) bytes) — opt-in ainda OFF"
+        Write-Info "Opt-in sera ligado apos a verificacao WMI abaixo"
     } catch {
         Write-Warn "Falha ao cachear blob para o driver: $_"
-        Write-Warn "Replay em kernel nao funcionara - use -InstallTask como fallback"
     }
 } else {
     Write-Warn "Driver RstFlt nao instalado - sem replay em kernel"
@@ -442,6 +557,34 @@ if ($uuid -ne "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF" -and $uuid.Length -gt 10) {
     Write-OK "UUID aplicado"
 } else {
     Write-Warn "UUID pode precisar de reboot para refletir"
+}
+
+# ============================================================
+#  Step 12b: Armar opt-in do replay em kernel (v3.4)
+#
+#  So chegamos aqui se todas as queries WMI acima retornaram sem
+#  travar/lancar. Isso e o sinal mais forte que temos, ainda em
+#  runtime, de que o blob que acabamos de gravar em mssmbios\Data
+#  nao vai brickar o parser em boots subsequentes. Agora sim
+#  ligamos o flag que autoriza o driver a re-aplicar no boot.
+# ============================================================
+if ($cachedBlob) {
+    $wmiOk = ($null -ne $uuid -and $uuid.Length -gt 10 -and
+              $null -ne $boardMfr -and $boardMfr.Length -gt 0 -and
+              $null -ne $sysMfr   -and $sysMfr.Length   -gt 0)
+
+    if ($wmiOk) {
+        try {
+            Set-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -Value 1 -Type DWord
+            Write-OK "Replay em kernel ARMADO (EnableSmbiosReplay=1)"
+            Write-Info "Driver aplicara o blob a cada boot antes de winmgmt"
+        } catch {
+            Write-Warn "Falha ao armar opt-in: $_"
+        }
+    } else {
+        Write-Warn "WMI nao respondeu limpo — replay em kernel NAO armado"
+        Write-Warn "Blob fica cacheado mas o driver ignora sem EnableSmbiosReplay=1"
+    }
 }
 
 # ============================================================

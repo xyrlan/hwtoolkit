@@ -382,7 +382,7 @@ function Invoke-Generate {
 
     # Montar o objeto do perfil
     $profile = [ordered]@{
-        version        = 3
+        version        = 4
         generated_utc  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         cpu_detected   = $cpuName
         socket_matched = $socket
@@ -404,6 +404,19 @@ function Invoke-Generate {
             chassis_version      = $chassisVersion
             chassis_serial       = "Default string"
             chassis_asset_tag    = "Default string"
+            chassis_sku          = "Default string"
+
+            # -- Type 4 (Processor Information) — apenas string fields.
+            # Nao mexer no CPUID/family/model — sao vindos do silicio e
+            # criar inconsistencia entre SMBIOS CPU e CPUID e um flag classico.
+            processor_serial     = "To Be Filled By O.E.M."
+            processor_asset_tag  = "To Be Filled By O.E.M."
+            processor_part_num   = "To Be Filled By O.E.M."
+
+            # -- Type 11 (OEM Strings) — vetor de strings arbitrarias.
+            # Dell mete service tag aqui, HP mete asset codes, MSI usualmente
+            # nao popula. Deixamos duas strings genericas "safe".
+            oem_strings          = @("Default string", "Default string")
         }
         windows = [ordered]@{
             machine_guid   = $machineGuid
@@ -752,7 +765,11 @@ function Show-ProfileData {
         @("Chassis Type",         "chassis_type"),
         @("Chassis Version",      "chassis_version"),
         @("Chassis Serial",       "chassis_serial"),
-        @("Chassis Asset Tag",    "chassis_asset_tag")
+        @("Chassis Asset Tag",    "chassis_asset_tag"),
+        @("Chassis SKU",          "chassis_sku"),
+        @("Processor Serial",     "processor_serial"),
+        @("Processor Asset Tag",  "processor_asset_tag"),
+        @("Processor Part#",      "processor_part_num")
     )
 
     foreach ($field in $smbiosFields) {

@@ -40,6 +40,49 @@
  *       the driver copies it into mssmbios\Data\SMBiosData while
  *       the machine is still booting, before winmgmt/anti-cheat
  *       start. Kills the race the old scheduled task had.
+ * v3.4 - Post-BSOD hardening.
+ *     - SMBIOS blob replay is now OPT-IN via
+ *       Parameters\EnableSmbiosReplay (REG_DWORD, default 0).
+ *       Old behavior (any cached SmbiosBlob applied unconditionally)
+ *       could brick boot when the userspace tool wrote a malformed
+ *       blob or when downstream WMI/mssmbios consumers choked on the
+ *       replayed structures. Userspace tool now sets EnableSmbiosReplay
+ *       only after it has verified the blob round-trips through
+ *       Win32_ComputerSystemProduct successfully.
+ *     - ValidateSmbiosBlob() now sanity-checks the cached blob before
+ *       overwrite: size cap 65535, walkable structure table, Type 127
+ *       (End-of-Table) present, string tables terminated. Bad blob is
+ *       ignored instead of being propagated to mssmbios\Data.
+ *     - Backup of the pre-replay SMBiosData is written to
+ *       Parameters\OrigSmbiosData on first apply so 09-recuperar-boot
+ *       can restore genuine firmware SMBIOS from offline registry.
+ *     - Companion INF drops StartType from 0 (BOOT_START) to 1
+ *       (SYSTEM_START) so any future crash in DriverEntry/AddDevice
+ *       no longer makes the machine unbootable.
+ *     - Fixed MDL/worker race in SpoofAtaPassDirectCompletion: the
+ *       deferred cleanup work item is now tracked by a second
+ *       RemoveLock reference so IRP_MN_REMOVE_DEVICE cannot delete
+ *       the device object (and thus the work-item's owner) while a
+ *       cleanup worker is still queued.
+ * v3.5 - Fixed serial truncation in SpoofStorageCompletion.
+ *       When the disk's real serial is shorter than the spoofed
+ *       one (e.g. a 6-char OEM serial vs a 15-char spoof), the
+ *       lower driver sized the response to `actual = original + 1`
+ *       and we could only overwrite `original - 1` chars — the
+ *       spoofed serial came out truncated and inconsistent with
+ *       what SMART/IDENTIFY/NVMe paths reported.
+ *       Fix: capture OutputBufferLength at dispatch (new
+ *       RSTFLT_STORAGE_CTX), and in the completion:
+ *         (a) if SerialNumber is the LAST field in the descriptor
+ *             (Windows storport default), extend the response up
+ *             to OutputBufferLength and update IoStatus.Information
+ *             so the caller reads the full spoofed serial;
+ *         (b) if a vendor miniport packs another field AFTER the
+ *             serial (rare — some Intel RST / LSI stacks do this),
+ *             truncate before that next field so we don't corrupt
+ *             VendorId/ProductId/Firmware that follow it.
+ *       Falls back to v3.4 behavior (truncate at `actual`) if the
+ *       context allocation fails.
  *
  * WARNING: Kernel drivers can BSOD your machine if buggy.
  * Test signing mode required to load unsigned drivers.
@@ -101,10 +144,11 @@ static IO_COMPLETION_ROUTINE SpoofNvmeIdentifyCompletion;
 static IO_COMPLETION_ROUTINE SpoofAtaPassDirectCompletion;
 static IO_WORKITEM_ROUTINE   MdlCleanupWorker;
 
-static VOID ReadRegistryConfig(PUNICODE_STRING RegPath);
-static VOID GenerateSerial(PDEVICE_EXTENSION dx, CHAR *Buf, ULONG Len);
-static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath);
-static VOID DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl);
+static VOID    ReadRegistryConfig(PUNICODE_STRING RegPath);
+static VOID    GenerateSerial(PDEVICE_EXTENSION dx, CHAR *Buf, ULONG Len);
+static VOID    ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath);
+static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length);
+static VOID    DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl);
 
 /* ================================================================
  *  MDL cleanup work item context — a completion routine may run at
@@ -112,8 +156,16 @@ static VOID DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl);
  *  defer the unlock/free to a worker thread.
  * ================================================================ */
 typedef struct _RSTFLT_MDL_CLEANUP {
-    PMDL          Mdl;
-    PIO_WORKITEM  WorkItem;
+    PMDL             Mdl;
+    PIO_WORKITEM     WorkItem;
+    /* v3.4: keep DevObj pinned via a RemoveLock reference until the
+       worker actually runs. Without this the completion routine could
+       release its own IRP-tagged lock, IRP_MN_REMOVE_DEVICE could
+       delete DevObj, and IoFreeWorkItem in the worker would touch
+       freed memory. DeferMdlCleanup acquires the reference tagged
+       with the address of this struct; the worker releases with the
+       same tag right before freeing the struct. */
+    PIO_REMOVE_LOCK  Lock;
 } RSTFLT_MDL_CLEANUP, *PRSTFLT_MDL_CLEANUP;
 
 /* Per-IRP context passed to SpoofAtaPassDirectCompletion via
@@ -123,6 +175,16 @@ typedef struct _RSTFLT_APTD_CTX {
     PMDL   Mdl;
     UCHAR *Kva;
 } RSTFLT_APTD_CTX, *PRSTFLT_APTD_CTX;
+
+/* v3.5: context for SpoofStorageCompletion. Carries the caller's
+   OutputBufferLength captured at dispatch time so the completion
+   knows how much room it can safely expand a shorter-than-spoof
+   serial into. Without this the completion only sees IoStatus.
+   Information (what the lower driver wrote), which for short
+   serials leaves us with too little room and truncates the spoof. */
+typedef struct _RSTFLT_STORAGE_CTX {
+    ULONG OutputBufferLength;
+} RSTFLT_STORAGE_CTX, *PRSTFLT_STORAGE_CTX;
 
 /* ================================================================
  *  ReadRegistryConfig - load seed, prefix, length from registry
@@ -220,18 +282,133 @@ static VOID ReadRegistryConfig(PUNICODE_STRING RegPath)
 }
 
 /* ================================================================
+ *  ValidateSmbiosBlob - sanity-check a cached SMBIOS blob before
+ *  we splat it into mssmbios\Data\SMBiosData.
+ *
+ *  v3.4 addition. Before v3.4 the driver trusted whatever bytes
+ *  userland had cached, and a corrupted / truncated blob could
+ *  crash mssmbios or WMI providers on the next boot — with
+ *  BOOT_START ordering that meant an unbootable box before any
+ *  STOP screen could render (exactly the failure mode we hit).
+ *
+ *  Rules (loose but enough to catch real corruption):
+ *    - Overall length between the raw-SMBIOS header (32 bytes) and
+ *      64 KiB (mssmbios wraps its RSMB header around the raw table,
+ *      so we're really validating what mssmbios stores, not the
+ *      firmware EPS).
+ *    - Walkable structure table starting at a small offset: each
+ *      entry has Type/Length header, formatted section fits, string
+ *      table ends with a lone null within bounds.
+ *    - Type 127 (End-of-Table) reached before we run off the end.
+ *
+ *  Returns TRUE only when every structure parses cleanly.
+ * ================================================================ */
+static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length)
+{
+    /* mssmbios prepends an 8-byte header describing the raw table
+       size and version; the raw SMBIOS structure table follows. We
+       search for the first plausible structure header instead of
+       hard-coding the offset — the layout has drifted between
+       Windows versions. */
+    ULONG i;
+    ULONG tableStart = 0;
+    ULONG p;
+    BOOLEAN sawEnd = FALSE;
+
+    if (Blob == NULL) return FALSE;
+    if (Length < 32) return FALSE;         /* too small to be real   */
+    if (Length > 65536) return FALSE;      /* too big — reject       */
+
+    /* Find first byte that looks like a Type 0/1/2/3 header with a
+       reasonable Length (>=4, <=Length). Scan the first 64 bytes. */
+    for (i = 0; i + 4 < Length && i < 64; i++) {
+        UCHAR t = Blob[i];
+        UCHAR L = Blob[i + 1];
+        if ((t == 0 || t == 1 || t == 2 || t == 3) &&
+            L >= 4 && (ULONG)(i + L) < Length)
+        {
+            tableStart = i;
+            break;
+        }
+    }
+    if (tableStart == 0 && Blob[0] > 127) return FALSE;
+
+    /* Walk structures. Each iteration advances past the formatted
+       area, then over the string table (sequence of NUL-terminated
+       ASCII, ended by an empty string i.e. two NULs). */
+    p = tableStart;
+    while (p + 2 <= Length) {
+        UCHAR type = Blob[p];
+        UCHAR len  = Blob[p + 1];
+        ULONG q;
+
+        if (len < 4)                return FALSE;
+        if ((ULONG)p + len > Length) return FALSE;
+
+        q = p + len;   /* start of string table */
+
+        /* End-of-table structure has no meaningful string table but
+           still terminates with the double-NUL sentinel. */
+        if (q >= Length) return FALSE;
+
+        if (Blob[q] == 0) {
+            /* Empty string table: just the double-NUL. */
+            if (q + 1 >= Length) return FALSE;
+            if (Blob[q + 1] != 0) return FALSE;
+            p = q + 2;
+        } else {
+            /* Non-empty: scan for terminating empty string. */
+            ULONG pos = q;
+            BOOLEAN terminated = FALSE;
+            while (pos < Length) {
+                ULONG strEnd = pos;
+                while (strEnd < Length && Blob[strEnd] != 0)
+                    strEnd++;
+                if (strEnd >= Length) return FALSE;
+                if (strEnd == pos) {
+                    /* empty string → end of table */
+                    terminated = TRUE;
+                    p = pos + 1;
+                    break;
+                }
+                pos = strEnd + 1;
+            }
+            if (!terminated) return FALSE;
+        }
+
+        if (type == 127) {   /* End-of-Table */
+            sawEnd = TRUE;
+            break;
+        }
+
+        /* Bound structure count to avoid a pathological loop on a
+           blob that keeps declaring more structures than actually
+           fit — 512 is far above any realistic firmware. */
+        if (p >= Length) return FALSE;
+    }
+
+    return sawEnd;
+}
+
+/* ================================================================
  *  ApplySmbiosBlobIfCached - replay a pre-computed SMBIOS blob
  *
- *  The userspace tool (spoof-uuid.ps1) parses, rewrites and stores
- *  the final SMBIOS blob at <RegPath>\Parameters\SmbiosBlob as
- *  REG_BINARY. This function copies that blob into
- *      HKLM\SYSTEM\CurrentControlSet\Services\mssmbios\Data\SMBiosData
- *  during DriverEntry, so the spoofed identity is already in place
- *  when winmgmt starts and any anti-cheat queries SMBIOS via WMI.
+ *  v3.4 semantics (breaking change vs v3.3):
+ *    - Replay is OPT-IN. Userspace must set
+ *        Parameters\EnableSmbiosReplay = 1  (REG_DWORD)
+ *      after it has verified the blob round-trips through WMI on
+ *      a live boot. Missing / zero = replay disabled, we return
+ *      immediately. This closes the "cached blob from previous
+ *      buggy run kills next boot" failure mode.
+ *    - Cached blob is validated with ValidateSmbiosBlob() before
+ *      we touch mssmbios\Data. Bad blob = ignored, no BSOD.
+ *    - On first successful apply we snapshot the pre-replay
+ *      SMBiosData into Parameters\OrigSmbiosData so
+ *      09-recuperar-boot can restore genuine firmware SMBIOS from
+ *      offline registry if we ever brick the box.
  *
- *  Runs during boot; failures are logged in DBG builds and ignored
- *  in retail — the driver's main storage-spoofing job still works
- *  even if SMBIOS replay fails.
+ *  Failures never propagate. The driver's storage-spoofing job
+ *  still works even if SMBIOS replay is disabled or fails.
  * ================================================================ */
 static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 {
@@ -243,7 +420,12 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     WCHAR   paramsBuf[512];
     ULONG   needSize = 0;
     ULONG   allocSize;
-    PKEY_VALUE_PARTIAL_INFORMATION info = NULL;
+    PKEY_VALUE_PARTIAL_INFORMATION info    = NULL;
+    PKEY_VALUE_PARTIAL_INFORMATION origInfo = NULL;
+    UCHAR   flagBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION flagInfo =
+        (PKEY_VALUE_PARTIAL_INFORMATION)flagBuf;
+    ULONG   flagVal = 0;
 
     /* Build "<RegPath>\Parameters" */
     paramsPath.Buffer        = paramsBuf;
@@ -260,8 +442,29 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     InitializeObjectAttributes(&oa, &paramsPath,
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL, NULL);
-    st = ZwOpenKey(&hParams, KEY_READ, &oa);
+    st = ZwOpenKey(&hParams, KEY_READ | KEY_SET_VALUE, &oa);
     if (!NT_SUCCESS(st)) return;
+
+    /* --- Opt-in gate: EnableSmbiosReplay = 1 --- */
+    RtlInitUnicodeString(&valName, L"EnableSmbiosReplay");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &needSize);
+    if (!NT_SUCCESS(st) ||
+        flagInfo->Type != REG_DWORD ||
+        flagInfo->DataLength < sizeof(ULONG))
+    {
+#if DBG
+        DbgPrint("[RstFlt] SMBIOS replay: opt-in flag absent, skipping\n");
+#endif
+        goto out;
+    }
+    RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+    if (flagVal == 0) {
+#if DBG
+        DbgPrint("[RstFlt] SMBIOS replay: opt-in flag = 0, skipping\n");
+#endif
+        goto out;
+    }
 
     /* Two-phase query: first learn size, then allocate + read. */
     RtlInitUnicodeString(&valName, L"SmbiosBlob");
@@ -270,8 +473,8 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     if (st != STATUS_BUFFER_TOO_SMALL &&
         st != STATUS_BUFFER_OVERFLOW)
         goto out;                        /* no cached blob → nothing to do */
-    if (needSize < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 8)
-        goto out;                        /* smaller than an SMBIOS header */
+    if (needSize < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 32)
+        goto out;                        /* smaller than any real SMBIOS */
 
     allocSize = needSize;
     info = (PKEY_VALUE_PARTIAL_INFORMATION)
@@ -280,9 +483,17 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 
     st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
                          info, allocSize, &needSize);
-    if (!NT_SUCCESS(st))         goto out;
+    if (!NT_SUCCESS(st))          goto out;
     if (info->Type != REG_BINARY) goto out;
-    if (info->DataLength < 8)     goto out;   /* not a real blob */
+
+    /* v3.4: validate before ever touching mssmbios */
+    if (!ValidateSmbiosBlob(info->Data, info->DataLength)) {
+#if DBG
+        DbgPrint("[RstFlt] SMBIOS replay: cached blob failed validation "
+                 "(%lu bytes) — ignored\n", info->DataLength);
+#endif
+        goto out;
+    }
 
     /* Open mssmbios\Data. Kernel handle bypasses ACL — the userland
        equivalent has to do a whole take-ownership dance. */
@@ -291,12 +502,59 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     InitializeObjectAttributes(&oa, &mssmbiosPath,
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL, NULL);
-    st = ZwOpenKey(&hMssmbios, KEY_SET_VALUE, &oa);
+    st = ZwOpenKey(&hMssmbios, KEY_QUERY_VALUE | KEY_SET_VALUE, &oa);
     if (!NT_SUCCESS(st)) {
 #if DBG
         DbgPrint("[RstFlt] SMBIOS replay: open mssmbios failed 0x%08X\n", st);
 #endif
         goto out;
+    }
+
+    /* --- v3.4: snapshot the current SMBiosData to OrigSmbiosData
+       (only on first apply, so we don't overwrite the genuine
+       firmware copy with a previously-replayed one). --- */
+    {
+        UNICODE_STRING origName;
+        ULONG origNeed = 0;
+
+        RtlInitUnicodeString(&origName, L"OrigSmbiosData");
+        st = ZwQueryValueKey(hParams, &origName, KeyValuePartialInformation,
+                             NULL, 0, &origNeed);
+        if (st == STATUS_OBJECT_NAME_NOT_FOUND) {
+            /* No backup yet — read current mssmbios data and store. */
+            UNICODE_STRING curName;
+            ULONG curNeed = 0;
+
+            RtlInitUnicodeString(&curName, L"SMBiosData");
+            st = ZwQueryValueKey(hMssmbios, &curName,
+                                 KeyValuePartialInformation,
+                                 NULL, 0, &curNeed);
+            if ((st == STATUS_BUFFER_TOO_SMALL ||
+                 st == STATUS_BUFFER_OVERFLOW) &&
+                curNeed > FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data))
+            {
+                origInfo = (PKEY_VALUE_PARTIAL_INFORMATION)
+                    ExAllocatePoolWithTag(NonPagedPool, curNeed, POOL_TAG);
+                if (origInfo) {
+                    st = ZwQueryValueKey(hMssmbios, &curName,
+                                         KeyValuePartialInformation,
+                                         origInfo, curNeed, &curNeed);
+                    if (NT_SUCCESS(st) &&
+                        origInfo->Type == REG_BINARY &&
+                        origInfo->DataLength > 0)
+                    {
+                        ZwSetValueKey(hParams, &origName, 0, REG_BINARY,
+                                      origInfo->Data,
+                                      origInfo->DataLength);
+#if DBG
+                        DbgPrint("[RstFlt] SMBIOS replay: backed up %lu "
+                                 "bytes to OrigSmbiosData\n",
+                                 origInfo->DataLength);
+#endif
+                    }
+                }
+            }
+        }
     }
 
     RtlInitUnicodeString(&valName, L"SMBiosData");
@@ -309,6 +567,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 
 out:
     if (info)      ExFreePoolWithTag(info, POOL_TAG);
+    if (origInfo)  ExFreePoolWithTag(origInfo, POOL_TAG);
     if (hMssmbios) ZwClose(hMssmbios);
     if (hParams)   ZwClose(hParams);
 }
@@ -492,7 +751,24 @@ NTSTATUS DispatchPower(PDEVICE_OBJECT DevObj, PIRP Irp)
  *
  *  Called after lower driver fills STORAGE_DEVICE_DESCRIPTOR for
  *  an IOCTL_STORAGE_QUERY_PROPERTY response.
- *  Releases the remove lock acquired by DispatchDeviceControl.
+ *
+ *  v3.5 behavior:
+ *    Two cases decide how much of the buffer we can rewrite:
+ *      (a) SerialNumber is the LAST field in the descriptor
+ *          (Windows storport default). Room to write is bounded
+ *          by OutputBufferLength (from Ctx), not by what the lower
+ *          driver wrote. If our spoof is longer than the original,
+ *          extend it and bump IoStatus.Information accordingly.
+ *      (b) A field lives AFTER SerialNumber (some vendor miniports
+ *          — Intel RST, LSI HBAs — pack VendorId/ProductId/Firmware
+ *          past the serial). Room is fixed to (nextFieldOffset -
+ *          SerialNumberOffset). Truncate to fit; don't touch bytes
+ *          past it or those strings get corrupted.
+ *    Falls back to v3.4 behavior if Ctx is NULL (OutputBufferLength
+ *    unavailable), i.e. truncate at IoStatus.Information.
+ *
+ *  Releases the remove lock acquired by DispatchDeviceControl and
+ *  frees the completion context.
  * ================================================================ */
 static NTSTATUS SpoofStorageCompletion(
     PDEVICE_OBJECT DevObj,
@@ -500,14 +776,15 @@ static NTSTATUS SpoofStorageCompletion(
     PVOID Ctx)
 {
     PDEVICE_EXTENSION dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
+    PRSTFLT_STORAGE_CTX sctx = (PRSTFLT_STORAGE_CTX)Ctx;
     PSTORAGE_DEVICE_DESCRIPTOR desc;
     PCHAR  ser;
-    ULONG  room;
     ULONG  actual;
-    ULONG  i;
+    ULONG  outLen;
     ULONG  copyLen;
-
-    UNREFERENCED_PARAMETER(Ctx);
+    ULONG  serSpaceEnd;    /* first byte offset AFTER our writable region */
+    ULONG  writable;
+    ULONG  i;
 
     if (Irp->IoStatus.Status != STATUS_SUCCESS)
         goto done;
@@ -522,11 +799,6 @@ static NTSTATUS SpoofStorageCompletion(
         desc->SerialNumberOffset >= actual)
         goto done;
 
-    ser  = (PCHAR)desc + desc->SerialNumberOffset;
-    room = actual - desc->SerialNumberOffset;
-    if (room < 2)
-        goto done;
-
     /* Generate a fake serial on first access */
     if (!dx->HasFakeSerial) {
         GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
@@ -537,23 +809,74 @@ static NTSTATUS SpoofStorageCompletion(
 #endif
     }
 
-    /* Overwrite the serial in the response buffer.
-       Only zero the serial field itself, NOT the rest of the buffer:
-       the Windows storage stack usually places SerialNumber last, but
-       some vendor stor miniports pack VendorId/ProductId/Firmware
-       after it — zeroing `room` bytes would corrupt those strings and
-       crash callers that read them. */
     copyLen = g_HasConfig ? g_SerialLen : 15;
+    outLen  = sctx ? sctx->OutputBufferLength : 0;
+    ser     = (PCHAR)desc + desc->SerialNumberOffset;
+
+    /* Find whether any *other* string field lives after SerialNumber.
+       Pick the smallest such offset — that's the first byte we can't
+       touch. Offset 0 in any of these means the field isn't present. */
     {
-        ULONG zeroLen = copyLen + 1;   /* +1 for NUL terminator */
-        if (zeroLen > room)
-            zeroLen = room;
-        RtlZeroMemory(ser, zeroLen);
+        ULONG nextOff = 0;
+        ULONG cand;
+
+        cand = desc->VendorIdOffset;
+        if (cand > desc->SerialNumberOffset && cand <= actual)
+            if (nextOff == 0 || cand < nextOff) nextOff = cand;
+
+        cand = desc->ProductIdOffset;
+        if (cand > desc->SerialNumberOffset && cand <= actual)
+            if (nextOff == 0 || cand < nextOff) nextOff = cand;
+
+        cand = desc->ProductRevisionOffset;
+        if (cand > desc->SerialNumberOffset && cand <= actual)
+            if (nextOff == 0 || cand < nextOff) nextOff = cand;
+
+        if (nextOff != 0) {
+            /* Case (b): serial is NOT the last field — can't extend. */
+            serSpaceEnd = nextOff;
+        } else if (outLen > desc->SerialNumberOffset) {
+            /* Case (a) with known OutputBufferLength: extend up to
+               the caller's original buffer capacity. */
+            serSpaceEnd = outLen;
+        } else {
+            /* Fallback (no ctx / short outLen): v3.4 behavior — stay
+               within what the lower driver already wrote. */
+            serSpaceEnd = actual;
+        }
     }
-    for (i = 0; i < copyLen && i < room - 1; i++)
+
+    if (serSpaceEnd <= desc->SerialNumberOffset)
+        goto done;
+
+    writable = serSpaceEnd - desc->SerialNumberOffset;
+    if (writable < 2)
+        goto done;   /* No room for even a 1-char serial + NUL */
+
+    /* Trim spoofed serial to fit the writable region (leaving 1 byte
+       for the NUL terminator). */
+    if (copyLen + 1 > writable)
+        copyLen = writable - 1;
+
+    /* Zero exactly copyLen + 1 bytes (the string + terminator).
+       Never zero beyond that: any trailing field (case b) or unused
+       tail of the caller's buffer must stay whatever it was. */
+    RtlZeroMemory(ser, copyLen + 1);
+    for (i = 0; i < copyLen; i++)
         ser[i] = dx->FakeSerial[i];
 
+    /* If our serial ends AFTER what the lower driver reported,
+       announce the longer response so callers read it fully. Never
+       shrink Information (would hide fields we didn't touch). */
+    {
+        ULONG newTail = desc->SerialNumberOffset + copyLen + 1;
+        if (newTail > actual)
+            Irp->IoStatus.Information = newTail;
+    }
+
 done:
+    if (sctx) ExFreePoolWithTag(sctx, POOL_TAG);
+
     if (Irp->PendingReturned)
         IoMarkIrpPending(Irp);
 
@@ -809,19 +1132,35 @@ static VOID MdlCleanupWorker(
     if (c->WorkItem)
         IoFreeWorkItem(c->WorkItem);
 
+    /* v3.4: release the RemoveLock reference DeferMdlCleanup took
+       for this worker. Must happen after IoFreeWorkItem — the work
+       item is owned by DevObj, and DevObj is only guaranteed to stay
+       alive while the remove-lock reference is held. Tag = c so the
+       release matches the acquire in DeferMdlCleanup. */
+    if (c->Lock)
+        IoReleaseRemoveLock(c->Lock, c);
+
     ExFreePoolWithTag(c, POOL_TAG);
 }
 
 /* ================================================================
  *  DeferMdlCleanup - queue the MDL to be released at PASSIVE_LEVEL.
- *  If we cannot allocate the work item, fall back to inline release
- *  only when IRQL permits; otherwise the MDL leaks (small pinned
- *  memory) rather than crashing the system.
+ *
+ *  v3.4: acquires an extra RemoveLock reference tagged with the
+ *  cleanup context itself so DevObj cannot be deleted while the
+ *  work item is queued/running. The worker releases with the same
+ *  tag right before freeing the struct.
+ *
+ *  If we cannot allocate the work item / context / lock, fall back
+ *  to inline release only when IRQL permits; otherwise the MDL
+ *  leaks (small pinned memory) rather than crashing the system.
  * ================================================================ */
 static VOID DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl)
 {
+    PDEVICE_EXTENSION   dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
     PRSTFLT_MDL_CLEANUP c;
     PIO_WORKITEM        wi;
+    NTSTATUS            st;
 
     if (Mdl == NULL)
         return;
@@ -846,8 +1185,24 @@ static VOID DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl)
         return;
     }
 
+    /* Take a RemoveLock reference so DevObj outlives the work item.
+       Tag = c (unique for this operation). If the device is already
+       being removed, the acquire fails — bail out and best-effort
+       release the MDL inline. */
+    st = IoAcquireRemoveLock(&dx->RemoveLock, c);
+    if (!NT_SUCCESS(st)) {
+        ExFreePoolWithTag(c, POOL_TAG);
+        IoFreeWorkItem(wi);
+        if (KeGetCurrentIrql() <= APC_LEVEL) {
+            MmUnlockPages(Mdl);
+            IoFreeMdl(Mdl);
+        }
+        return;
+    }
+
     c->Mdl      = Mdl;
     c->WorkItem = wi;
+    c->Lock     = &dx->RemoveLock;
     IoQueueWorkItem(wi, MdlCleanupWorker, DelayedWorkQueue, c);
 }
 
@@ -954,6 +1309,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
     /* ---- Path 1: IOCTL_STORAGE_QUERY_PROPERTY ---- */
     if (ioctl == IOCTL_STORAGE_QUERY_PROPERTY) {
         PSTORAGE_PROPERTY_QUERY q;
+        PRSTFLT_STORAGE_CTX     sctx;
 
         if (sp->Parameters.DeviceIoControl.InputBufferLength <
             sizeof(STORAGE_PROPERTY_QUERY))
@@ -964,8 +1320,21 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
             q->QueryType  != PropertyStandardQuery)
             goto passthru;
 
+        /* v3.5: capture OutputBufferLength so the completion knows
+           the caller's buffer capacity (not just what the lower
+           driver actually wrote). Lets us safely EXTEND a short
+           original serial to full spoof length. If the alloc fails
+           we still fall through with completion=NULL, and the
+           routine reverts to v3.4 truncate-at-actual behavior. */
+        sctx = (PRSTFLT_STORAGE_CTX)ExAllocatePoolWithTag(
+            NonPagedPool, sizeof(*sctx), POOL_TAG);
+        if (sctx != NULL) {
+            sctx->OutputBufferLength =
+                sp->Parameters.DeviceIoControl.OutputBufferLength;
+        }
+
         IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofStorageCompletion, NULL,
+        IoSetCompletionRoutine(Irp, SpoofStorageCompletion, sctx,
                                TRUE, TRUE, TRUE);
         return IoCallDriver(dx->LowerDevice, Irp);
     }
@@ -1328,7 +1697,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     DrvObj->DriverUnload               = DriverUnload;
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v3.3) config=%s prefix=%s len=%lu\n",
+    DbgPrint("[RstFlt] DriverEntry OK (v3.5) config=%s prefix=%s len=%lu\n",
              g_HasConfig ? "loaded" : "defaults", g_Prefix, g_SerialLen);
 #endif
     return STATUS_SUCCESS;
