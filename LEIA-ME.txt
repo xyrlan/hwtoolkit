@@ -30,6 +30,8 @@ HWToolkit/
     hwprofile.ps1            <- Gerador de profile (v4 schema)
     change-hwid-easy.ps1     <- HWID + MAC + EDID changer
     spoof-uuid.ps1           <- SMBIOS blob modifier
+    consistency-check.ps1    <- Auditoria read-only: BIOS mirror + cross-check
+    restore-firmware-smbios.ps1 <- Restaura SMBIOS do firmware (limpa spoof)
   driver/
     rstflt.c                 <- Storage filter v3.4 (source)
     rstflt.inf               <- INF do storage filter

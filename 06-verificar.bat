@@ -47,4 +47,18 @@ if exist "%~dp0scripts\hwprofile.ps1" (
 )
 
 echo.
+echo === CONSISTENCY CROSS-CHECK + BIOS MIRROR AUDIT ===
+if exist "%~dp0scripts\consistency-check.ps1" (
+    rem  Read-only. Sinaliza GAPs onde:
+    rem    - HARDWARE\DESCRIPTION\System\BIOS ainda mostra a placa REAL
+    rem      (SMBIOS spoof furado nesse ponto)
+    rem    - Manufacturer diverge entre ComputerSystem/BaseBoard/Chassis
+    rem    - Disk Model vs Serial format inconsistente
+    rem    - VolFlt nao esta filtrando (VSN mostrado sao os reais)
+    powershell -ExecutionPolicy Bypass -File "%~dp0scripts\consistency-check.ps1"
+) else (
+    echo [!] scripts\consistency-check.ps1 nao encontrado
+)
+
+echo.
 pause
