@@ -1476,9 +1476,23 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
     /* Copy relevant flags from lower device */
     flt->Flags |= dx->LowerDevice->Flags &
                   (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
-    flt->DeviceType      = dx->LowerDevice->DeviceType;
-    flt->Characteristics = dx->LowerDevice->Characteristics;
-    flt->Flags          &= ~DO_DEVICE_INITIALIZING;
+    flt->DeviceType           = dx->LowerDevice->DeviceType;
+    flt->Characteristics      = dx->LowerDevice->Characteristics;
+    /* v4.0.2 hotfix: propagate AlignmentRequirement from lower.
+     * IoAttachDeviceToDeviceStack does NOT copy this field; without
+     * it the filter advertises the processor-default alignment seeded
+     * by IoCreateDevice(FILE_DEVICE_DISK), which mismatches what
+     * disk.sys / storvsc expect on the boot PDO. First direct-I/O
+     * read of the boot volume ($Boot/MFT) then fails alignment
+     * validation, mount aborts, ntoskrnl bugchecks 0x7B
+     * INACCESSIBLE_BOOT_DEVICE. Canonical WDM filter shape (WDK
+     * "Initializing a Device Object", ClassPnP filter samples)
+     * requires this copy. Root-caused by 3-lens adversarial workflow
+     * after v4.0.1 hotfix passed DriverEntry gate check but VM boot
+     * still bugchecked at ~30s mark (post-loader, at first storage
+     * I/O for volume mount). */
+    flt->AlignmentRequirement = dx->LowerDevice->AlignmentRequirement;
+    flt->Flags               &= ~DO_DEVICE_INITIALIZING;
 
 #if DBG
     DbgPrint("[RstFlt] Attached to PDO %p (lower=%p)\n",
