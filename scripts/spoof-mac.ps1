@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 # ============================================================
-#  HWID Changer v3.5.1 (schema v6) - Profile-Based
+#  HWID Changer v3.6 (schema v7) - Profile-Based
 #
 #  Escopo reduzido em v3.5.1:
 #    - Somente MAC addresses (OUI real, sem bit LA).
@@ -18,7 +18,7 @@ $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 
 # ---- Carregar profile ----
 Write-Host ""
-Write-Host "=== HWID Changer v3.5.1 (Profile-Based) ===" -ForegroundColor Cyan
+Write-Host "=== HWID Changer v3.6 (Profile-Based) ===" -ForegroundColor Cyan
 
 if (-not (Test-Path $profilePath)) {
     Write-Host "  [X] Profile nao encontrado!" -ForegroundColor Red
@@ -31,15 +31,17 @@ if (-not (Test-Path $profilePath)) {
 $prof = Get-Content $profilePath -Raw | ConvertFrom-Json
 $net = $prof.network
 
-# Schema version guard (v3.5.1 / Fase 1.5 = schema v6)
+# Schema version guard (v3.6 = schema v7; ainda aceita v6 legado)
 $profVer = 0
 if ($prof.PSObject.Properties['version']) {
     [int]::TryParse([string]$prof.version, [ref]$profVer) | Out-Null
 }
 Write-Host "  [OK] Profile carregado (v$profVer)" -ForegroundColor Green
 if ($profVer -lt 6) {
-    Write-Host "  [!] Profile schema v$profVer detectado; recomendado v6+ (Fase 1.5)." -ForegroundColor Yellow
+    Write-Host "  [!] Profile schema v$profVer detectado; recomendado v7+ (v3.6)." -ForegroundColor Yellow
     Write-Host "  [!] Campos legado (windows.*) sao ignorados; regenere com 00-gerar-profile.bat." -ForegroundColor Yellow
+} elseif ($profVer -eq 6) {
+    Write-Host "  [i] Profile v6 legado — ainda funciona, mas regenere para v7 quando puder." -ForegroundColor DarkGray
 }
 if (-not $net) {
     Write-Host "  [X] Profile nao contem bloco 'network' - regenere o profile." -ForegroundColor Red

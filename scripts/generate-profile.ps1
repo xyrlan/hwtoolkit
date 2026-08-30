@@ -4,12 +4,17 @@
     Gerador centralizado de perfil de hardware para o toolkit de spoofing.
 .DESCRIPTION
     Gera um conjunto completo e CONSISTENTE de identificadores falsos de hardware,
-    salva em um perfil JSON, e escreve o seed do driver no registro.
+    salva em um perfil JSON, e escreve valores auxiliares no registro.
     Todos os outros scripts (spoof-mac.ps1, spoof-smbios.ps1, e o driver kernel)
-    devem ler deste perfil ao invés de gerar valores aleatórios independentemente.
+    devem ler deste perfil ao inves de gerar valores aleatorios independentemente.
 .NOTES
-    Localização do perfil: C:\ProgramData\.hwcfg\profile.json
-    Schema v6 — remove bloco 'windows' (machine_guid, sqm_machine_id,
+    Localizacao do perfil: C:\ProgramData\.hwcfg\profile.json
+    Schema v7 — remove bloco 'storage' (seed_b64, serial_prefix,
+    serial_length). O driver rstflt v3.6 nao intercepta mais IOCTLs
+    de storage (fonte historica de BSOD); a spoofagem de serial de
+    disco foi removida do toolkit. EMAC nao consome serial de disco
+    via IOCTL, entao o custo (BSOD) > beneficio.
+    Schema v6 removeu bloco 'windows' (machine_guid, sqm_machine_id,
     product_id): EMAC nao le esses campos, e a reescrita criava diff
     detectavel contra baseline do Windows sem ganho de anti-fingerprint.
     Schema v5 adicionou audio (rotation pool), monitor EDID completo,
@@ -20,7 +25,7 @@ param(
     [switch]$Generate,    # Gerar novo perfil
     [switch]$Show,        # Exibir perfil atual
     [switch]$Validate,    # Validar consistência do perfil
-    [switch]$WriteDriver, # Escrever valores do driver no registro (após instalar o driver)
+    [switch]$WriteDriver, # Criar chave Parameters do driver no registro (após instalar o driver)
     [int]$BoardIndex = 0, # 1-based; se >0, pula o menu interativo de placa
     [string]$Socket = ""  # opcional; se setado, pula deteccao automatica de socket
 )
@@ -117,7 +122,7 @@ function Show-Banner {
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
     Write-Host "  ║        HWPROFILE  -  Gerador de Perfil HW       ║" -ForegroundColor DarkCyan
-    Write-Host "  ║            Perfil centralizado v6               ║" -ForegroundColor DarkCyan
+    Write-Host "  ║            Perfil centralizado v7               ║" -ForegroundColor DarkCyan
     Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
     Write-Host ""
 }
@@ -131,7 +136,7 @@ function Show-Usage {
     Write-Host "    .\generate-profile.ps1 -Validate    " -NoNewline -ForegroundColor White
     Write-Host "Validar consistência do perfil" -ForegroundColor Gray
     Write-Host "    .\generate-profile.ps1 -WriteDriver " -NoNewline -ForegroundColor White
-    Write-Host "Escrever seed do driver no registro" -ForegroundColor Gray
+    Write-Host "Criar chave Parameters do driver no registro" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Localização do perfil: " -NoNewline -ForegroundColor Gray
     Write-Host $ProfilePath -ForegroundColor Cyan
@@ -414,10 +419,6 @@ function Invoke-Generate {
         }
     }
 
-    # Storage
-    $storageSeedBytes = Get-CryptoRandomBytes -Count 32
-    $storageSeedB64   = [Convert]::ToBase64String($storageSeedBytes)
-
     # ---- Monitor EDID (schema v5, completo) ----
     # Escolhe marca primeiro, depois modelo pertencente a essa marca para
     # que anti-cheat que hash o EDID inteiro nao veja combinacoes impossiveis
@@ -462,7 +463,7 @@ function Invoke-Generate {
 
     # Montar o objeto do perfil
     $prof = [ordered]@{
-        version        = 6
+        version        = 7
         generated_utc  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         cpu_detected   = $cpuName
         socket_matched = $socket
@@ -499,11 +500,6 @@ function Invoke-Generate {
             oem_strings          = @("Default string", "Default string")
         }
         network = $networkEntries
-        storage = [ordered]@{
-            seed_b64      = $storageSeedB64
-            serial_prefix = "S6BN"
-            serial_length = 15
-        }
         monitor = [ordered]@{
             mfr_pnp_id   = $mfrPnP
             product_code = $productCode
@@ -545,7 +541,7 @@ function Invoke-Generate {
     Write-Host "  [+] Perfil salvo em: $ProfilePath" -ForegroundColor Green
     Write-Host ""
 
-    # Escrever valores do driver no registro
+    # Criar chave Parameters do driver no registro
     Write-DriverRegistry -Profile $prof
 
     # Exibir resumo
@@ -558,21 +554,26 @@ function Invoke-Generate {
 }
 
 # ============================================================
-#  -WriteDriver : Escrever seed do driver no registro
+#  -WriteDriver : Criar chave Parameters do driver no registro
 # ============================================================
+# Nota v7: o driver rstflt v3.6 nao intercepta mais IOCTLs de storage,
+# entao nao ha mais SerialSeed/SerialPrefix/SerialLength para gravar.
+# Esta funcao apenas garante que a chave Parameters exista — os valores
+# SMBIOS (SmbiosBlob, EnableSmbiosReplay, OrigSmbiosData) sao escritos
+# por spoof-smbios.ps1 quando o replay SMBIOS e habilitado.
 
 function Write-DriverRegistry {
     param($Profile)
 
     $driverKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
 
-    Write-Host "  [*] Escrevendo valores do driver no registro..." -ForegroundColor Cyan
+    Write-Host "  [*] Preparando chave Parameters do driver no registro..." -ForegroundColor Cyan
 
     # Verificar se a chave do serviço existe
     $serviceKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt"
     if (-not (Test-Path $serviceKeyPath)) {
         Write-Host "  [AVISO] Chave do serviço RstFlt não encontrada." -ForegroundColor Yellow
-        Write-Host "  O driver ainda não foi instalado. Os valores serão escritos," -ForegroundColor Yellow
+        Write-Host "  O driver ainda não foi instalado. A chave Parameters sera criada," -ForegroundColor Yellow
         Write-Host "  mas o driver precisa ser instalado para funcionar." -ForegroundColor Yellow
         Write-Host ""
     }
@@ -587,53 +588,37 @@ function Write-DriverRegistry {
             Write-Host "  [ERRO] Falha ao criar chave de registro: $_" -ForegroundColor Red
             return
         }
-    }
-
-    # Obter dados do storage
-    $storageData = $null
-    if ($Profile -is [PSCustomObject]) {
-        $storageData = $Profile.storage
     } else {
-        $storageData = $Profile["storage"]
+        Write-Host "  [+] Chave Parameters ja existe: $driverKeyPath" -ForegroundColor Green
     }
 
-    $seedB64      = if ($storageData -is [PSCustomObject]) { $storageData.seed_b64 }      else { $storageData["seed_b64"] }
-    $serialPrefix = if ($storageData -is [PSCustomObject]) { $storageData.serial_prefix } else { $storageData["serial_prefix"] }
-    $serialLength = if ($storageData -is [PSCustomObject]) { $storageData.serial_length } else { $storageData["serial_length"] }
-
-    # SerialSeed (REG_BINARY, 32 bytes)
-    try {
-        $seedBytes = [Convert]::FromBase64String($seedB64)
-        Set-ItemProperty -Path $driverKeyPath -Name "SerialSeed" -Value $seedBytes -Type Binary
-        Write-Host "  [+] SerialSeed     : " -NoNewline -ForegroundColor Green
-        Write-Host "32 bytes (REG_BINARY)" -ForegroundColor White
+    # Limpeza de residuos v3.5 -> v3.6: se o usuario esta atualizando,
+    # os valores SerialSeed/SerialPrefix/SerialLength continuam sentados
+    # na chave Parameters. O driver v3.6 nao le mais, mas sao "old-code
+    # was here" para qualquer scan de anti-cheat que enumere Parameters.
+    $stale = @('SerialSeed', 'SerialPrefix', 'SerialLength')
+    $removedAny = $false
+    foreach ($name in $stale) {
+        try {
+            $existing = Get-ItemProperty -Path $driverKeyPath -Name $name -ErrorAction Stop
+            if ($existing) {
+                Remove-ItemProperty -Path $driverKeyPath -Name $name -ErrorAction SilentlyContinue
+                Write-Host "  [-] Removido residuo v3.5: $name" -ForegroundColor DarkYellow
+                $removedAny = $true
+            }
+        } catch {
+            # valor nao existia — normal em instalacao fresca
+        }
     }
-    catch {
-        Write-Host "  [ERRO] Falha ao escrever SerialSeed: $_" -ForegroundColor Red
-    }
-
-    # SerialPrefix (REG_SZ)
-    try {
-        Set-ItemProperty -Path $driverKeyPath -Name "SerialPrefix" -Value $serialPrefix -Type String
-        Write-Host "  [+] SerialPrefix   : " -NoNewline -ForegroundColor Green
-        Write-Host "$serialPrefix (REG_SZ)" -ForegroundColor White
-    }
-    catch {
-        Write-Host "  [ERRO] Falha ao escrever SerialPrefix: $_" -ForegroundColor Red
-    }
-
-    # SerialLength (REG_DWORD)
-    try {
-        Set-ItemProperty -Path $driverKeyPath -Name "SerialLength" -Value ([int]$serialLength) -Type DWord
-        Write-Host "  [+] SerialLength   : " -NoNewline -ForegroundColor Green
-        Write-Host "$serialLength (REG_DWORD)" -ForegroundColor White
-    }
-    catch {
-        Write-Host "  [ERRO] Falha ao escrever SerialLength: $_" -ForegroundColor Red
+    if (-not $removedAny) {
+        Write-Host "  [i] Sem residuos v3.5 a limpar." -ForegroundColor DarkGray
     }
 
     Write-Host ""
-    Write-Host "  [+] Valores do driver escritos com sucesso." -ForegroundColor Green
+    Write-Host "  [+] Chave Parameters pronta." -ForegroundColor Green
+    Write-Host "  [i] Nota: driver rstflt v3.6 nao spoofa mais serial de disco." -ForegroundColor DarkGray
+    Write-Host "  [i] Valores SMBIOS (SmbiosBlob, EnableSmbiosReplay) sao gravados" -ForegroundColor DarkGray
+    Write-Host "      por spoof-smbios.ps1 quando o replay SMBIOS e habilitado." -ForegroundColor DarkGray
 }
 
 function Invoke-WriteDriver {
@@ -756,24 +741,7 @@ function Invoke-Validate {
         $passed++
     }
 
-    # 6. Storage seed tem 32 bytes
-    $checks++
-    try {
-        $seedBytes = [Convert]::FromBase64String($prof.storage.seed_b64)
-        if ($seedBytes.Length -eq 32) {
-            Write-Host "  [OK]    Storage seed tem 32 bytes" -ForegroundColor Green
-            $passed++
-        } else {
-            Write-Host "  [FALHA] Storage seed tem $($seedBytes.Length) bytes (esperado: 32)" -ForegroundColor Red
-            $allPassed = $false
-        }
-    }
-    catch {
-        Write-Host "  [FALHA] Storage seed não é base64 válido" -ForegroundColor Red
-        $allPassed = $false
-    }
-
-    # 8. EDID legacy serial (compat com spoof-mac.ps1)
+    # 6. EDID legacy serial (compat com spoof-mac.ps1)
     $checks++
     if ($prof.monitor -and $prof.monitor.edid_serial) {
         $edidHex = $prof.monitor.edid_serial
@@ -789,7 +757,7 @@ function Invoke-Validate {
         $passed++  # Nao falhar para profiles legados
     }
 
-    # 9. Monitor EDID v5 — mfr_pnp_id, product_code, serial_num, week/year
+    # 7. Monitor EDID v5 — mfr_pnp_id, product_code, serial_num, week/year
     $checks++
     $monOk = $true
     $mon = $prof.monitor
@@ -855,7 +823,7 @@ function Invoke-Validate {
         }
     }
 
-    # 10. Monitor edid_serial (legacy) deriva de serial_num (LE)
+    # 8. Monitor edid_serial (legacy) deriva de serial_num (LE)
     $checks++
     if ($mon -and $null -ne $mon.serial_num -and $mon.edid_serial) {
         try {
@@ -877,7 +845,7 @@ function Invoke-Validate {
         $passed++
     }
 
-    # 11. Audio rotation pool — >=2 GUIDs validos
+    # 9. Audio rotation pool — >=2 GUIDs validos
     $checks++
     $guidBracesPattern = "^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$"
     if ($prof.audio -and $prof.audio.rotation_pool) {
@@ -905,7 +873,7 @@ function Invoke-Validate {
         $passed++
     }
 
-    # 12. EMAC persistent_uuid — UUID v4
+    # 10. EMAC persistent_uuid — UUID v4
     $checks++
     if ($prof.emac -and $prof.emac.persistent_uuid) {
         $emacU = $prof.emac.persistent_uuid
@@ -945,7 +913,6 @@ function Show-ProfileData {
     # Acessar dados de forma compatível com PSCustomObject e Hashtable
     $smbios  = if ($p -is [PSCustomObject]) { $p.smbios }  else { $p["smbios"] }
     $network = if ($p -is [PSCustomObject]) { $p.network } else { $p["network"] }
-    $storage = if ($p -is [PSCustomObject]) { $p.storage } else { $p["storage"] }
     $monitor = if ($p -is [PSCustomObject]) { $p.monitor } else { $p["monitor"] }
     $audio   = if ($p -is [PSCustomObject]) { $p.audio }   else { $p["audio"] }
     $emac    = if ($p -is [PSCustomObject]) { $p.emac }    else { $p["emac"] }
@@ -1009,25 +976,6 @@ function Show-ProfileData {
         $macFormatted = ($macStr -replace '(.{2})', '$1-').TrimEnd('-')
         Write-Host "  $($matchStr.PadRight(22)) : " -NoNewline -ForegroundColor Gray
         Write-Host $macFormatted -ForegroundColor White
-    }
-    Write-Host ""
-
-    # Storage
-    Write-Host "  --- Storage ---" -ForegroundColor Cyan
-    $seedB64  = if ($storage -is [PSCustomObject]) { $storage.seed_b64 }      else { $storage["seed_b64"] }
-    $prefix   = if ($storage -is [PSCustomObject]) { $storage.serial_prefix } else { $storage["serial_prefix"] }
-    $length   = if ($storage -is [PSCustomObject]) { $storage.serial_length } else { $storage["serial_length"] }
-
-    Write-Host "  Serial Prefix        : " -NoNewline -ForegroundColor Gray
-    Write-Host $prefix -ForegroundColor White
-    Write-Host "  Serial Length        : " -NoNewline -ForegroundColor Gray
-    Write-Host $length -ForegroundColor White
-    Write-Host "  Seed (base64)        : " -NoNewline -ForegroundColor Gray
-    # Mostrar apenas os primeiros 20 chars do seed para legibilidade
-    if ($seedB64.Length -gt 24) {
-        Write-Host "$($seedB64.Substring(0, 24))..." -ForegroundColor White
-    } else {
-        Write-Host $seedB64 -ForegroundColor White
     }
     Write-Host ""
 
