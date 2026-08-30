@@ -1,10 +1,17 @@
 /*
- * RstFlt - Minimal SMBIOS-Replay Filter Driver (v3.6)
+ * RstFlt - Minimal SMBIOS + CPU Registry Replay Filter Driver (v4.0)
  *
- * SYSTEM_START upper filter of the DiskDrive class. Its only job is
- * to replay a userspace-cached SMBIOS blob into mssmbios\Data during
- * DriverEntry, ahead of winmgmt / anti-cheat. All IRPs are strict
- * pass-through — the driver does no filtering of storage I/O.
+ * SYSTEM_START upper filter of the DiskDrive class. Its jobs are to
+ * replay a userspace-cached SMBIOS blob into mssmbios\Data during
+ * DriverEntry (ahead of winmgmt / anti-cheat), and to replay cached
+ * per-core CPU identity strings (ProcessorNameString / Identifier /
+ * VendorIdentifier) into every subkey under
+ *   \Registry\Machine\HARDWARE\DESCRIPTION\System\CentralProcessor
+ * so per-thread readers (WMI Win32_Processor, GetSystemInfo, cpuinfo
+ * scrapers, EMAC-style AC probes) return the spoofed identity on every
+ * logical processor. CPU replay runs on a system worker thread so
+ * DriverEntry returns immediately (no boot slowdown). All IRPs are
+ * strict pass-through - the driver does no filtering of storage I/O.
  *
  * Changelog
  * ---------
@@ -116,6 +123,36 @@
  *             filter always has attachments, so unload never actually
  *             runs, and advertising it lets sc-stop→replace→sc-start
  *             race the stale mapped image.
+ * v4.0 - CPU registry replay added (Track A of Fase 2).
+ *     - New ReplayCpuRegistry queued as a system-thread work item
+ *       from DriverEntry; runs at PASSIVE off the boot-driver thread
+ *       so DriverEntry returns immediately (no boot slowdown) and
+ *       the CPU-population race with HAL is drained with a 10s
+ *       budget instead of blocking DriverEntry for 500ms.
+ *     - Opt-in via Parameters\EnableCpuReplay (REG_DWORD, default 0)
+ *       mirroring EnableSmbiosReplay. Cached CpuStrings absent OR
+ *       gate zero -> replay is a no-op.
+ *     - Parameters\OrigCpuStrings backup written on first apply so
+ *       09-recuperar-boot can restore genuine CPU strings offline.
+ *     - HAL race hardening: wait for CentralProcessor subkey count
+ *       to reach KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)
+ *       before enumerating; each per-value write is preceded by a
+ *       ZwQueryValueKey probe so we only overwrite values HAL has
+ *       already populated (avoids the last-writer-wins loss).
+ *     - Cached blob is validated before use: reject odd DataLength,
+ *       enforce per-string caps (128 wchar name / 64 wchar identifier
+ *       / 16 wchar vendor) so a corrupted or oversized cache cannot
+ *       propagate a 32k string into registry consumers.
+ *     - subBuf sized 256 WCHARs; STATUS_BUFFER_OVERFLOW /
+ *       STATUS_BUFFER_TOO_SMALL on ZwEnumerateKey is treated as
+ *       "skip this entry, continue" instead of aborting the enum.
+ *     - Ordering: ReplayCpuRegistry is queued BEFORE
+ *       ApplySmbiosBlobIfCached in DriverEntry so the race-sensitive
+ *       op does not sit behind an on-disk hive I/O in the queue.
+ *       (ApplySmbiosBlobIfCached itself stays inline in DriverEntry —
+ *       its target hive is on-disk and mssmbios has already booted
+ *       BOOT_START before us, so the timing pressure is on future
+ *       readers/reloads, not this-boot mssmbios.)
  *
  * WARNING: Kernel drivers can BSOD your machine if buggy.
  * Test signing mode required to load unsigned drivers.
@@ -128,6 +165,20 @@
  * ================================================================ */
 #define POOL_TAG    'tRsF'
 
+/* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
+ * Downstream WMI / session-mgr consumers commonly use fixed 260-char
+ * buffers; caps well under that protect them from a corrupted cache
+ * that would otherwise propagate a 32k string. */
+#define CPU_NAME_MAX_WCHARS    128
+#define CPU_IDENT_MAX_WCHARS   64
+#define CPU_VENDOR_MAX_WCHARS  16
+
+/* v4.0: HAL/subkey-population wait budget. Each pass sleeps 100ms;
+ * 100 passes = 10s. Runs on a worker thread so this does not block
+ * DriverEntry or downstream SYSTEM_START drivers. */
+#define CPU_REPLAY_MAX_PASSES  100
+#define CPU_REPLAY_DELAY_MS    100
+
 /* ================================================================
  *  Device extension - attached to each filtered disk device.
  *  v3.6: no per-device state beyond what PnP correctness requires.
@@ -139,6 +190,18 @@ typedef struct _DEVICE_EXTENSION {
     BOOLEAN         Started;
     BOOLEAN         Removed;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
+
+/* ================================================================
+ *  CPU replay worker context - allocated in nonpaged pool by
+ *  DriverEntry, freed by the worker itself after replay finishes.
+ *  Owns a private copy of RegPath's buffer (IO manager's UNICODE_STRING
+ *  is stack-scoped on the caller and must not outlive DriverEntry).
+ * ================================================================ */
+typedef struct _CPU_REPLAY_CTX {
+    WORK_QUEUE_ITEM  WorkItem;
+    UNICODE_STRING   RegPath;
+    WCHAR            RegPathBuffer[1];  /* trailing flexible buffer  */
+} CPU_REPLAY_CTX, *PCPU_REPLAY_CTX;
 
 /* ================================================================
  *  Forward declarations
@@ -154,6 +217,8 @@ static IO_COMPLETION_ROUTINE PnpRemoveCompletion;
 
 static VOID    ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath);
 static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length);
+static VOID    ReplayCpuRegistry(PUNICODE_STRING RegPath);
+static VOID    CpuReplayWorker(PVOID Context);
 
 /* ================================================================
  *  ValidateSmbiosBlob - sanity-check a cached SMBIOS blob before
@@ -457,6 +522,608 @@ out:
 }
 
 /* ================================================================
+ *  ReplayCpuRegistry - Track A / v4.0 core routine.
+ *
+ *  Rewrites three per-core REG_SZ values under
+ *      \Registry\Machine\HARDWARE\DESCRIPTION\System\CentralProcessor\<N>
+ *  on every logical processor, from a REG_MULTI_SZ cached by userspace
+ *  at
+ *      <RegPath>\Parameters\CpuStrings
+ *  Layout — three consecutive NUL-terminated wide strings then a
+ *  final double-NUL sentinel, order fixed:
+ *      [0] ProcessorNameString  (cap CPU_NAME_MAX_WCHARS wchars)
+ *      [1] Identifier           (cap CPU_IDENT_MAX_WCHARS wchars)
+ *      [2] VendorIdentifier     (cap CPU_VENDOR_MAX_WCHARS wchars)
+ *
+ *  Opt-in gate: Parameters\EnableCpuReplay (REG_DWORD, default 0),
+ *  identical shape to EnableSmbiosReplay. Missing or zero -> return.
+ *
+ *  Backup: on first successful open of CentralProcessor\0, if
+ *  Parameters\OrigCpuStrings does not exist, snapshot the current
+ *  ProcessorNameString/Identifier/VendorIdentifier there as a
+ *  REG_MULTI_SZ so 09-recuperar-boot can restore genuine values.
+ *
+ *  Race with HAL: HARDWARE\DESCRIPTION\System is a volatile hive
+ *  rebuilt every boot. HAL creates the CentralProcessor root very
+ *  early but populates each per-CPU subkey and each value inside
+ *  those subkeys asynchronously as APs come online. We
+ *    (a) wait until ZwQueryKey(hCpuRoot).SubKeys reaches the value
+ *        reported by KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS),
+ *    (b) before every ZwSetValueKey, probe the target value with
+ *        ZwQueryValueKey: if it is not yet present (STATUS_OBJECT_
+ *        NAME_NOT_FOUND) we skip that core this pass, mark it, and
+ *        try again on the next 100ms tick. Once the value exists we
+ *        overwrite it — we are the last writer, so HAL cannot clobber
+ *        us afterwards.
+ *  Overall budget CPU_REPLAY_MAX_PASSES * CPU_REPLAY_DELAY_MS ms.
+ *
+ *  Runs on a system worker thread (via CpuReplayWorker) so this whole
+ *  loop never blocks DriverEntry or downstream SYSTEM_START drivers.
+ *  All failures are silent; never bugchecks.
+ * ================================================================ */
+static VOID ReplayCpuRegistry(PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+    HANDLE   hParams   = NULL;
+    HANDLE   hCpuRoot  = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING paramsPath, tail, valName, cpuRootPath;
+    WCHAR    paramsBuf[512];
+    ULONG    needSize = 0;
+    ULONG    allocSize;
+    PKEY_VALUE_PARTIAL_INFORMATION info      = NULL;
+    UCHAR    flagBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION flagInfo  =
+        (PKEY_VALUE_PARTIAL_INFORMATION)flagBuf;
+    ULONG    flagVal   = 0;
+    PWCHAR   strs[3];
+    ULONG    strLens[3];
+    ULONG    walkIdx;
+    ULONG    foundCount;
+    PWCHAR   cursor;
+    PWCHAR   limit;
+    ULONG    expected;
+    ULONG    pass;
+    ULONG    keyInfoNeed = 0;
+    UCHAR    keyInfoBuf[sizeof(KEY_FULL_INFORMATION) + 64];
+    PKEY_FULL_INFORMATION keyInfo = (PKEY_FULL_INFORMATION)keyInfoBuf;
+    LARGE_INTEGER delay;
+    ULONG    subIndex;
+    UCHAR    subBuf[sizeof(KEY_BASIC_INFORMATION) + 256 * sizeof(WCHAR)];
+    PKEY_BASIC_INFORMATION subInfo = (PKEY_BASIC_INFORMATION)subBuf;
+    ULONG    coresDone;
+    ULONG    coresPending;
+    BOOLEAN  backupChecked = FALSE;
+
+    /* Same NULL/empty guard as ApplySmbiosBlobIfCached — the two
+       functions share the RegPath supplied by IO manager (copied
+       into the worker context). */
+    if (RegPath == NULL || RegPath->Buffer == NULL || RegPath->Length == 0)
+        return;
+
+    /* Build "<RegPath>\Parameters" */
+    paramsPath.Buffer        = paramsBuf;
+    paramsPath.Length        = 0;
+    paramsPath.MaximumLength = sizeof(paramsBuf);
+
+    st = RtlAppendUnicodeStringToString(&paramsPath, RegPath);
+    if (!NT_SUCCESS(st)) return;
+
+    RtlInitUnicodeString(&tail, L"\\Parameters");
+    st = RtlAppendUnicodeStringToString(&paramsPath, &tail);
+    if (!NT_SUCCESS(st)) return;
+
+    InitializeObjectAttributes(&oa, &paramsPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwOpenKey(&hParams, KEY_READ | KEY_SET_VALUE, &oa);
+    if (!NT_SUCCESS(st)) return;
+
+    /* --- Opt-in gate: EnableCpuReplay = 1 --- */
+    RtlInitUnicodeString(&valName, L"EnableCpuReplay");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &needSize);
+    if (!NT_SUCCESS(st) ||
+        flagInfo->Type != REG_DWORD ||
+        flagInfo->DataLength < sizeof(ULONG))
+    {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: opt-in flag absent, skipping\n");
+#endif
+        goto out;
+    }
+    RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+    if (flagVal == 0) {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: opt-in flag = 0, skipping\n");
+#endif
+        goto out;
+    }
+
+    /* Two-phase query for CpuStrings. */
+    RtlInitUnicodeString(&valName, L"CpuStrings");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         NULL, 0, &needSize);
+    if (st != STATUS_BUFFER_TOO_SMALL &&
+        st != STATUS_BUFFER_OVERFLOW)
+    {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: CpuStrings absent, skipping\n");
+#endif
+        goto out;
+    }
+    if (needSize < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) +
+                   3 * sizeof(WCHAR))
+        goto out;
+
+    allocSize = needSize;
+    info = (PKEY_VALUE_PARTIAL_INFORMATION)
+           ExAllocatePoolWithTag(NonPagedPool, allocSize, POOL_TAG);
+    if (info == NULL) goto out;
+
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         info, allocSize, &needSize);
+    if (!NT_SUCCESS(st))              goto out;
+    if (info->Type != REG_MULTI_SZ)   goto out;
+    if (info->DataLength < 3 * sizeof(WCHAR)) goto out;
+
+    /* Reject odd byte length up front — WCHAR-alignment invariant. */
+    if (info->DataLength & 1) {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: CpuStrings odd DataLength, ignored\n");
+#endif
+        goto out;
+    }
+
+    /* Walk the MULTI_SZ, capture pointers/lengths for the first three
+       non-empty strings. Bounds use a wchar-typed limit so odd-length
+       cases (rejected above but belt-and-braces) cannot step past the
+       nominal allocation. */
+    for (walkIdx = 0; walkIdx < 3; walkIdx++) {
+        strs[walkIdx]    = NULL;
+        strLens[walkIdx] = 0;
+    }
+    foundCount = 0;
+    cursor = (PWCHAR)info->Data;
+    limit  = (PWCHAR)info->Data + (info->DataLength / sizeof(WCHAR));
+
+    while (cursor < limit && foundCount < 3) {
+        PWCHAR scan = cursor;
+        ULONG  wideLen = 0;
+
+        while (scan < limit && *scan != L'\0') {
+            scan++;
+            wideLen++;
+        }
+        if (scan >= limit) break;     /* no terminator inside bounds  */
+        if (wideLen == 0) break;      /* empty string — end of table  */
+
+        strs[foundCount]    = cursor;
+        strLens[foundCount] = wideLen;
+        foundCount++;
+        cursor = scan + 1;            /* skip past NUL                */
+    }
+
+    if (foundCount < 3) {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: CpuStrings has %lu strings, "
+                 "need 3 — skipping\n", foundCount);
+#endif
+        goto out;
+    }
+
+    /* Per-string caps: reject the whole blob if any string overruns
+       the realistic upper bound (128/64/16 wchars respectively).
+       Downstream WMI/session-mgr readers commonly assume 260-char
+       buffers, and a 32k ProcessorNameString on every core is a
+       reliable way to crash them at SYSTEM_START. */
+    if (strLens[0] > CPU_NAME_MAX_WCHARS   ||
+        strLens[1] > CPU_IDENT_MAX_WCHARS  ||
+        strLens[2] > CPU_VENDOR_MAX_WCHARS)
+    {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: CpuStrings too long "
+                 "(%lu/%lu/%lu wchars) — skipping\n",
+                 strLens[0], strLens[1], strLens[2]);
+#endif
+        goto out;
+    }
+
+    /* CentralProcessor root path — volatile hive, no on-disk I/O. */
+    RtlInitUnicodeString(&cpuRootPath,
+        L"\\Registry\\Machine\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor");
+
+    /* Expected logical-CPU count from the kernel scheduler. Zero
+       return would be pathological; treat it as "give up". */
+    expected = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    if (expected == 0) {
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: KeQueryActiveProcessorCountEx=0, "
+                 "skipping\n");
+#endif
+        goto out;
+    }
+
+    /* Track which cores still need at least one value written. We
+       don't know the max subkey index until we enumerate, so we
+       count coresDone against `expected` and re-enter the pass loop
+       until every core is done or the budget expires. */
+    coresDone = 0;
+
+    for (pass = 0; pass < CPU_REPLAY_MAX_PASSES; pass++) {
+
+        /* Reset per-pass root handle up front — defensive against
+           Verifier fault-injection paths that don't clear the OUT
+           handle on failure. */
+        hCpuRoot = NULL;
+
+        InitializeObjectAttributes(&oa, &cpuRootPath,
+                                   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                                   NULL, NULL);
+        st = ZwOpenKey(&hCpuRoot,
+                       KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE,
+                       &oa);
+        if (!NT_SUCCESS(st)) {
+            if (st == STATUS_OBJECT_NAME_NOT_FOUND) {
+                /* HAL has not published the root yet — wait and retry. */
+                delay.QuadPart =
+                    -(LONGLONG)(CPU_REPLAY_DELAY_MS * 10 * 1000);
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+                continue;
+            }
+#if DBG
+            DbgPrint("[RstFlt] CPU replay: open CentralProcessor "
+                     "failed 0x%08X\n", st);
+#endif
+            goto out;
+        }
+
+        /* Wait for HAL to publish every per-CPU subkey. */
+        st = ZwQueryKey(hCpuRoot, KeyFullInformation,
+                        keyInfo, sizeof(keyInfoBuf), &keyInfoNeed);
+        if (!NT_SUCCESS(st)) {
+#if DBG
+            DbgPrint("[RstFlt] CPU replay: ZwQueryKey failed 0x%08X\n", st);
+#endif
+            ZwClose(hCpuRoot);
+            hCpuRoot = NULL;
+            goto out;
+        }
+
+        if (keyInfo->SubKeys < expected) {
+            /* Not all APs have come online yet. Close and retry. */
+            ZwClose(hCpuRoot);
+            hCpuRoot = NULL;
+            delay.QuadPart =
+                -(LONGLONG)(CPU_REPLAY_DELAY_MS * 10 * 1000);
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            continue;
+        }
+
+        /* Enumerate every subkey. For each one, per-value pre-check
+           against HAL race: only overwrite values HAL has already
+           populated. Count cores fully written this pass; if any
+           remain pending, retry after a delay. */
+        coresDone    = 0;
+        coresPending = 0;
+        subIndex     = 0;
+
+        for (;;) {
+            HANDLE hCpu = NULL;
+            UNICODE_STRING subName;
+            OBJECT_ATTRIBUTES subOa;
+            UNICODE_STRING vProcName, vIdent, vVendor;
+            ULONG resultLen  = 0;
+            ULONG probeNeed  = 0;
+            NTSTATUS probeSt;
+            BOOLEAN valuesReady = TRUE;
+
+            st = ZwEnumerateKey(hCpuRoot, subIndex, KeyBasicInformation,
+                                subInfo, sizeof(subBuf), &resultLen);
+            if (st == STATUS_NO_MORE_ENTRIES) break;
+            if (st == STATUS_BUFFER_OVERFLOW ||
+                st == STATUS_BUFFER_TOO_SMALL)
+            {
+                /* Oversized subkey name — skip past it, keep going. */
+#if DBG
+                DbgPrint("[RstFlt] CPU replay: enum idx=%lu oversized, "
+                         "skipping\n", subIndex);
+#endif
+                subIndex++;
+                continue;
+            }
+            if (!NT_SUCCESS(st)) {
+#if DBG
+                DbgPrint("[RstFlt] CPU replay: enum idx=%lu failed 0x%08X\n",
+                         subIndex, st);
+#endif
+                break;
+            }
+
+            subName.Buffer        = subInfo->Name;
+            subName.Length        = (USHORT)subInfo->NameLength;
+            subName.MaximumLength = (USHORT)subInfo->NameLength;
+
+            InitializeObjectAttributes(&subOa, &subName,
+                                       OBJ_CASE_INSENSITIVE |
+                                       OBJ_KERNEL_HANDLE,
+                                       hCpuRoot, NULL);
+            st = ZwOpenKey(&hCpu, KEY_QUERY_VALUE | KEY_SET_VALUE, &subOa);
+            if (!NT_SUCCESS(st)) {
+#if DBG
+                DbgPrint("[RstFlt] CPU replay: open subkey idx=%lu "
+                         "failed 0x%08X\n", subIndex, st);
+#endif
+                subIndex++;
+                continue;
+            }
+
+            /* One-shot backup on the FIRST subkey we can open with
+               all three values present. Only cores past the HAL race
+               are legitimate sources of "genuine" values.
+               Post-verify fix (N1): backupChecked is set AFTER the
+               successful ZwSetValueKey below, not on entry — so a
+               core still mid-population on this pass does not consume
+               the one-shot; the next pass / next subkey retries. */
+            if (!backupChecked) {
+                UNICODE_STRING origName;
+                ULONG origNeed = 0;
+
+                RtlInitUnicodeString(&origName, L"OrigCpuStrings");
+                probeSt = ZwQueryValueKey(hParams, &origName,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &origNeed);
+                if (probeSt == STATUS_OBJECT_NAME_NOT_FOUND) {
+                    /* Read current name/ident/vendor from THIS core.
+                       Skip backup if any value is not yet present —
+                       we'll try again next pass on the next subkey. */
+                    UNICODE_STRING nName, iName, vName2;
+                    PKEY_VALUE_PARTIAL_INFORMATION nInfo = NULL;
+                    PKEY_VALUE_PARTIAL_INFORMATION iInfo = NULL;
+                    PKEY_VALUE_PARTIAL_INFORMATION vInfo = NULL;
+                    ULONG nNeed = 0, iNeed = 0, vNeed = 0;
+                    NTSTATUS nSt, iSt, vSt;
+
+                    RtlInitUnicodeString(&nName, L"ProcessorNameString");
+                    RtlInitUnicodeString(&iName, L"Identifier");
+                    RtlInitUnicodeString(&vName2, L"VendorIdentifier");
+
+                    nSt = ZwQueryValueKey(hCpu, &nName,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &nNeed);
+                    iSt = ZwQueryValueKey(hCpu, &iName,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &iNeed);
+                    vSt = ZwQueryValueKey(hCpu, &vName2,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &vNeed);
+
+                    if ((nSt == STATUS_BUFFER_TOO_SMALL ||
+                         nSt == STATUS_BUFFER_OVERFLOW) &&
+                        (iSt == STATUS_BUFFER_TOO_SMALL ||
+                         iSt == STATUS_BUFFER_OVERFLOW) &&
+                        (vSt == STATUS_BUFFER_TOO_SMALL ||
+                         vSt == STATUS_BUFFER_OVERFLOW))
+                    {
+                        nInfo = (PKEY_VALUE_PARTIAL_INFORMATION)
+                            ExAllocatePoolWithTag(NonPagedPool,
+                                                  nNeed, POOL_TAG);
+                        iInfo = (PKEY_VALUE_PARTIAL_INFORMATION)
+                            ExAllocatePoolWithTag(NonPagedPool,
+                                                  iNeed, POOL_TAG);
+                        vInfo = (PKEY_VALUE_PARTIAL_INFORMATION)
+                            ExAllocatePoolWithTag(NonPagedPool,
+                                                  vNeed, POOL_TAG);
+
+                        if (nInfo && iInfo && vInfo) {
+                            nSt = ZwQueryValueKey(hCpu, &nName,
+                                    KeyValuePartialInformation,
+                                    nInfo, nNeed, &nNeed);
+                            iSt = ZwQueryValueKey(hCpu, &iName,
+                                    KeyValuePartialInformation,
+                                    iInfo, iNeed, &iNeed);
+                            vSt = ZwQueryValueKey(hCpu, &vName2,
+                                    KeyValuePartialInformation,
+                                    vInfo, vNeed, &vNeed);
+
+                            if (NT_SUCCESS(nSt) && NT_SUCCESS(iSt) &&
+                                NT_SUCCESS(vSt) &&
+                                nInfo->Type == REG_SZ &&
+                                iInfo->Type == REG_SZ &&
+                                vInfo->Type == REG_SZ)
+                            {
+                                /* Assemble a MULTI_SZ:
+                                   name\0ident\0vendor\0\0
+                                   We assume the source values are
+                                   NUL-terminated as REG_SZ from HAL. */
+                                ULONG nBytes = nInfo->DataLength;
+                                ULONG iBytes = iInfo->DataLength;
+                                ULONG vBytes = vInfo->DataLength;
+                                ULONG totalBytes;
+                                PUCHAR blob;
+
+                                /* Ensure each has its own terminator;
+                                   if not, pad. */
+                                if (nBytes < sizeof(WCHAR)) nBytes = 0;
+                                if (iBytes < sizeof(WCHAR)) iBytes = 0;
+                                if (vBytes < sizeof(WCHAR)) vBytes = 0;
+
+                                totalBytes = nBytes + iBytes + vBytes +
+                                             sizeof(WCHAR); /* final NUL */
+
+                                blob = (PUCHAR)ExAllocatePoolWithTag(
+                                        NonPagedPool, totalBytes,
+                                        POOL_TAG);
+                                if (blob) {
+                                    ULONG off = 0;
+                                    if (nBytes) {
+                                        RtlCopyMemory(blob + off,
+                                                      nInfo->Data,
+                                                      nBytes);
+                                        off += nBytes;
+                                    }
+                                    if (iBytes) {
+                                        RtlCopyMemory(blob + off,
+                                                      iInfo->Data,
+                                                      iBytes);
+                                        off += iBytes;
+                                    }
+                                    if (vBytes) {
+                                        RtlCopyMemory(blob + off,
+                                                      vInfo->Data,
+                                                      vBytes);
+                                        off += vBytes;
+                                    }
+                                    /* trailing double-NUL sentinel:
+                                       previous string's NUL + one more */
+                                    blob[off]     = 0;
+                                    blob[off + 1] = 0;
+
+                                    {
+                                        NTSTATUS bkSt;
+                                        bkSt = ZwSetValueKey(hParams,
+                                                    &origName, 0,
+                                                    REG_MULTI_SZ,
+                                                    blob,
+                                                    (ULONG)totalBytes);
+                                        if (NT_SUCCESS(bkSt)) {
+                                            backupChecked = TRUE;
+#if DBG
+                                            DbgPrint("[RstFlt] CPU "
+                                                "replay: backed up %lu "
+                                                "bytes to "
+                                                "OrigCpuStrings\n",
+                                                totalBytes);
+#endif
+                                        }
+                                    }
+                                    ExFreePoolWithTag(blob, POOL_TAG);
+                                }
+                            }
+                        }
+
+                        if (nInfo) ExFreePoolWithTag(nInfo, POOL_TAG);
+                        if (iInfo) ExFreePoolWithTag(iInfo, POOL_TAG);
+                        if (vInfo) ExFreePoolWithTag(vInfo, POOL_TAG);
+                    }
+                }
+            }
+
+            /* Per-value pre-check: only overwrite what HAL has
+               already published on this core. If any of the three
+               is absent, treat this core as not-ready for this pass. */
+            RtlInitUnicodeString(&vProcName, L"ProcessorNameString");
+            RtlInitUnicodeString(&vIdent,    L"Identifier");
+            RtlInitUnicodeString(&vVendor,   L"VendorIdentifier");
+
+            probeSt = ZwQueryValueKey(hCpu, &vProcName,
+                                      KeyValuePartialInformation,
+                                      NULL, 0, &probeNeed);
+            if (probeSt == STATUS_OBJECT_NAME_NOT_FOUND)
+                valuesReady = FALSE;
+
+            if (valuesReady) {
+                probeSt = ZwQueryValueKey(hCpu, &vIdent,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &probeNeed);
+                if (probeSt == STATUS_OBJECT_NAME_NOT_FOUND)
+                    valuesReady = FALSE;
+            }
+            if (valuesReady) {
+                probeSt = ZwQueryValueKey(hCpu, &vVendor,
+                                          KeyValuePartialInformation,
+                                          NULL, 0, &probeNeed);
+                if (probeSt == STATUS_OBJECT_NAME_NOT_FOUND)
+                    valuesReady = FALSE;
+            }
+
+            if (!valuesReady) {
+                coresPending++;
+                ZwClose(hCpu);
+                subIndex++;
+                continue;
+            }
+
+            /* HAL has published all three values on this core.
+               Overwrite them — we are the last writer for each.
+               DataSize argument cast to ULONG explicitly to keep
+               WDK /W4 /WX quiet on x64. */
+            ZwSetValueKey(hCpu, &vProcName, 0, REG_SZ,
+                          (PVOID)strs[0],
+                          (ULONG)((strLens[0] + 1) * sizeof(WCHAR)));
+
+            ZwSetValueKey(hCpu, &vIdent, 0, REG_SZ,
+                          (PVOID)strs[1],
+                          (ULONG)((strLens[1] + 1) * sizeof(WCHAR)));
+
+            ZwSetValueKey(hCpu, &vVendor, 0, REG_SZ,
+                          (PVOID)strs[2],
+                          (ULONG)((strLens[2] + 1) * sizeof(WCHAR)));
+
+#if DBG
+            DbgPrint("[RstFlt] CPU replay: rewrote CentralProcessor\\%wZ\n",
+                     &subName);
+#endif
+            coresDone++;
+            ZwClose(hCpu);
+            subIndex++;
+        }
+
+        ZwClose(hCpuRoot);
+        hCpuRoot = NULL;
+
+        if (coresPending == 0) {
+            /* Every enumerable core is done. */
+#if DBG
+            DbgPrint("[RstFlt] CPU replay: pass %lu, %lu core(s) done, "
+                     "no pending\n", pass, coresDone);
+#endif
+            break;
+        }
+
+#if DBG
+        DbgPrint("[RstFlt] CPU replay: pass %lu, %lu done, %lu pending, "
+                 "waiting %ums\n",
+                 pass, coresDone, coresPending, CPU_REPLAY_DELAY_MS);
+#endif
+        delay.QuadPart = -(LONGLONG)(CPU_REPLAY_DELAY_MS * 10 * 1000);
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+#if DBG
+    DbgPrint("[RstFlt] CPU replay: finished, %lu core(s) written\n",
+             coresDone);
+#endif
+
+out:
+    if (info)     ExFreePoolWithTag(info, POOL_TAG);
+    if (hCpuRoot) ZwClose(hCpuRoot);
+    if (hParams)  ZwClose(hParams);
+}
+
+/* ================================================================
+ *  CpuReplayWorker - system worker thread entry point.
+ *
+ *  Runs at PASSIVE_LEVEL, off DriverEntry's thread. Consumes the
+ *  CPU_REPLAY_CTX allocated by DriverEntry (owning RegPath copy),
+ *  invokes ReplayCpuRegistry, then frees itself.
+ *
+ *  Must never touch the DRIVER_OBJECT or the IO manager's original
+ *  RegPath — both may be out of scope by the time we run. Our
+ *  UNICODE_STRING inside the context is self-contained.
+ * ================================================================ */
+static VOID CpuReplayWorker(PVOID Context)
+{
+    PCPU_REPLAY_CTX ctx = (PCPU_REPLAY_CTX)Context;
+
+    if (ctx == NULL) return;
+
+    ReplayCpuRegistry(&ctx->RegPath);
+
+    ExFreePoolWithTag(ctx, POOL_TAG);
+}
+
+/* ================================================================
  *  PnpStartCompletion - signals event when IRP_MN_START completes
  * ================================================================ */
 static NTSTATUS PnpStartCompletion(
@@ -740,15 +1407,63 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
  * ================================================================ */
 
 /* ================================================================
- *  DriverEntry - replay SMBIOS blob and register dispatch routines
+ *  DriverEntry - queue CPU-registry replay worker, replay SMBIOS
+ *  blob synchronously, register dispatch routines.
  *
- *  v3.6: no registry config to read (SerialSeed/Prefix/Length are
- *  gone). SMBIOS replay is the sole boot-time job; everything else
- *  is pure pass-through.
+ *  v4.0 ordering rationale: CPU replay is race-sensitive against
+ *  HAL's per-core value population and needs a long tick budget,
+ *  so it goes off-thread via ExQueueWorkItem FIRST — no boot
+ *  slowdown, and it starts scheduling before we sit on any hive
+ *  I/O. ApplySmbiosBlobIfCached stays inline: its target hive is
+ *  on-disk and mssmbios itself has already booted at BOOT_START
+ *  before us, so the timing pressure is on future readers/reloads,
+ *  not the current-boot mssmbios instance.
+ *
+ *  Both replays are best-effort and never propagate failure.
  * ================================================================ */
 NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
 {
     ULONG i;
+    PCPU_REPLAY_CTX ctx = NULL;
+    ULONG           ctxSize;
+    USHORT          copyLen;
+
+    /* v4.0: queue the CPU-registry replay work item BEFORE the
+       SMBIOS blob apply. The IO manager's RegPath UNICODE_STRING
+       is stack-scoped on our caller — we must copy the buffer into
+       a nonpaged allocation the worker owns.
+
+       Ctx allocation failure is silently non-fatal: the driver
+       still loads, dispatch is set up, SMBIOS replay still runs,
+       only the CPU registry stays genuine for this boot. */
+    if (RegPath != NULL && RegPath->Buffer != NULL && RegPath->Length > 0) {
+        copyLen = RegPath->Length;                          /* bytes    */
+        ctxSize = (ULONG)(FIELD_OFFSET(CPU_REPLAY_CTX, RegPathBuffer) +
+                          copyLen + sizeof(WCHAR));         /* + NUL    */
+
+        ctx = (PCPU_REPLAY_CTX)
+              ExAllocatePoolWithTag(NonPagedPool, ctxSize, POOL_TAG);
+        if (ctx != NULL) {
+            RtlZeroMemory(ctx, ctxSize);
+            RtlCopyMemory(ctx->RegPathBuffer, RegPath->Buffer, copyLen);
+            ctx->RegPath.Buffer        = ctx->RegPathBuffer;
+            ctx->RegPath.Length        = copyLen;
+            ctx->RegPath.MaximumLength = (USHORT)(copyLen + sizeof(WCHAR));
+
+            ExInitializeWorkItem(&ctx->WorkItem,
+                                 CpuReplayWorker,
+                                 ctx);
+            ExQueueWorkItem(&ctx->WorkItem, DelayedWorkQueue);
+#if DBG
+            DbgPrint("[RstFlt] CPU replay: worker queued\n");
+#endif
+        }
+#if DBG
+        else {
+            DbgPrint("[RstFlt] CPU replay: ctx alloc failed, skipping\n");
+        }
+#endif
+    }
 
     /* Replay cached SMBIOS blob (if the userspace tool has ever run
        AND EnableSmbiosReplay=1) into mssmbios\Data\SMBiosData.
@@ -772,7 +1487,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v3.6, minimal SMBIOS-replay)\n");
+    DbgPrint("[RstFlt] DriverEntry OK (v4.0, SMBIOS + CPU replay)\n");
 #endif
     return STATUS_SUCCESS;
 }

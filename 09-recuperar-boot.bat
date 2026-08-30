@@ -69,6 +69,16 @@ powershell -ExecutionPolicy Bypass -Command ^
   "      Write-Host (\"[+] $cs SMBiosData restaurado do backup ($($backup.Length) bytes)\");" ^
   "    }" ^
   "  } catch {}" ^
+  "  # v4.0: derrubar CPU replay tambem. HARDWARE\DESCRIPTION\System" ^
+  "  # e volatil - o kernel reconstroi CentralProcessor\\* do CPUID" ^
+  "  # a cada boot com valores reais. Desligar EnableCpuReplay +" ^
+  "  # remover CpuStrings evita que qualquer replay futuro sobrescreva." ^
+  "  # OrigCpuStrings fica preservado para uso posterior via -Uninstall." ^
+  "  try {" ^
+  "    Remove-ItemProperty -Path $paramsKey -Name EnableCpuReplay -ErrorAction SilentlyContinue;" ^
+  "    Remove-ItemProperty -Path $paramsKey -Name CpuStrings       -ErrorAction SilentlyContinue;" ^
+  "    Write-Host (\"[+] $cs CPU replay desligado (EnableCpuReplay + CpuStrings removidos)\");" ^
+  "  } catch {}" ^
   "}" ^
   "if ($swOk) { Remove-ItemProperty -Path 'HKLM:\OFFSW\HWToolkit' -Name OrigUpperFilters -ErrorAction SilentlyContinue }" ^
   "[gc]::Collect(); Start-Sleep -Milliseconds 300;" ^

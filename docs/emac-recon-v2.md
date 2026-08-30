@@ -252,19 +252,34 @@ Given the corrected model:
 
 ---
 
-## Fase 2 revised (kernel-required gaps)
+## Fase 2 status (post-v4.0)
 
-Only two gaps remain that cannot be closed with registry writes alone.
+- GAP #1 — Network `PnPInstanceId` — STILL OPEN.
+  Initial Track B proposal (NDIS LWF + bus filter) rejected: EMAC
+  reads the registry cache (`RegQueryValueEx` on
+  `Control\Network\{...}\Connection\PnPInstanceId`), never triggers
+  `IRP_MN_QUERY_ID` in runtime, so neither LWF nor bus filter cover
+  the cached read. Alternative Track B' (`CmRegisterCallbackEx`
+  filtered by RubinOT.exe PID) closes this and 12+ other keys with
+  a single callback; deferred until post-v4.0 procmon confirms it
+  is still needed.
+- GAP #2 — CPU `ProcessorNameString` / `Identifier` /
+  `VendorIdentifier` — CLOSED in v4.0 (Track A).
+  Registry mirror at `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N`
+  is now overwritten by the RstFlt v4.0 driver via a system-thread
+  work item queued from DriverEntry. HAL populates the values first
+  (kernel writes them from CPUID leaves 0x80000002-4 during
+  BOOT_START); the driver waits for the population to finish
+  (`ZwQueryKey KeyFullInformation` subkey count vs
+  `KeQueryActiveProcessorCountEx`, per-value `ZwQueryValueKey`
+  probe), then replaces the strings. CPUID instruction results
+  themselves are NOT modified — a check that executes `cpuid`
+  directly still sees the real silicon, but every consumer that
+  reads the registry mirror (WMI, Win32_Processor, EMAC) sees
+  the fake. Opt-in via `Parameters\EnableCpuReplay=1`; backup
+  in `Parameters\OrigCpuStrings`.
 
-- GAP #1 — Network `PnPInstanceId`
-  Registry rewrite alone is undone at the next PnP enumeration. Requires
-  an NDIS bus filter to intercept and rewrite at enum time.
-- GAP #2 — CPU `ProcessorNameString`
-  Value comes from CPUID; the registry mirror only reflects it. Would
-  require a kernel-mode CPUID trap / VMX replay, or a hypervisor-level
-  shim. Out of scope for a registry+SMBIOS toolkit.
-
-Everything else previously deferred to Fase 2 is now closed by Fase 1.6:
+Registry-only closures from Fase 1.6:
 
 - GAP #7 disk model      -> `spoof-disk-registry.ps1`
 - GAP #8 PCI granular ID -> `spoof-pci-hardwareid.ps1`
