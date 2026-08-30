@@ -1,0 +1,14 @@
+========================================================
+  RECUPERACAO DE BOOT - RstFlt
+
+  Use este script SOMENTE se o Windows nao iniciar
+  apos instalar o driver.
+
+  Como chegar aqui:
+  1. Na tela de reparo, va em Solucionar Problemas
+  2. Opcoes Avancadas
+  3. Prompt de Comando
+  4. Navegue ate este arquivo e execute-o
+========================================================
+
+Pressione qualquer tecla para continuar. . . 
