@@ -165,15 +165,19 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-rem --- Escrever seed do profile ---
-echo [*] Verificando profile para seed do driver...
+rem --- Preparar chave Parameters do driver ---
+rem v3.6: nao ha mais seed/prefix/length de serial pra escrever.
+rem O -WriteDriver so cria a chave Parameters vazia (e limpa
+rem residuos SerialSeed/SerialPrefix/SerialLength de instalacoes
+rem anteriores do v3.5). SmbiosBlob + EnableSmbiosReplay entram
+rem depois via 05-aplicar-smbios.
+echo [*] Preparando chave Parameters do driver...
 if exist "%~dp0scripts\generate-profile.ps1" (
-    echo [*] Escrevendo seed do driver via generate-profile...
     powershell -ExecutionPolicy Bypass -Command "& '%~dp0scripts\generate-profile.ps1' -WriteDriver" 2>nul
     if !errorlevel! equ 0 (
-        echo [OK] Seed do driver configurado
+        echo [OK] Chave Parameters criada
     ) else (
-        echo [!] Falha ao escrever seed - rode 00-gerar-profile.bat primeiro
+        echo [!] Falha ao criar Parameters - rode 00-gerar-profile.bat primeiro
     )
 ) else (
     echo [!] generate-profile.ps1 nao encontrado em scripts\

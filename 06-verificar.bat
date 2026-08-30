@@ -4,7 +4,10 @@ echo   PASSO 6 - Verificar Tudo
 echo ========================================================
 echo.
 
-echo === SERIAL DE DISCO ===
+echo === SERIAL DE DISCO (nao spoofado em v3.6 - valor real) ===
+rem v3.6 removeu o intercept de IOCTL_STORAGE_QUERY_PROPERTY do rstflt.
+rem EMAC nao le esse campo, o beneficio nao pagava o BSOD risk.
+rem Este dump serve so como reality-check do hardware.
 wmic diskdrive get model,serialnumber
 echo.
 

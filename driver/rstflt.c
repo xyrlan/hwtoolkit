@@ -1,9 +1,10 @@
 /*
- * RstFlt - Storage Filter Driver (v3)
+ * RstFlt - Minimal SMBIOS-Replay Filter Driver (v3.6)
  *
- * Upper filter for the DiskDrive device class.
- * Intercepts disk serial number queries across multiple IOCTL paths
- * and replaces them with deterministic, per-slot fake serials.
+ * SYSTEM_START upper filter of the DiskDrive class. Its only job is
+ * to replay a userspace-cached SMBIOS blob into mssmbios\Data during
+ * DriverEntry, ahead of winmgmt / anti-cheat. All IRPs are strict
+ * pass-through — the driver does no filtering of storage I/O.
  *
  * Changelog
  * ---------
@@ -83,34 +84,53 @@
  *             VendorId/ProductId/Firmware that follow it.
  *       Falls back to v3.4 behavior (truncate at `actual`) if the
  *       context allocation fails.
+ * v3.6 - Stripped storage IOCTL intercept paths entirely.
+ *     - EMAC recon confirmed anti-cheat does not query disk serial
+ *       via DeviceIoControl. Storage IOCTL paths were carrying six
+ *       historical BSOD sources (see v3.1-v3.5 entries above) for
+ *       no EMAC-relevant benefit. Kept for other-AC portability in
+ *       earlier versions; removed here after user BSOD on v3.5.
+ *     - Driver is now a minimal SYSTEM_START upper filter whose
+ *       sole job is SMBIOS blob replay in DriverEntry. All IRPs
+ *       are pass-through. AddDevice remains so the service loads
+ *       reliably (upper filter of DiskDrive class ensures load
+ *       ordering that beats winmgmt/anti-cheat to SMBIOS access).
+ *     - Removed: DispatchDeviceControl entirely, GenerateSerial,
+ *       ReadRegistryConfig, Spoof* completions, MDL cleanup path,
+ *       SerialSeed/SerialPrefix/SerialLength registry parameters.
+ *     - Kept: SMBIOS replay opt-in gate (EnableSmbiosReplay=1),
+ *       ValidateSmbiosBlob, OrigSmbiosData backup, IO_REMOVE_LOCK
+ *       discipline on remaining PnP/Power/passthrough dispatch.
+ *     - Post-review hardening:
+ *         (a) ApplySmbiosBlobIfCached guards NULL/empty RegPath so
+ *             Driver Verifier fault injection cannot bootloop us.
+ *         (b) ValidateSmbiosBlob header/fit bounds use <= not <, so
+ *             legitimate slim blobs are no longer silently refused.
+ *         (c) IRP_MN_REMOVE_DEVICE now forward-and-wait: attach a
+ *             completion routine that signals a KEVENT, wait, then
+ *             IoDetachDevice + IoDeleteDevice, then complete the IRP.
+ *             Previous shape (release-lock-and-wait immediately after
+ *             IoCallDriver) races async lower-driver REMOVE completion
+ *             on stacks like iaStorAC.
+ *         (d) DriverUnload registration dropped — a DiskDrive upper
+ *             filter always has attachments, so unload never actually
+ *             runs, and advertising it lets sc-stop→replace→sc-start
+ *             race the stale mapped image.
  *
  * WARNING: Kernel drivers can BSOD your machine if buggy.
  * Test signing mode required to load unsigned drivers.
  */
 
 #include <ntddk.h>
-#include <ntdddisk.h>
-#include <ntddscsi.h>
-#include <ntddstor.h>
 
 /* ================================================================
  *  Constants
  * ================================================================ */
 #define POOL_TAG    'tRsF'
-#define MAX_SERIAL  40
-#define SEED_SIZE   32
-#define ID_COMMAND  0xEC  /* ATA IDENTIFY DEVICE */
 
 /* ================================================================
- *  Global state (read-only after DriverEntry)
- * ================================================================ */
-static UCHAR    g_Seed[SEED_SIZE];   /* From registry Parameters\SerialSeed   */
-static CHAR     g_Prefix[8];        /* Serial prefix (e.g. "S6BN")           */
-static ULONG    g_SerialLen;        /* Desired serial length (e.g. 15)       */
-static BOOLEAN  g_HasConfig;        /* TRUE if registry config was loaded    */
-
-/* ================================================================
- *  Device extension - attached to each filtered disk device
+ *  Device extension - attached to each filtered disk device.
+ *  v3.6: no per-device state beyond what PnP correctness requires.
  * ================================================================ */
 typedef struct _DEVICE_EXTENSION {
     PDEVICE_OBJECT  LowerDevice;
@@ -118,168 +138,22 @@ typedef struct _DEVICE_EXTENSION {
     IO_REMOVE_LOCK  RemoveLock;
     BOOLEAN         Started;
     BOOLEAN         Removed;
-    CHAR            FakeSerial[MAX_SERIAL + 1];
-    BOOLEAN         HasFakeSerial;
-    /* Stable location info for deterministic serial generation */
-    CHAR            LocationInfo[256];
-    ULONG           LocationLen;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 /* ================================================================
  *  Forward declarations
  * ================================================================ */
 DRIVER_ADD_DEVICE AddDevice;
-DRIVER_UNLOAD     DriverUnload;
 
 DRIVER_DISPATCH DispatchPassthrough;
 DRIVER_DISPATCH DispatchPnp;
 DRIVER_DISPATCH DispatchPower;
-DRIVER_DISPATCH DispatchDeviceControl;
 
 static IO_COMPLETION_ROUTINE PnpStartCompletion;
-static IO_COMPLETION_ROUTINE SpoofStorageCompletion;
-static IO_COMPLETION_ROUTINE SpoofIdentifyCompletion;
-static IO_COMPLETION_ROUTINE SpoofAtaPassCompletion;
-static IO_COMPLETION_ROUTINE SpoofNvmeIdentifyCompletion;
-static IO_COMPLETION_ROUTINE SpoofAtaPassDirectCompletion;
-static IO_WORKITEM_ROUTINE   MdlCleanupWorker;
+static IO_COMPLETION_ROUTINE PnpRemoveCompletion;
 
-static VOID    ReadRegistryConfig(PUNICODE_STRING RegPath);
-static VOID    GenerateSerial(PDEVICE_EXTENSION dx, CHAR *Buf, ULONG Len);
 static VOID    ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath);
 static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length);
-static VOID    DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl);
-
-/* ================================================================
- *  MDL cleanup work item context — a completion routine may run at
- *  DISPATCH_LEVEL but MmUnlockPages requires <= APC_LEVEL, so we
- *  defer the unlock/free to a worker thread.
- * ================================================================ */
-typedef struct _RSTFLT_MDL_CLEANUP {
-    PMDL             Mdl;
-    PIO_WORKITEM     WorkItem;
-    /* v3.4: keep DevObj pinned via a RemoveLock reference until the
-       worker actually runs. Without this the completion routine could
-       release its own IRP-tagged lock, IRP_MN_REMOVE_DEVICE could
-       delete DevObj, and IoFreeWorkItem in the worker would touch
-       freed memory. DeferMdlCleanup acquires the reference tagged
-       with the address of this struct; the worker releases with the
-       same tag right before freeing the struct. */
-    PIO_REMOVE_LOCK  Lock;
-} RSTFLT_MDL_CLEANUP, *PRSTFLT_MDL_CLEANUP;
-
-/* Per-IRP context passed to SpoofAtaPassDirectCompletion via
-   IoSetCompletionRoutine. DriverContext[] on the IRP is not
-   guaranteed to survive IoCallDriver, so we allocate our own. */
-typedef struct _RSTFLT_APTD_CTX {
-    PMDL   Mdl;
-    UCHAR *Kva;
-} RSTFLT_APTD_CTX, *PRSTFLT_APTD_CTX;
-
-/* v3.5: context for SpoofStorageCompletion. Carries the caller's
-   OutputBufferLength captured at dispatch time so the completion
-   knows how much room it can safely expand a shorter-than-spoof
-   serial into. Without this the completion only sees IoStatus.
-   Information (what the lower driver wrote), which for short
-   serials leaves us with too little room and truncates the spoof. */
-typedef struct _RSTFLT_STORAGE_CTX {
-    ULONG OutputBufferLength;
-} RSTFLT_STORAGE_CTX, *PRSTFLT_STORAGE_CTX;
-
-/* ================================================================
- *  ReadRegistryConfig - load seed, prefix, length from registry
- *
- *  Reads from <RegistryPath>\Parameters:
- *    SerialSeed   REG_BINARY  32 bytes
- *    SerialPrefix REG_SZ
- *    SerialLength REG_DWORD
- *
- *  On any failure the globals keep their defaults.
- * ================================================================ */
-static VOID ReadRegistryConfig(PUNICODE_STRING RegPath)
-{
-    NTSTATUS st;
-    HANDLE hKey = NULL;
-    HANDLE hParams = NULL;
-    OBJECT_ATTRIBUTES oa;
-    UNICODE_STRING paramsName;
-    UNICODE_STRING valueName;
-    UCHAR infoBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 256];
-    PKEY_VALUE_PARTIAL_INFORMATION info = (PKEY_VALUE_PARTIAL_INFORMATION)infoBuf;
-    ULONG resultLen;
-    UNICODE_STRING fullPath;
-    WCHAR fullPathBuf[512];
-    ULONG i;
-
-    /* Build "<RegPath>\Parameters" */
-    fullPath.Buffer        = fullPathBuf;
-    fullPath.Length         = 0;
-    fullPath.MaximumLength = sizeof(fullPathBuf);
-
-    st = RtlAppendUnicodeStringToString(&fullPath, RegPath);
-    if (!NT_SUCCESS(st))
-        return;
-
-    RtlInitUnicodeString(&paramsName, L"\\Parameters");
-    st = RtlAppendUnicodeStringToString(&fullPath, &paramsName);
-    if (!NT_SUCCESS(st))
-        return;
-
-    InitializeObjectAttributes(&oa, &fullPath,
-                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-                               NULL, NULL);
-
-    st = ZwOpenKey(&hParams, KEY_READ, &oa);
-    if (!NT_SUCCESS(st))
-        return;
-
-    /* -- SerialSeed (REG_BINARY, 32 bytes) -- */
-    RtlInitUnicodeString(&valueName, L"SerialSeed");
-    st = ZwQueryValueKey(hParams, &valueName, KeyValuePartialInformation,
-                         info, sizeof(infoBuf), &resultLen);
-    if (NT_SUCCESS(st) &&
-        info->Type == REG_BINARY &&
-        info->DataLength >= SEED_SIZE)
-    {
-        RtlCopyMemory(g_Seed, info->Data, SEED_SIZE);
-    }
-
-    /* -- SerialPrefix (REG_SZ) -- */
-    RtlInitUnicodeString(&valueName, L"SerialPrefix");
-    st = ZwQueryValueKey(hParams, &valueName, KeyValuePartialInformation,
-                         info, sizeof(infoBuf), &resultLen);
-    if (NT_SUCCESS(st) && info->Type == REG_SZ && info->DataLength > 0) {
-        /* Convert from wide to narrow, cap at 7 chars + NUL */
-        PWCHAR src = (PWCHAR)info->Data;
-        ULONG  wLen = info->DataLength / sizeof(WCHAR);
-        ULONG  j = 0;
-
-        for (i = 0; i < wLen && j < sizeof(g_Prefix) - 1; i++) {
-            if (src[i] == L'\0')
-                break;
-            g_Prefix[j++] = (CHAR)src[i];
-        }
-        g_Prefix[j] = '\0';
-    }
-
-    /* -- SerialLength (REG_DWORD) -- */
-    RtlInitUnicodeString(&valueName, L"SerialLength");
-    st = ZwQueryValueKey(hParams, &valueName, KeyValuePartialInformation,
-                         info, sizeof(infoBuf), &resultLen);
-    if (NT_SUCCESS(st) &&
-        info->Type == REG_DWORD &&
-        info->DataLength >= sizeof(ULONG))
-    {
-        ULONG val = *(PULONG)info->Data;
-        if (val > 0 && val <= MAX_SERIAL)
-            g_SerialLen = val;
-    }
-
-    g_HasConfig = TRUE;
-    ZwClose(hParams);
-
-    UNREFERENCED_PARAMETER(hKey);
-}
 
 /* ================================================================
  *  ValidateSmbiosBlob - sanity-check a cached SMBIOS blob before
@@ -320,12 +194,14 @@ static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length)
     if (Length > 65536) return FALSE;      /* too big — reject       */
 
     /* Find first byte that looks like a Type 0/1/2/3 header with a
-       reasonable Length (>=4, <=Length). Scan the first 64 bytes. */
-    for (i = 0; i + 4 < Length && i < 64; i++) {
+       reasonable Length (>=4, fits within Length). Scan the first
+       64 bytes. Uses `<=` on the fit test so a blob whose only header
+       sits at exact end is still accepted. */
+    for (i = 0; i + 2 <= Length && i < 64; i++) {
         UCHAR t = Blob[i];
         UCHAR L = Blob[i + 1];
         if ((t == 0 || t == 1 || t == 2 || t == 3) &&
-            L >= 4 && (ULONG)(i + L) < Length)
+            L >= 4 && (ULONG)i + L <= Length)
         {
             tableStart = i;
             break;
@@ -407,8 +283,10 @@ static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length)
  *      09-recuperar-boot can restore genuine firmware SMBIOS from
  *      offline registry if we ever brick the box.
  *
- *  Failures never propagate. The driver's storage-spoofing job
- *  still works even if SMBIOS replay is disabled or fails.
+ *  Failures never propagate. The driver's only remaining job (this
+ *  function) failing simply leaves the firmware SMBIOS untouched;
+ *  the driver still loads and its pass-through dispatch keeps disks
+ *  working normally.
  * ================================================================ */
 static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 {
@@ -426,6 +304,12 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     PKEY_VALUE_PARTIAL_INFORMATION flagInfo =
         (PKEY_VALUE_PARTIAL_INFORMATION)flagBuf;
     ULONG   flagVal = 0;
+
+    /* Defensive: IO manager should never pass a NULL/empty RegPath,
+       but Driver Verifier fault injection and third-party service-
+       manager wrappers can. SYSTEM_START + fault here = bootloop. */
+    if (RegPath == NULL || RegPath->Buffer == NULL || RegPath->Length == 0)
+        return;
 
     /* Build "<RegPath>\Parameters" */
     paramsPath.Buffer        = paramsBuf;
@@ -573,49 +457,30 @@ out:
 }
 
 /* ================================================================
- *  GenerateSerial - deterministic serial from seed + location
- *
- *  Uses FNV-1a to combine the global seed with the per-device
- *  location string, then an LCG to expand the hash into an
- *  alphanumeric serial of the requested length.
- * ================================================================ */
-static VOID GenerateSerial(PDEVICE_EXTENSION dx, CHAR *Buf, ULONG Len)
-{
-    ULONG hash = 0x811c9dc5;  /* FNV-1a offset basis */
-    ULONG i;
-    ULONG prefixLen = 0;
-    static const CHAR cs[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
-    /* Hash the global seed */
-    for (i = 0; i < SEED_SIZE; i++) {
-        hash ^= g_Seed[i];
-        hash *= 0x01000193;   /* FNV-1a prime */
-    }
-
-    /* Hash the device location info */
-    for (i = 0; i < dx->LocationLen; i++) {
-        hash ^= (UCHAR)dx->LocationInfo[i];
-        hash *= 0x01000193;
-    }
-
-    /* Copy prefix from g_Prefix */
-    while (g_Prefix[prefixLen] && prefixLen < Len) {
-        Buf[prefixLen] = g_Prefix[prefixLen];
-        prefixLen++;
-    }
-
-    /* Generate remaining characters using LCG seeded from hash */
-    for (i = prefixLen; i < Len; i++) {
-        hash = hash * 1103515245 + 12345;
-        Buf[i] = cs[(hash >> 16) % (sizeof(cs) - 1)];
-    }
-    Buf[Len] = '\0';
-}
-
-/* ================================================================
  *  PnpStartCompletion - signals event when IRP_MN_START completes
  * ================================================================ */
 static NTSTATUS PnpStartCompletion(
+    PDEVICE_OBJECT DevObj,
+    PIRP Irp,
+    PVOID Ctx)
+{
+    UNREFERENCED_PARAMETER(DevObj);
+    UNREFERENCED_PARAMETER(Irp);
+
+    KeSetEvent((PKEVENT)Ctx, IO_NO_INCREMENT, FALSE);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+/* ================================================================
+ *  PnpRemoveCompletion - signals event when IRP_MN_REMOVE completes.
+ *  Same shape as PnpStartCompletion. We use this so that our
+ *  IoDetachDevice/IoDeleteDevice run AFTER the lower stack has
+ *  finished tearing down its REMOVE-time work. Some lower filters
+ *  (e.g. iaStorAC on OEM builds) defer part of REMOVE; without this
+ *  synchronization, our detach/delete can race a lower driver that
+ *  still touches our attachment (use-after-free / pool corruption).
+ * ================================================================ */
+static NTSTATUS PnpRemoveCompletion(
     PDEVICE_OBJECT DevObj,
     PIRP Irp,
     PVOID Ctx)
@@ -674,22 +539,42 @@ NTSTATUS DispatchPnp(PDEVICE_OBJECT DevObj, PIRP Irp)
         IoReleaseRemoveLock(&dx->RemoveLock, Irp);
         return st;
 
-    /* ---- REMOVE: forward, wait for drain, detach, delete ---- */
+    /* ---- REMOVE: forward-and-wait, drain, detach, delete, complete ---
+       Post-review change (v3.6): the earlier shape used IoSkip +
+       IoCallDriver and immediately IoReleaseRemoveLockAndWait, which
+       drains only OUR tracked IRPs — not any lower-driver work that
+       runs asynchronously off the REMOVE IRP. If IoDetachDevice ran
+       while the lower stack still touched our attachment we could
+       get a use-after-free (0xE6/0xC2). Forward-and-wait ensures the
+       whole lower stack has processed REMOVE before we detach. */
     case IRP_MN_REMOVE_DEVICE:
         dx->Started = FALSE;
         dx->Removed = TRUE;
-        Irp->IoStatus.Status = STATUS_SUCCESS;
-        IoSkipCurrentIrpStackLocation(Irp);
-        st = IoCallDriver(dx->LowerDevice, Irp);
 
-        /* Wait for all tracked IRPs to complete */
+        KeInitializeEvent(&evt, NotificationEvent, FALSE);
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        IoSetCompletionRoutine(Irp, PnpRemoveCompletion, &evt,
+                               TRUE, TRUE, TRUE);
+
+        st = IoCallDriver(dx->LowerDevice, Irp);
+        if (st == STATUS_PENDING) {
+            KeWaitForSingleObject(&evt, Executive,
+                                  KernelMode, FALSE, NULL);
+            st = Irp->IoStatus.Status;
+        }
+
+        /* Now wait for any of OUR tracked IRPs to drain, then detach
+           + delete, then complete the REMOVE. */
         IoReleaseRemoveLockAndWait(&dx->RemoveLock, Irp);
         IoDetachDevice(dx->LowerDevice);
         IoDeleteDevice(DevObj);
+
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
 #if DBG
         DbgPrint("[RstFlt] Device %p removed\n", DevObj);
 #endif
-        return st;
+        return STATUS_SUCCESS;
 
     /* ---- SURPRISE REMOVAL ---- */
     case IRP_MN_SURPRISE_REMOVAL:
@@ -747,762 +632,9 @@ NTSTATUS DispatchPower(PDEVICE_OBJECT DevObj, PIRP Irp)
 }
 
 /* ================================================================
- *  SpoofStorageCompletion - modify serial in STORAGE_DEVICE_DESCRIPTOR
- *
- *  Called after lower driver fills STORAGE_DEVICE_DESCRIPTOR for
- *  an IOCTL_STORAGE_QUERY_PROPERTY response.
- *
- *  v3.5 behavior:
- *    Two cases decide how much of the buffer we can rewrite:
- *      (a) SerialNumber is the LAST field in the descriptor
- *          (Windows storport default). Room to write is bounded
- *          by OutputBufferLength (from Ctx), not by what the lower
- *          driver wrote. If our spoof is longer than the original,
- *          extend it and bump IoStatus.Information accordingly.
- *      (b) A field lives AFTER SerialNumber (some vendor miniports
- *          — Intel RST, LSI HBAs — pack VendorId/ProductId/Firmware
- *          past the serial). Room is fixed to (nextFieldOffset -
- *          SerialNumberOffset). Truncate to fit; don't touch bytes
- *          past it or those strings get corrupted.
- *    Falls back to v3.4 behavior if Ctx is NULL (OutputBufferLength
- *    unavailable), i.e. truncate at IoStatus.Information.
- *
- *  Releases the remove lock acquired by DispatchDeviceControl and
- *  frees the completion context.
- * ================================================================ */
-static NTSTATUS SpoofStorageCompletion(
-    PDEVICE_OBJECT DevObj,
-    PIRP Irp,
-    PVOID Ctx)
-{
-    PDEVICE_EXTENSION dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PRSTFLT_STORAGE_CTX sctx = (PRSTFLT_STORAGE_CTX)Ctx;
-    PSTORAGE_DEVICE_DESCRIPTOR desc;
-    PCHAR  ser;
-    ULONG  actual;
-    ULONG  outLen;
-    ULONG  copyLen;
-    ULONG  serSpaceEnd;    /* first byte offset AFTER our writable region */
-    ULONG  writable;
-    ULONG  i;
-
-    if (Irp->IoStatus.Status != STATUS_SUCCESS)
-        goto done;
-
-    actual = (ULONG)Irp->IoStatus.Information;
-    if (actual < sizeof(STORAGE_DEVICE_DESCRIPTOR))
-        goto done;
-
-    desc = (PSTORAGE_DEVICE_DESCRIPTOR)Irp->AssociatedIrp.SystemBuffer;
-    if (desc == NULL ||
-        desc->SerialNumberOffset == 0 ||
-        desc->SerialNumberOffset >= actual)
-        goto done;
-
-    /* Generate a fake serial on first access */
-    if (!dx->HasFakeSerial) {
-        GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
-        dx->HasFakeSerial = TRUE;
-#if DBG
-        DbgPrint("[RstFlt] Storage serial for dev %p: %s\n",
-                 DevObj, dx->FakeSerial);
-#endif
-    }
-
-    copyLen = g_HasConfig ? g_SerialLen : 15;
-    outLen  = sctx ? sctx->OutputBufferLength : 0;
-    ser     = (PCHAR)desc + desc->SerialNumberOffset;
-
-    /* Find whether any *other* string field lives after SerialNumber.
-       Pick the smallest such offset — that's the first byte we can't
-       touch. Offset 0 in any of these means the field isn't present. */
-    {
-        ULONG nextOff = 0;
-        ULONG cand;
-
-        cand = desc->VendorIdOffset;
-        if (cand > desc->SerialNumberOffset && cand <= actual)
-            if (nextOff == 0 || cand < nextOff) nextOff = cand;
-
-        cand = desc->ProductIdOffset;
-        if (cand > desc->SerialNumberOffset && cand <= actual)
-            if (nextOff == 0 || cand < nextOff) nextOff = cand;
-
-        cand = desc->ProductRevisionOffset;
-        if (cand > desc->SerialNumberOffset && cand <= actual)
-            if (nextOff == 0 || cand < nextOff) nextOff = cand;
-
-        if (nextOff != 0) {
-            /* Case (b): serial is NOT the last field — can't extend. */
-            serSpaceEnd = nextOff;
-        } else if (outLen > desc->SerialNumberOffset) {
-            /* Case (a) with known OutputBufferLength: extend up to
-               the caller's original buffer capacity. */
-            serSpaceEnd = outLen;
-        } else {
-            /* Fallback (no ctx / short outLen): v3.4 behavior — stay
-               within what the lower driver already wrote. */
-            serSpaceEnd = actual;
-        }
-    }
-
-    if (serSpaceEnd <= desc->SerialNumberOffset)
-        goto done;
-
-    writable = serSpaceEnd - desc->SerialNumberOffset;
-    if (writable < 2)
-        goto done;   /* No room for even a 1-char serial + NUL */
-
-    /* Trim spoofed serial to fit the writable region (leaving 1 byte
-       for the NUL terminator). */
-    if (copyLen + 1 > writable)
-        copyLen = writable - 1;
-
-    /* Zero exactly copyLen + 1 bytes (the string + terminator).
-       Never zero beyond that: any trailing field (case b) or unused
-       tail of the caller's buffer must stay whatever it was. */
-    RtlZeroMemory(ser, copyLen + 1);
-    for (i = 0; i < copyLen; i++)
-        ser[i] = dx->FakeSerial[i];
-
-    /* If our serial ends AFTER what the lower driver reported,
-       announce the longer response so callers read it fully. Never
-       shrink Information (would hide fields we didn't touch). */
-    {
-        ULONG newTail = desc->SerialNumberOffset + copyLen + 1;
-        if (newTail > actual)
-            Irp->IoStatus.Information = newTail;
-    }
-
-done:
-    if (sctx) ExFreePoolWithTag(sctx, POOL_TAG);
-
-    if (Irp->PendingReturned)
-        IoMarkIrpPending(Irp);
-
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return STATUS_SUCCESS;
-}
-
-/* ================================================================
- *  SpoofIdentifyCompletion - modify serial in SMART IDENTIFY response
- *
- *  Called after lower driver completes IOCTL_SMART_RCV_DRIVE_DATA
- *  with an IDENTIFY DEVICE command.  The 512-byte identify data
- *  block contains the serial at words 10-19 (bytes 20-39), stored
- *  with ATA byte-swap (each word has its bytes swapped).
- *  Releases the remove lock acquired by DispatchDeviceControl.
- * ================================================================ */
-static NTSTATUS SpoofIdentifyCompletion(
-    PDEVICE_OBJECT DevObj,
-    PIRP Irp,
-    PVOID Ctx)
-{
-    PDEVICE_EXTENSION dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PSENDCMDOUTPARAMS out;
-    ULONG actual;
-    UCHAR *idData;
-    ULONG serialOff  = 20;  /* Words 10-19 = bytes 20-39 */
-    ULONG serialSize = 20;  /* 20 bytes (10 words)       */
-    CHAR serial[MAX_SERIAL + 1];
-    ULONG i;
-
-    UNREFERENCED_PARAMETER(Ctx);
-
-    if (Irp->IoStatus.Status != STATUS_SUCCESS)
-        goto done;
-
-    actual = (ULONG)Irp->IoStatus.Information;
-    if (actual < sizeof(SENDCMDOUTPARAMS) + 512 - 1)
-        goto done;
-
-    out    = (PSENDCMDOUTPARAMS)Irp->AssociatedIrp.SystemBuffer;
-    idData = out->bBuffer;
-
-    /* Generate fake serial on first access */
-    if (!dx->HasFakeSerial) {
-        GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
-        dx->HasFakeSerial = TRUE;
-#if DBG
-        DbgPrint("[RstFlt] IDENTIFY serial for dev %p: %s\n",
-                 DevObj, dx->FakeSerial);
-#endif
-    }
-
-    /* ATA serial field is 20 bytes, right-padded with spaces */
-    RtlFillMemory(serial, 20, ' ');
-    for (i = 0; i < 20 && dx->FakeSerial[i]; i++)
-        serial[i] = dx->FakeSerial[i];
-
-    /* Write with ATA byte-swap: each pair of bytes is swapped */
-    for (i = 0; i < serialSize; i += 2) {
-        idData[serialOff + i]     = serial[i + 1];
-        idData[serialOff + i + 1] = serial[i];
-    }
-
-done:
-    if (Irp->PendingReturned)
-        IoMarkIrpPending(Irp);
-
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return STATUS_SUCCESS;
-}
-
-/* ================================================================
- *  SpoofAtaPassCompletion - modify serial in ATA_PASS_THROUGH response
- *
- *  Called after lower driver completes IOCTL_ATA_PASS_THROUGH with
- *  an IDENTIFY DEVICE command.  The identify data buffer follows
- *  the ATA_PASS_THROUGH_EX header at DataBufferOffset.
- *  Releases the remove lock acquired by DispatchDeviceControl.
- * ================================================================ */
-static NTSTATUS SpoofAtaPassCompletion(
-    PDEVICE_OBJECT DevObj,
-    PIRP Irp,
-    PVOID Ctx)
-{
-    PDEVICE_EXTENSION dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PATA_PASS_THROUGH_EX apt;
-    UCHAR *dataBuffer;
-    ULONG actual;
-    ULONG serialOff  = 20;
-    ULONG serialSize = 20;
-    CHAR serial[MAX_SERIAL + 1];
-    ULONG i;
-
-    UNREFERENCED_PARAMETER(Ctx);
-
-    if (Irp->IoStatus.Status != STATUS_SUCCESS)
-        goto done;
-
-    actual = (ULONG)Irp->IoStatus.Information;
-    if (actual < sizeof(ATA_PASS_THROUGH_EX))
-        goto done;
-
-    apt = (PATA_PASS_THROUGH_EX)Irp->AssociatedIrp.SystemBuffer;
-    if (apt == NULL)
-        goto done;
-
-    /* Overflow-safe validation of the caller-controlled DataBufferOffset.
-       A malicious/buggy caller can set DataBufferOffset near 0xFFFFFFFF
-       so that (DataBufferOffset + 512) wraps around and passes a naive
-       "< apt->DataBufferOffset + 512" check, then dataBuffer would point
-       into unmapped kernel memory -> BSOD on the next write. */
-    if (apt->DataBufferOffset < sizeof(ATA_PASS_THROUGH_EX))
-        goto done;
-    if (apt->DataBufferOffset > actual)
-        goto done;
-    if ((ULONGLONG)512 > (ULONGLONG)(actual - apt->DataBufferOffset))
-        goto done;
-
-    dataBuffer = (UCHAR*)apt + apt->DataBufferOffset;
-
-    /* Generate fake serial on first access */
-    if (!dx->HasFakeSerial) {
-        GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
-        dx->HasFakeSerial = TRUE;
-#if DBG
-        DbgPrint("[RstFlt] ATA pass serial for dev %p: %s\n",
-                 DevObj, dx->FakeSerial);
-#endif
-    }
-
-    /* Same ATA byte-swap logic */
-    RtlFillMemory(serial, 20, ' ');
-    for (i = 0; i < 20 && dx->FakeSerial[i]; i++)
-        serial[i] = dx->FakeSerial[i];
-
-    for (i = 0; i < serialSize; i += 2) {
-        dataBuffer[serialOff + i]     = serial[i + 1];
-        dataBuffer[serialOff + i + 1] = serial[i];
-    }
-
-done:
-    if (Irp->PendingReturned)
-        IoMarkIrpPending(Irp);
-
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return STATUS_SUCCESS;
-}
-
-/* ================================================================
- *  SpoofNvmeIdentifyCompletion - rewrite serial in NVMe IDENTIFY
- *  CONTROLLER response.
- *
- *  Called after lower driver completes IOCTL_STORAGE_PROTOCOL_COMMAND
- *  with a NVMe IDENTIFY (opcode 0x06), CNS = 0x01 (Identify Controller).
- *  The 4096-byte controller data block begins at
- *  cmd->DataFromDeviceBufferOffset from the start of the SystemBuffer.
- *  Serial Number lives at bytes 4-23 (20 bytes ASCII, space-padded,
- *  NOT ATA byte-swapped — unlike ATA IDENTIFY).
- *  Releases the remove lock acquired by DispatchDeviceControl.
- * ================================================================ */
-static NTSTATUS SpoofNvmeIdentifyCompletion(
-    PDEVICE_OBJECT DevObj,
-    PIRP Irp,
-    PVOID Ctx)
-{
-    PDEVICE_EXTENSION dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PSTORAGE_PROTOCOL_COMMAND cmd;
-    UCHAR *dataBuf;
-    ULONG actual;
-    ULONG dataOff;
-    ULONG dataLen;
-    CHAR  serial[MAX_SERIAL + 1];
-    ULONG i;
-    ULONG copyLen;
-
-    UNREFERENCED_PARAMETER(Ctx);
-
-    if (Irp->IoStatus.Status != STATUS_SUCCESS)
-        goto done;
-
-    actual = (ULONG)Irp->IoStatus.Information;
-    if (actual < sizeof(STORAGE_PROTOCOL_COMMAND))
-        goto done;
-
-    cmd = (PSTORAGE_PROTOCOL_COMMAND)Irp->AssociatedIrp.SystemBuffer;
-    if (cmd == NULL)
-        goto done;
-
-    dataOff = cmd->DataFromDeviceBufferOffset;
-    dataLen = cmd->DataFromDeviceTransferLength;
-
-    /* Overflow-safe bounds validation on caller-controlled offsets */
-    if (dataOff < sizeof(STORAGE_PROTOCOL_COMMAND))
-        goto done;
-    if (dataOff > actual)
-        goto done;
-    if (dataLen < 64)   /* need at least Identify Controller SN+MN */
-        goto done;
-    if (dataLen > actual - dataOff)
-        goto done;
-
-    dataBuf = (UCHAR*)cmd + dataOff;
-
-    /* Generate fake serial on first access */
-    if (!dx->HasFakeSerial) {
-        GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
-        dx->HasFakeSerial = TRUE;
-#if DBG
-        DbgPrint("[RstFlt] NVMe serial for dev %p: %s\n",
-                 DevObj, dx->FakeSerial);
-#endif
-    }
-
-    /* NVMe Identify Controller Serial Number: 20 bytes, ASCII,
-       space-padded, plain byte order (no ATA swap). */
-    RtlFillMemory(serial, 20, ' ');
-    copyLen = g_HasConfig ? g_SerialLen : 15;
-    if (copyLen > 20)
-        copyLen = 20;
-    for (i = 0; i < copyLen && dx->FakeSerial[i]; i++)
-        serial[i] = dx->FakeSerial[i];
-
-    for (i = 0; i < 20; i++)
-        dataBuf[4 + i] = serial[i];
-
-done:
-    if (Irp->PendingReturned)
-        IoMarkIrpPending(Irp);
-
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return STATUS_SUCCESS;
-}
-
-/* ================================================================
- *  MdlCleanupWorker - runs at PASSIVE_LEVEL, unlocks and frees an
- *  MDL that a completion routine could not release itself due to
- *  IRQL restrictions.
- * ================================================================ */
-static VOID MdlCleanupWorker(
-    PDEVICE_OBJECT DevObj,
-    PVOID Context)
-{
-    PRSTFLT_MDL_CLEANUP c = (PRSTFLT_MDL_CLEANUP)Context;
-    UNREFERENCED_PARAMETER(DevObj);
-
-    if (c == NULL)
-        return;
-
-    if (c->Mdl) {
-        MmUnlockPages(c->Mdl);
-        IoFreeMdl(c->Mdl);
-    }
-    if (c->WorkItem)
-        IoFreeWorkItem(c->WorkItem);
-
-    /* v3.4: release the RemoveLock reference DeferMdlCleanup took
-       for this worker. Must happen after IoFreeWorkItem — the work
-       item is owned by DevObj, and DevObj is only guaranteed to stay
-       alive while the remove-lock reference is held. Tag = c so the
-       release matches the acquire in DeferMdlCleanup. */
-    if (c->Lock)
-        IoReleaseRemoveLock(c->Lock, c);
-
-    ExFreePoolWithTag(c, POOL_TAG);
-}
-
-/* ================================================================
- *  DeferMdlCleanup - queue the MDL to be released at PASSIVE_LEVEL.
- *
- *  v3.4: acquires an extra RemoveLock reference tagged with the
- *  cleanup context itself so DevObj cannot be deleted while the
- *  work item is queued/running. The worker releases with the same
- *  tag right before freeing the struct.
- *
- *  If we cannot allocate the work item / context / lock, fall back
- *  to inline release only when IRQL permits; otherwise the MDL
- *  leaks (small pinned memory) rather than crashing the system.
- * ================================================================ */
-static VOID DeferMdlCleanup(PDEVICE_OBJECT DevObj, PMDL Mdl)
-{
-    PDEVICE_EXTENSION   dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PRSTFLT_MDL_CLEANUP c;
-    PIO_WORKITEM        wi;
-    NTSTATUS            st;
-
-    if (Mdl == NULL)
-        return;
-
-    wi = IoAllocateWorkItem(DevObj);
-    if (wi == NULL) {
-        if (KeGetCurrentIrql() <= APC_LEVEL) {
-            MmUnlockPages(Mdl);
-            IoFreeMdl(Mdl);
-        }
-        return;
-    }
-
-    c = (PRSTFLT_MDL_CLEANUP)ExAllocatePoolWithTag(
-            NonPagedPool, sizeof(*c), POOL_TAG);
-    if (c == NULL) {
-        IoFreeWorkItem(wi);
-        if (KeGetCurrentIrql() <= APC_LEVEL) {
-            MmUnlockPages(Mdl);
-            IoFreeMdl(Mdl);
-        }
-        return;
-    }
-
-    /* Take a RemoveLock reference so DevObj outlives the work item.
-       Tag = c (unique for this operation). If the device is already
-       being removed, the acquire fails — bail out and best-effort
-       release the MDL inline. */
-    st = IoAcquireRemoveLock(&dx->RemoveLock, c);
-    if (!NT_SUCCESS(st)) {
-        ExFreePoolWithTag(c, POOL_TAG);
-        IoFreeWorkItem(wi);
-        if (KeGetCurrentIrql() <= APC_LEVEL) {
-            MmUnlockPages(Mdl);
-            IoFreeMdl(Mdl);
-        }
-        return;
-    }
-
-    c->Mdl      = Mdl;
-    c->WorkItem = wi;
-    c->Lock     = &dx->RemoveLock;
-    IoQueueWorkItem(wi, MdlCleanupWorker, DelayedWorkQueue, c);
-}
-
-/* ================================================================
- *  SpoofAtaPassDirectCompletion - rewrite serial for the DIRECT
- *  variant of IOCTL_ATA_PASS_THROUGH.
- *
- *  Unlike the BUFFERED variant, the ATA data payload lives at a
- *  user-mode pointer (aptd->DataBuffer) that the dispatch routine
- *  already probed+locked into an MDL. The kernel VA and the MDL
- *  arrive here via the completion context.
- * ================================================================ */
-static NTSTATUS SpoofAtaPassDirectCompletion(
-    PDEVICE_OBJECT DevObj,
-    PIRP Irp,
-    PVOID Ctx)
-{
-    PDEVICE_EXTENSION   dx  = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PRSTFLT_APTD_CTX    cx  = (PRSTFLT_APTD_CTX)Ctx;
-    PMDL   mdl     = NULL;
-    UCHAR *dataBuf = NULL;
-    CHAR   serial[MAX_SERIAL + 1];
-    ULONG  i;
-    ULONG  serialOff  = 20;
-    ULONG  serialSize = 20;
-
-    if (cx) {
-        mdl     = cx->Mdl;
-        dataBuf = cx->Kva;
-    }
-
-    if (Irp->IoStatus.Status != STATUS_SUCCESS)
-        goto cleanup;
-    if (dataBuf == NULL || mdl == NULL)
-        goto cleanup;
-
-    /* Generate fake serial on first access */
-    if (!dx->HasFakeSerial) {
-        GenerateSerial(dx, dx->FakeSerial, g_HasConfig ? g_SerialLen : 15);
-        dx->HasFakeSerial = TRUE;
-#if DBG
-        DbgPrint("[RstFlt] ATA_DIRECT serial for dev %p: %s\n",
-                 DevObj, dx->FakeSerial);
-#endif
-    }
-
-    /* Same 20-byte, space-padded, ATA byte-swapped serial layout as
-       the buffered ATA variant. */
-    RtlFillMemory(serial, 20, ' ');
-    for (i = 0; i < 20 && dx->FakeSerial[i]; i++)
-        serial[i] = dx->FakeSerial[i];
-
-    for (i = 0; i < serialSize; i += 2) {
-        dataBuf[serialOff + i]     = serial[i + 1];
-        dataBuf[serialOff + i + 1] = serial[i];
-    }
-
-cleanup:
-    /* Defer MDL cleanup to PASSIVE_LEVEL — MmUnlockPages is illegal
-       at DISPATCH_LEVEL, which is where storage completions often
-       run. */
-    if (mdl)
-        DeferMdlCleanup(DevObj, mdl);
-    if (cx)
-        ExFreePoolWithTag(cx, POOL_TAG);
-
-    if (Irp->PendingReturned)
-        IoMarkIrpPending(Irp);
-
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return STATUS_SUCCESS;
-}
-
-/* ================================================================
- *  DispatchDeviceControl - intercept serial-exposing IOCTLs
- *
- *  Five interception paths:
- *    1. IOCTL_STORAGE_QUERY_PROPERTY   (StorageDeviceProperty)
- *    2. IOCTL_SMART_RCV_DRIVE_DATA     (ATA IDENTIFY DEVICE, cmd 0xEC)
- *    3. IOCTL_ATA_PASS_THROUGH         (ATA IDENTIFY DEVICE, buffered)
- *    4. IOCTL_STORAGE_PROTOCOL_COMMAND (NVMe IDENTIFY CONTROLLER)
- *    5. IOCTL_ATA_PASS_THROUGH_DIRECT  (ATA IDENTIFY DEVICE, direct)
- * ================================================================ */
-NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DevObj, PIRP Irp)
-{
-    PDEVICE_EXTENSION  dx = (PDEVICE_EXTENSION)DevObj->DeviceExtension;
-    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
-    ULONG ioctl;
-    NTSTATUS st;
-
-    st = IoAcquireRemoveLock(&dx->RemoveLock, Irp);
-    if (!NT_SUCCESS(st)) {
-        Irp->IoStatus.Status = st;
-        IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return st;
-    }
-
-    /* Only intercept when device is fully started and not removed */
-    if (!dx->Started || dx->Removed)
-        goto passthru;
-
-    ioctl = sp->Parameters.DeviceIoControl.IoControlCode;
-
-    /* ---- Path 1: IOCTL_STORAGE_QUERY_PROPERTY ---- */
-    if (ioctl == IOCTL_STORAGE_QUERY_PROPERTY) {
-        PSTORAGE_PROPERTY_QUERY q;
-        PRSTFLT_STORAGE_CTX     sctx;
-
-        if (sp->Parameters.DeviceIoControl.InputBufferLength <
-            sizeof(STORAGE_PROPERTY_QUERY))
-            goto passthru;
-
-        q = (PSTORAGE_PROPERTY_QUERY)Irp->AssociatedIrp.SystemBuffer;
-        if (q->PropertyId != StorageDeviceProperty ||
-            q->QueryType  != PropertyStandardQuery)
-            goto passthru;
-
-        /* v3.5: capture OutputBufferLength so the completion knows
-           the caller's buffer capacity (not just what the lower
-           driver actually wrote). Lets us safely EXTEND a short
-           original serial to full spoof length. If the alloc fails
-           we still fall through with completion=NULL, and the
-           routine reverts to v3.4 truncate-at-actual behavior. */
-        sctx = (PRSTFLT_STORAGE_CTX)ExAllocatePoolWithTag(
-            NonPagedPool, sizeof(*sctx), POOL_TAG);
-        if (sctx != NULL) {
-            sctx->OutputBufferLength =
-                sp->Parameters.DeviceIoControl.OutputBufferLength;
-        }
-
-        IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofStorageCompletion, sctx,
-                               TRUE, TRUE, TRUE);
-        return IoCallDriver(dx->LowerDevice, Irp);
-    }
-
-    /* ---- Path 2: IOCTL_SMART_RCV_DRIVE_DATA (IDENTIFY DEVICE) ---- */
-    if (ioctl == SMART_RCV_DRIVE_DATA) {
-        PSENDCMDINPARAMS inParams;
-
-        if (sp->Parameters.DeviceIoControl.InputBufferLength <
-            sizeof(SENDCMDINPARAMS))
-            goto passthru;
-
-        inParams = (PSENDCMDINPARAMS)Irp->AssociatedIrp.SystemBuffer;
-
-        /* Only intercept IDENTIFY DEVICE (0xEC), not other SMART cmds */
-        if (inParams->irDriveRegs.bCommandReg != ID_COMMAND)
-            goto passthru;
-
-        IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofIdentifyCompletion, NULL,
-                               TRUE, TRUE, TRUE);
-        return IoCallDriver(dx->LowerDevice, Irp);
-    }
-
-    /* ---- Path 3: IOCTL_ATA_PASS_THROUGH (IDENTIFY DEVICE) ---- */
-    if (ioctl == IOCTL_ATA_PASS_THROUGH) {
-        PATA_PASS_THROUGH_EX aptIn;
-
-        if (sp->Parameters.DeviceIoControl.InputBufferLength <
-            sizeof(ATA_PASS_THROUGH_EX))
-            goto passthru;
-
-        aptIn = (PATA_PASS_THROUGH_EX)Irp->AssociatedIrp.SystemBuffer;
-
-        /* CurrentTaskFile[6] is the command register */
-        if (aptIn->CurrentTaskFile[6] != ID_COMMAND)
-            goto passthru;
-
-        IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofAtaPassCompletion, NULL,
-                               TRUE, TRUE, TRUE);
-        return IoCallDriver(dx->LowerDevice, Irp);
-    }
-
-    /* ---- Path 4: IOCTL_STORAGE_PROTOCOL_COMMAND (NVMe IDENTIFY) ---- */
-    if (ioctl == IOCTL_STORAGE_PROTOCOL_COMMAND) {
-        PSTORAGE_PROTOCOL_COMMAND cmd;
-        ULONG inLen;
-        UCHAR opc;
-        UCHAR cns;
-
-        inLen = sp->Parameters.DeviceIoControl.InputBufferLength;
-        if (inLen < sizeof(STORAGE_PROTOCOL_COMMAND))
-            goto passthru;
-
-        cmd = (PSTORAGE_PROTOCOL_COMMAND)Irp->AssociatedIrp.SystemBuffer;
-        if (cmd == NULL)
-            goto passthru;
-
-        /* NVMe only. STORAGE_PROTOCOL_TYPE: 1=Scsi, 2=Ata, 3=Nvme.
-           Use the numeric constant to avoid pulling in the enum on
-           older WDKs that may name it differently. */
-        if (cmd->ProtocolType != 3 /* ProtocolTypeNvme */)
-            goto passthru;
-
-        /* Need at least OPC (byte 0) + CDW10 (bytes 40-43) of the
-           embedded NVMe command to identify Identify Controller. */
-        if (cmd->CommandLength < 44)
-            goto passthru;
-
-        /* Overflow-safe check that Command[] actually fits.
-           STORAGE_PROTOCOL_COMMAND already declares Command[1], so the
-           real total is sizeof(...) + CommandLength - 1. */
-        if (cmd->CommandLength > inLen)
-            goto passthru;
-        if (inLen - cmd->CommandLength < sizeof(STORAGE_PROTOCOL_COMMAND) - 1)
-            goto passthru;
-
-        opc = cmd->Command[0];
-        cns = cmd->Command[40];  /* CDW10 low byte = CNS */
-
-        /* NVMe Admin IDENTIFY opcode = 0x06, CNS 0x01 = Identify Controller
-           (where the 20-byte Serial Number lives at bytes 4-23). */
-        if (opc != 0x06 || cns != 0x01)
-            goto passthru;
-
-        IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofNvmeIdentifyCompletion, NULL,
-                               TRUE, TRUE, TRUE);
-        return IoCallDriver(dx->LowerDevice, Irp);
-    }
-
-    /* ---- Path 5: IOCTL_ATA_PASS_THROUGH_DIRECT (ATA IDENTIFY DEVICE) ---- */
-    if (ioctl == IOCTL_ATA_PASS_THROUGH_DIRECT) {
-        PATA_PASS_THROUGH_DIRECT aptd;
-        PMDL   mdl;
-        PVOID  kva;
-        PRSTFLT_APTD_CTX cx;
-
-        if (sp->Parameters.DeviceIoControl.InputBufferLength <
-            sizeof(ATA_PASS_THROUGH_DIRECT))
-            goto passthru;
-
-        aptd = (PATA_PASS_THROUGH_DIRECT)Irp->AssociatedIrp.SystemBuffer;
-        if (aptd == NULL)
-            goto passthru;
-
-        /* Only intercept IDENTIFY DEVICE (0xEC). CurrentTaskFile[6]
-           holds the ATA command register in ATA_PASS_THROUGH_DIRECT. */
-        if (aptd->CurrentTaskFile[6] != ID_COMMAND)
-            goto passthru;
-
-        if (aptd->DataTransferLength < 512)
-            goto passthru;
-        if (aptd->DataBuffer == NULL)
-            goto passthru;
-
-        cx = (PRSTFLT_APTD_CTX)ExAllocatePoolWithTag(
-                NonPagedPool, sizeof(*cx), POOL_TAG);
-        if (cx == NULL)
-            goto passthru;
-
-        /* Dispatch runs at PASSIVE_LEVEL in the caller's process
-           context. Build an MDL over the user DataBuffer and lock
-           the pages so the completion routine (potentially at
-           DISPATCH_LEVEL) can still touch the buffer via a system
-           VA that stays valid regardless of context/IRQL. */
-        mdl = IoAllocateMdl(aptd->DataBuffer, aptd->DataTransferLength,
-                            FALSE, FALSE, NULL);
-        if (mdl == NULL) {
-            ExFreePoolWithTag(cx, POOL_TAG);
-            goto passthru;
-        }
-
-        __try {
-            MmProbeAndLockPages(mdl, Irp->RequestorMode, IoWriteAccess);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            IoFreeMdl(mdl);
-            ExFreePoolWithTag(cx, POOL_TAG);
-            goto passthru;
-        }
-
-        kva = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
-        if (kva == NULL) {
-            MmUnlockPages(mdl);
-            IoFreeMdl(mdl);
-            ExFreePoolWithTag(cx, POOL_TAG);
-            goto passthru;
-        }
-
-        cx->Mdl = mdl;
-        cx->Kva = (UCHAR*)kva;
-
-        IoCopyCurrentIrpStackLocationToNext(Irp);
-        IoSetCompletionRoutine(Irp, SpoofAtaPassDirectCompletion, cx,
-                               TRUE, TRUE, TRUE);
-        return IoCallDriver(dx->LowerDevice, Irp);
-    }
-
-passthru:
-    IoSkipCurrentIrpStackLocation(Irp);
-    st = IoCallDriver(dx->LowerDevice, Irp);
-    IoReleaseRemoveLock(&dx->RemoveLock, Irp);
-    return st;
-}
-
-/* ================================================================
  *  DispatchPassthrough - generic forwarding for all other IRPs
+ *  (including IRP_MJ_DEVICE_CONTROL and IRP_MJ_INTERNAL_DEVICE_CONTROL
+ *  in v3.6 — no interception).
  *
  *  Acquires the remove lock to ensure the device extension and
  *  LowerDevice pointer stay valid while the IRP is forwarded.
@@ -1529,19 +661,20 @@ NTSTATUS DispatchPassthrough(PDEVICE_OBJECT DevObj, PIRP Irp)
 }
 
 /* ================================================================
- *  AddDevice - attach filter to each disk in the PnP stack
+ *  AddDevice - attach filter to each disk in the PnP stack.
  *
- *  Queries DevicePropertyLocationInformation for a stable per-slot
- *  identifier used in deterministic serial generation.
+ *  v3.6: no per-device configuration is needed anymore. We still
+ *  attach so the service loads reliably at SYSTEM_START (upper
+ *  filter of DiskDrive class ensures we load early enough for
+ *  DriverEntry's SMBIOS replay to precede winmgmt/anti-cheat),
+ *  but the filter is transparent — every IRP that reaches us
+ *  is forwarded unchanged.
  * ================================================================ */
 NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
 {
     NTSTATUS        st;
     PDEVICE_OBJECT  flt = NULL;
     PDEVICE_EXTENSION dx;
-    WCHAR  locBufW[128];
-    ULONG  locLen = 0;
-    ULONG  i;
 
     st = IoCreateDevice(
         DrvObj,
@@ -1568,61 +701,6 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
     dx->PhysicalDevice = Pdo;
     dx->Started        = FALSE;
     dx->Removed        = FALSE;
-    dx->HasFakeSerial  = FALSE;
-
-    /* Get device location info for deterministic serial generation */
-    st = IoGetDeviceProperty(
-        Pdo,
-        DevicePropertyLocationInformation,
-        sizeof(locBufW),
-        locBufW,
-        &locLen);
-
-    if (NT_SUCCESS(st) && locLen > 0) {
-        /* Convert wide to narrow, store in extension */
-        ULONG wChars = locLen / sizeof(WCHAR);
-        ULONG j = 0;
-
-        for (i = 0; i < wChars && j < sizeof(dx->LocationInfo) - 1; i++) {
-            if (locBufW[i] == L'\0')
-                break;
-            dx->LocationInfo[j++] = (CHAR)locBufW[i];
-        }
-        dx->LocationInfo[j] = '\0';
-        dx->LocationLen = j;
-    } else {
-        /* Fallback: hash of PDO pointer as location string.
-           Formatted manually to avoid pulling stdio out of ntstrsafe. */
-        ULONG_PTR pdoVal = (ULONG_PTR)Pdo;
-        ULONG_PTR ptrVal = (ULONG_PTR)Pdo;
-        static const CHAR hex[] = "0123456789ABCDEF";
-        CHAR *p = dx->LocationInfo;
-        int nibble;
-        int j;
-
-        pdoVal ^= (pdoVal >> 16);
-        pdoVal *= 0x45d9f3b;
-        pdoVal ^= (pdoVal >> 16);
-
-        /* "PDO_" prefix */
-        *p++ = 'P'; *p++ = 'D'; *p++ = 'O'; *p++ = '_';
-
-        /* Pointer as 16 hex digits */
-        for (j = 15; j >= 0; j--) {
-            nibble = (int)((ptrVal >> (j * 4)) & 0xF);
-            *p++ = hex[nibble];
-        }
-        *p++ = '_';
-
-        /* Hash as 8 hex digits */
-        for (j = 7; j >= 0; j--) {
-            nibble = (int)((pdoVal >> (j * 4)) & 0xF);
-            *p++ = hex[nibble];
-        }
-        *p = '\0';
-
-        dx->LocationLen = (ULONG)(p - dx->LocationInfo);
-    }
 
     /* Attach to the device stack */
     dx->LowerDevice = IoAttachDeviceToDeviceStack(flt, Pdo);
@@ -1642,63 +720,59 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
     flt->Flags          &= ~DO_DEVICE_INITIALIZING;
 
 #if DBG
-    DbgPrint("[RstFlt] Attached to PDO %p (lower=%p, loc=%s)\n",
-             Pdo, dx->LowerDevice, dx->LocationInfo);
+    DbgPrint("[RstFlt] Attached to PDO %p (lower=%p)\n",
+             Pdo, dx->LowerDevice);
 #endif
     return STATUS_SUCCESS;
 }
 
 /* ================================================================
- *  DriverUnload
- *  PnP IRP_MN_REMOVE_DEVICE handles actual cleanup.
+ *  (DriverUnload intentionally NOT provided.)
+ *
+ *  A DiskDrive upper-filter always has attachments — REMOVE IRPs
+ *  are the only way this driver leaves the system, and they run
+ *  through DispatchPnp above. Advertising DriverUnload would let
+ *  `sc stop RstFlt` return success synchronously, letting a
+ *  hot-replace path (sc stop → replace .sys → sc start) race the
+ *  still-mapped image. Omitting it means service-stop reports
+ *  "cannot stop — driver cannot accept requests" and forces a
+ *  reboot for reinstall, which is the correct behavior.
  * ================================================================ */
-VOID DriverUnload(PDRIVER_OBJECT DrvObj)
-{
-    UNREFERENCED_PARAMETER(DrvObj);
-#if DBG
-    DbgPrint("[RstFlt] Unload\n");
-#endif
-}
 
 /* ================================================================
- *  DriverEntry - read config and register dispatch routines
+ *  DriverEntry - replay SMBIOS blob and register dispatch routines
+ *
+ *  v3.6: no registry config to read (SerialSeed/Prefix/Length are
+ *  gone). SMBIOS replay is the sole boot-time job; everything else
+ *  is pure pass-through.
  * ================================================================ */
 NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
 {
     ULONG i;
 
-    /* Set defaults before attempting registry read */
-    RtlZeroMemory(g_Seed, SEED_SIZE);
-    RtlCopyMemory(g_Prefix, "S6BN", 5);   /* includes NUL */
-    g_SerialLen = 15;
-    g_HasConfig = FALSE;
-
-    /* Try to load configuration from registry */
-    ReadRegistryConfig(RegPath);
-
-    /* Replay cached SMBIOS blob (if the userspace tool has ever run)
-       into mssmbios\Data\SMBiosData. Doing this here — inside the
-       boot-start driver's DriverEntry — beats winmgmt and any
-       user-mode anti-cheat to the punch, killing the race that made
-       the old scheduled-task approach unreliable. */
+    /* Replay cached SMBIOS blob (if the userspace tool has ever run
+       AND EnableSmbiosReplay=1) into mssmbios\Data\SMBiosData.
+       Doing this here — inside a SYSTEM_START driver's DriverEntry —
+       beats winmgmt and any user-mode anti-cheat to the punch,
+       killing the race that made the old scheduled-task approach
+       unreliable. Failure is silently non-fatal: the driver still
+       loads and disks still work; only the firmware SMBIOS values
+       remain unchanged for that boot. */
     ApplySmbiosBlobIfCached(RegPath);
 
-    /* Default: all IRPs pass through */
+    /* Default: all IRPs pass through (v3.6: DEVICE_CONTROL included) */
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         DrvObj->MajorFunction[i] = DispatchPassthrough;
 
-    /* Override specific handlers */
-    DrvObj->MajorFunction[IRP_MJ_PNP]                     = DispatchPnp;
-    DrvObj->MajorFunction[IRP_MJ_POWER]                   = DispatchPower;
-    DrvObj->MajorFunction[IRP_MJ_DEVICE_CONTROL]          = DispatchDeviceControl;
-    DrvObj->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = DispatchDeviceControl;
+    /* Override PnP + Power with WDM-correct handlers */
+    DrvObj->MajorFunction[IRP_MJ_PNP]   = DispatchPnp;
+    DrvObj->MajorFunction[IRP_MJ_POWER] = DispatchPower;
 
     DrvObj->DriverExtension->AddDevice = AddDevice;
-    DrvObj->DriverUnload               = DriverUnload;
+    /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v3.5) config=%s prefix=%s len=%lu\n",
-             g_HasConfig ? "loaded" : "defaults", g_Prefix, g_SerialLen);
+    DbgPrint("[RstFlt] DriverEntry OK (v3.6, minimal SMBIOS-replay)\n");
 #endif
     return STATUS_SUCCESS;
 }

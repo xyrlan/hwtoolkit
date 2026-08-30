@@ -192,27 +192,22 @@ foreach ($a in $adapters) {
 }
 
 # ============================================================
-#  5. Disco: Model (nao spoofado) vs Serial format (spoofado)
+#  5. Disco: Model + Serial (informativo, NAO spoofado em v3.6)
 #
-#  Se Model diz "Samsung SSD 970" mas Serial parece formato
-#  Kingston/Crucial (prefixo diferente), disparate obvio.
-#  Alem disso mostra ambos os campos que anti-cheat compara.
+#  v3.6 removeu o intercept de IOCTL_STORAGE_QUERY_PROPERTY /
+#  IDENTIFY / NVMe do driver rstflt. O serial de disco reportado
+#  aqui e o real da controladora - EMAC nao consulta esse campo,
+#  o custo/beneficio do spoof nao valia o BSOD risk.
+#  Mostramos os valores so pra registro. Nao emitimos gap por
+#  "prefixo errado" - nao existe prefixo esperado.
 # ============================================================
-Write-Section "Disco: Model vs Serial format"
+Write-Section "Disco: Model + Serial (nao spoofado em v3.6 - valor real)"
 
 $disks = Get-CimInstance Win32_DiskDrive |
          Where-Object { $_.MediaType -match "Fixed" -or $_.InterfaceType -match "IDE|SCSI|NVMe" }
 foreach ($d in $disks) {
     $ser = if ($d.SerialNumber) { $d.SerialNumber.Trim() } else { "(vazio)" }
     Write-Info ("{0,-35} Serial: {1}" -f $d.Model, $ser)
-
-    # Heuristica leve - so aviso se cheiro obvio
-    if ($d.Model -match "Samsung"  -and $ser -notmatch "^S[0-9A-Z]") {
-        Write-Gap "Samsung mas serial nao comeca com S - verifique SerialPrefix"
-    }
-    if ($d.Model -match "Kingston" -and $ser -match "^S6BN") {
-        Write-Gap "Kingston com prefixo S6BN (default do toolkit) - mismatch"
-    }
 }
 
 # ============================================================
@@ -468,6 +463,13 @@ if (-not (Test-Path $displayRoot)) {
 }
 
 # ============================================================
+#  (Reservado — sem section 9 dedicada. Antes do v3.6 aqui havia
+#  o dump de driver storage state / disk-serial spoof check; foi
+#  removido junto com o intercept de IOCTL_STORAGE_QUERY_PROPERTY
+#  no driver.)
+# ============================================================
+
+# ============================================================
 #  8. emac-uuid file persistente + ACL locked
 #
 #  EMAC guarda HWID plaintext em %USERPROFILE%\emac-uuid. Deletar
@@ -584,10 +586,10 @@ if (-not $hasProfile) {
         Write-Info ("profile schema_version = {0}" -f $schemaVer)
         $verInt = 0
         [int]::TryParse([string]$schemaVer, [ref]$verInt) | Out-Null
-        if ($verInt -lt 5) {
-            Write-Warn ("schema {0} < 5 - Fase 1 (audio rotation, EDID full, emac persistence) ausente. Regenere o profile." -f $schemaVer)
+        if ($verInt -lt 7) {
+            Write-Warn ("schema {0} < 7 - versao antiga do profile (pre-v3.6, ainda contem 'storage' block obsoleto). Regenere com 00-gerar-profile.bat." -f $schemaVer)
         } else {
-            Write-OK "schema >= 5 (Fase 1 fields presentes)"
+            Write-OK "schema >= 7 (v3.6+ minimal driver, sem storage IOCTL spoof)"
         }
     }
 }
@@ -672,51 +674,6 @@ if ($null -eq $cpuidVendor -or $null -eq $wmiMfr) {
         Write-OK "CPUID vendor bate com WMI Manufacturer"
     } else {
         Write-Gap "SMBIOS Type 4 CPU manufacturer diverges from CPUID vendor"
-    }
-}
-
-# ============================================================
-#  13. Storage serial deterministico (info-only)
-#
-#  Se RstFlt esta ativo e tem SerialSeed em Parameters, os seriais
-#  reportados por Win32_DiskDrive devem ser derivados via FNV-1a
-#  do seed + SerialPrefix do profile. Nao reimplementamos o hash
-#  aqui - apenas imprimimos model + serial atual para auditor
-#  cruzar visualmente com o prefixo esperado.
-# ============================================================
-Write-Section "Storage serial deterministico (RstFlt info)"
-
-$rstfltPresent = $false
-try {
-    $svc = Get-Service -Name RstFlt -ErrorAction SilentlyContinue
-    if ($svc) { $rstfltPresent = $true }
-} catch { }
-
-if (-not $rstfltPresent) {
-    Write-Info "RstFlt nao instalado - pulando check de seriais deterministicos"
-} else {
-    $seed = $null
-    try {
-        $rp = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters" -ErrorAction SilentlyContinue
-        if ($rp -and $rp.PSObject.Properties['SerialSeed']) { $seed = $rp.SerialSeed }
-    } catch { }
-
-    if ($null -eq $seed) {
-        Write-Info "RstFlt presente mas sem Parameters\SerialSeed - driver nao seedado"
-    } else {
-        Write-Info ("RstFlt SerialSeed: {0}" -f $seed)
-        $expectedPrefix = $null
-        if ($hasProfile -and $prof.PSObject.Properties['storage'] -and $prof.storage.PSObject.Properties['SerialPrefix']) {
-            $expectedPrefix = [string]$prof.storage.SerialPrefix
-            Write-Info ("profile.storage.SerialPrefix esperado: {0}" -f $expectedPrefix)
-        }
-        try {
-            $dd = Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue
-            foreach ($d in $dd) {
-                $ser = if ($d.SerialNumber) { $d.SerialNumber.Trim() } else { "(vazio)" }
-                Write-Info ("{0,-35} Serial: {1}" -f $d.Model, $ser)
-            }
-        } catch { }
     }
 }
 

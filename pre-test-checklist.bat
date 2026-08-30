@@ -16,8 +16,9 @@ rem     1. Driver Verifier em rstflt.sys
 rem     2. AutoReboot=0 (para ver o STOP code na tela)
 rem     3. CrashDumpEnabled=7 (Automatic — kernel dump)
 rem     4. DedicatedDumpFile ou pagefile >= RAM
-rem     5. Estado do driver (servico, seed, SmbiosBlob,
+rem     5. Estado do driver (servico, SmbiosBlob,
 rem        EnableSmbiosReplay, OrigSmbiosData backup)
+rem        (v3.6: SerialSeed nao existe mais - IOCTL intercept removido)
 rem     6. testsigning + HVCI
 rem ========================================================
 
@@ -145,15 +146,9 @@ echo    RstFlt\Parameters:
 powershell -NoProfile -Command ^
   "$p='HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters';" ^
   "if (-not (Test-Path $p)) { '    (chave ausente)' } else {" ^
-  "  $seed = (Get-ItemProperty -Path $p -Name SerialSeed         -ErrorAction SilentlyContinue).SerialSeed;" ^
   "  $blob = (Get-ItemProperty -Path $p -Name SmbiosBlob         -ErrorAction SilentlyContinue).SmbiosBlob;" ^
   "  $ena  = (Get-ItemProperty -Path $p -Name EnableSmbiosReplay -ErrorAction SilentlyContinue).EnableSmbiosReplay;" ^
   "  $orig = (Get-ItemProperty -Path $p -Name OrigSmbiosData     -ErrorAction SilentlyContinue).OrigSmbiosData;" ^
-  "  $pref = (Get-ItemProperty -Path $p -Name SerialPrefix       -ErrorAction SilentlyContinue).SerialPrefix;" ^
-  "  $len  = (Get-ItemProperty -Path $p -Name SerialLength       -ErrorAction SilentlyContinue).SerialLength;" ^
-  "  '      SerialSeed         : ' + $(if ($seed) { $seed.Length.ToString() + ' bytes'  } else { '(ausente)' });" ^
-  "  '      SerialPrefix       : ' + $(if ($pref) { $pref                              } else { '(ausente)' });" ^
-  "  '      SerialLength       : ' + $(if ($len -ne $null) { $len                      } else { '(ausente)' });" ^
   "  '      SmbiosBlob         : ' + $(if ($blob) { $blob.Length.ToString() + ' bytes' } else { '(ausente)' });" ^
   "  '      EnableSmbiosReplay : ' + $(if ($ena -ne $null) { $ena                      } else { '(ausente=OFF)' });" ^
   "  '      OrigSmbiosData     : ' + $(if ($orig) { $orig.Length.ToString() + ' bytes' } else { '(ausente)' });" ^

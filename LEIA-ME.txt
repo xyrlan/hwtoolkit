@@ -1,6 +1,6 @@
 ========================================================
-  HW TOOLKIT v3.5.1 + Fase 1 (EMAC hardening)
-  Sistema centralizado de profile + storage filter
+  HW TOOLKIT v3.6 + Fase 1 (EMAC hardening)
+  Sistema centralizado de profile + SMBIOS boot replay
 ========================================================
 
 OBJETIVO:
@@ -16,8 +16,8 @@ HWToolkit/
   LEIA-ME.txt               <- Este arquivo
   00-gerar-profile.bat      <- Gera profile de hardware (1x)
   01-instalar-ferramentas.bat <- VS Build Tools + WDK (1x)
-  02-compilar-driver.bat     <- Compila rstflt.sys
-  03-instalar-driver.bat     <- Instala + registra rstflt (storage)
+  02-compilar-driver.bat     <- Compila rstflt.sys (v3.6, SMBIOS replay minimal)
+  03-instalar-driver.bat     <- Instala + registra rstflt (SMBIOS boot replay)
   pre-test-checklist.bat     <- Verifier + dump + estado driver (check/arm/disarm)
   04-aplicar-hwid.bat        <- GUIDs, MACs, Product ID, EDID, audio, emac-uuid
   05-aplicar-smbios.bat      <- UUID + strings SMBIOS (Types 1/2/3/4/11)
@@ -38,8 +38,8 @@ HWToolkit/
     check-consistency.ps1    <- Auditoria read-only: BIOS mirror + cross-check [antes: consistency-check.ps1]
     restore-smbios.ps1       <- Restaura SMBIOS do firmware (limpa spoof) [antes: restore-firmware-smbios.ps1]
   driver/
-    rstflt.c                 <- Storage filter v3.5 (source)
-    rstflt.inf               <- INF do storage filter
+    rstflt.c                 <- SMBIOS replay v3.6 (minimal - IOCTL removidos)
+    rstflt.inf               <- INF do filtro (upper filter de DiskDrive)
     makefile.mak             <- Makefile para rstflt.sys
 
 Profile:
@@ -56,6 +56,13 @@ Profile:
   Nota: VolFlt (spoof de VSN via minifilter) foi REMOVIDO em
   v3.5.1. Nao ha 03b. VSN nao esta na cobertura da fingerprint
   do EMAC (ver PROTOCOLO EMAC abaixo).
+
+  Nota (v3.6): Storage IOCTL intercept (disk serial ATA/NVMe)
+  tambem foi REMOVIDO do driver. EMAC nao consulta esse vetor
+  e os paths tinham historico de BSOD (v3.1-3.4 documentam
+  6 correcoes). Driver agora e minimal: apenas SMBIOS replay
+  opt-in via EnableSmbiosReplay=1. Ver "MUDANCAS EM v3.6"
+  no fim deste arquivo.
 
   DEPOIS (quando quiser novos IDs):
     00 -> 02 -> 03 -> reboot -> 04 -> 05 -> 06 -> 07
@@ -80,8 +87,9 @@ Profile:
        Compila rstflt.c -> rstflt.sys via nmake.
 
   03 - INSTALAR DRIVER
-       Copia .sys, cria servico boot-start, registra
-       como upper filter de DiskDrive, escreve seed.
+       Copia .sys, cria servico system-start, registra
+       como upper filter de DiskDrive, escreve SmbiosBlob
+       + EnableSmbiosReplay para replay no proximo boot.
        Reboot obrigatorio.
 
   04 - APLICAR HWID
@@ -133,17 +141,12 @@ Profile:
 
   Surface                   Componente               Metodo
   -----------------------   ----------------------   ----------------------
-  Disk serial (ATA)         Driver RstFlt            IOCTL intercept (STORAGE_QUERY,
-                                                     SMART IDENTIFY, ATA_PASS_THROUGH,
-                                                     ATA_PASS_THROUGH_DIRECT)
-  Disk serial (NVMe)        Driver RstFlt            STORAGE_QUERY + STORAGE_PROTOCOL_
-                                                     COMMAND (Identify Controller)
   SMBIOS UUID               spoof-smbios.ps1         Rebuild + cache no driver
   SMBIOS strings            spoof-smbios.ps1         Types 1/2/3 completos + Type 3 SKU
                                                      + Type 4 (proc strings) + Type 11
                                                      (OEM Strings). CPUID nao tocado.
   SMBIOS boot replay        Driver RstFlt            DriverEntry copia blob cacheado
-                                                     para mssmbios\Data\SMBiosData
+    (v3.6, IOCTL removidos)                          para mssmbios\Data\SMBiosData
                                                      antes de winmgmt/anti-cheat
   Machine GUID              (removido em v3.5.1)     EMAC nao le; diff vs baseline
   SQM Machine ID            (removido em v3.5.1)     EMAC nao le; diff vs baseline
@@ -166,6 +169,15 @@ Profile:
 ========================================================
   LIMITACOES CONHECIDAS
 ========================================================
+
+  - Disk serial (ATA/NVMe) nao spoofado desde v3.6.
+    EMAC nao consulta esse vetor no fingerprint atual, e os
+    paths de IOCTL intercept do driver (STORAGE_QUERY, SMART
+    IDENTIFY, ATA_PASS_THROUGH, ATA_PASS_THROUGH_DIRECT,
+    STORAGE_PROTOCOL_COMMAND) tinham historico de BSOD
+    (v3.1-3.4 documentam 6 correcoes). Custo > beneficio:
+    removido. Se um dia o anti-cheat comecar a consultar
+    esse vetor, reintroducao entra em plano.
 
   - Test signing mode: anti-cheats kernel-level detectam
     a CI policy. Sem DSE bypass, o watermark fica visivel.
@@ -190,12 +202,6 @@ Profile:
     arriscado, pode causar tela preta com driver NVIDIA).
     Strings da GPU (AdapterString, ChipType) ficam opcionais
     em Fase 2 e exigem teste caso a caso por modelo.
-
-  - NVMe Identify Namespace (CNS=0x00) e Namespace Identification
-    Descriptor List (CNS=0x03) nao sao spoofados. Contem NGUID/EUI64
-    que sao identificadores por-namespace, raramente usados por
-    anti-cheat de jogo. Apenas Identify Controller (CNS=0x01, o
-    campo Serial Number) e reescrito.
 
   - Amcache.hve esta locked pelo kernel. Limpar requer
     boot no WinRE.
@@ -258,6 +264,27 @@ Profile:
   - Conta de administrador
   - Secure Boot DESABILITADO na BIOS
   - ~10 GB livres (para VS Build Tools + WDK)
+
+========================================================
+  MUDANCAS EM v3.6
+========================================================
+
+  v3.6 - Storage IOCTL intercept removido do driver. EMAC
+         nao usa esse vetor, e paths tinham historico de
+         BSOD (v3.1-3.4 documentam 6 correcoes). Driver
+         agora e minimal: apenas SMBIOS boot replay opt-in.
+         Profile schema v6 -> v7 (removido bloco storage).
+
+         Impacto pratico:
+           - driver/rstflt.c: 1704 -> 778 linhas (metade e
+             changelog v1-v3.6 + comentarios de validacao)
+           - Registry: SerialSeed/SerialPrefix/SerialLength
+             nao sao mais escritos em RstFlt\Parameters
+           - profile.json: campo "storage" removido
+           - Disk serial ATA/NVMe: valor real e exposto
+             (ver LIMITACOES CONHECIDAS)
+           - SMBIOS replay: intacto (SmbiosBlob,
+             EnableSmbiosReplay, OrigSmbiosData)
 
 ========================================================
 
