@@ -51,10 +51,59 @@ rem --- Remover arquivo ---
 echo [*] Removendo rstflt.sys...
 del /f "%SystemRoot%\System32\drivers\rstflt.sys" 2>nul
 
+rem --- Reverter spoofs Fase 1.6 (registry-based, sobrevivem a remocao do driver) ---
+echo.
+echo ========================================================
+echo   Reverter Fase 1.6 (Windows ID + Disk + PCI + Volume)
+echo ========================================================
+echo Passar --skip-fase16 para pular esta etapa.
+set "SKIP_FASE16=0"
+for %%A in (%*) do (
+    if /I "%%~A"=="--skip-fase16" set "SKIP_FASE16=1"
+    if /I "%%~A"=="/skip-fase16"  set "SKIP_FASE16=1"
+)
+
+if "%SKIP_FASE16%"=="1" (
+    echo [i] --skip-fase16: pulando restore Fase 1.6.
+    goto :fase16_done
+)
+
+echo [*] Restaurando MachineGuid + ComputerName + Hostname...
+if exist "C:\ProgramData\.hwcfg\windows-id-backup.json" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-windows-id.ps1" -Restore
+) else (
+    echo     (windows-id-backup.json ausente, pulando)
+)
+
+echo [*] Restaurando PCI HardwareID...
+if exist "C:\ProgramData\.hwcfg\pci-hardwareid-mapping.json" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-pci-hardwareid.ps1" -Restore
+) else (
+    echo     (pci-hardwareid-mapping.json ausente, pulando)
+)
+
+echo [*] Restaurando Disk registry...
+if exist "C:\ProgramData\.hwcfg\disk-registry-backup.json" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-disk-registry.ps1" -Restore
+) else (
+    echo     (disk-registry-backup.json ausente, pulando)
+)
+
+echo [*] Restaurando Volume GUIDs (secundarios)...
+if exist "C:\ProgramData\.hwcfg\volume-guid-backup.json" (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-volume-guid.ps1" -Restore
+) else (
+    echo     (volume-guid-backup.json ausente, pulando)
+)
+
+:fase16_done
+
 echo.
 echo ========================================================
 echo   DESINSTALADO! Reinicie o PC.
-echo   Os seriais voltam ao original apos reiniciar.
+echo   Storage/SMBIOS + Fase 1.6 revertidos.
+echo   ObS: Audio GUIDs / EDID nao revertidos por este script -
+echo        rode 08b-restaurar-smbios.bat se precisar do SMBIOS pre-spoof.
 echo ========================================================
 echo.
 pause

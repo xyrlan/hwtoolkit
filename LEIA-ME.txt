@@ -1,5 +1,5 @@
 ========================================================
-  HW TOOLKIT v3.6 + Fase 1 (EMAC hardening)
+  HW TOOLKIT v3.7 + Fase 1.6 (registry-only HWID)
   Sistema centralizado de profile + SMBIOS boot replay
 ========================================================
 
@@ -7,6 +7,13 @@ OBJETIVO:
   Toolkit completo de spoofing de identificadores de hardware.
   Todos os componentes leem de um profile centralizado para
   garantir consistencia entre si.
+
+RECONHECIMENTO (LEITURA OBRIGATORIA):
+  docs/emac-recon-v2.md - findings empiricos corrigidos (procmon
+  cross-verified). Supersede o recon v1 (interno, nao versionado)
+  que assumia leituras DeviceIoControl / WMI que na realidade nao
+  acontecem. Base para decisoes de arquitetura v3.6 (driver
+  minimal) e v3.7 (Fase 1.6 registry-only + hotfix MachineGuid).
 
 ========================================================
   ESTRUTURA
@@ -148,9 +155,17 @@ Profile:
   SMBIOS boot replay        Driver RstFlt            DriverEntry copia blob cacheado
     (v3.6, IOCTL removidos)                          para mssmbios\Data\SMBiosData
                                                      antes de winmgmt/anti-cheat
-  Machine GUID              (removido em v3.5.1)     EMAC nao le; diff vs baseline
-  SQM Machine ID            (removido em v3.5.1)     EMAC nao le; diff vs baseline
-  Product ID                (removido em v3.5.1)     EMAC nao le; diff vs baseline
+  Machine GUID              spoof-windows-id.ps1     RESTAURADO em v3.7 (recon v2:
+                                                     EMAC LE via RegQueryValueEx
+                                                     Buffer Overflow -> Success)
+  ComputerName / hostname   spoof-windows-id.ps1     ActiveComputerName + Tcpip Hostname
+  SQM Machine ID            (removido em v3.5.1)     EMAC nao le (recon v2 confirmou 0 events)
+  Product ID                (removido em v3.5.1)     EMAC nao le (recon v2 confirmou 0 events)
+  SCSI Disk model           spoof-disk-registry.ps1  Enum\SCSI\Disk&Ven_*&Prod_* (Fase 1.6)
+  PCI HardwareID granular   spoof-pci-hardwareid.ps1 Enum\PCI\...\HardwareID REG_MULTI_SZ
+                                                     (SUBSYS+REV+CC) (Fase 1.6)
+  Volume GUIDs (Enum)       spoof-volume-guid.ps1    Enum\STORAGE\Volume + MountedDevices
+                                                     (Fase 1.6, NUNCA toca volume de boot)
   MAC address               change-hwid              Registry (OUI real)
   EDID monitor serial       spoof-edid-full.ps1      Cobertura completa (ver linhas abaixo)
   Audio endpoint GUIDs      spoof-audio-guids.ps1    HKLM\...\MMDevices\Audio (Render/Capture)
@@ -206,13 +221,19 @@ Profile:
   - Amcache.hve esta locked pelo kernel. Limpar requer
     boot no WinRE.
 
-  - Hostname/ComputerName nao e alterado automaticamente.
-    Se necessario, mude via:
-    Rename-Computer -NewName "DESKTOP-XXXXXXX" -Restart
+  - Hostname/ComputerName: coberto em v3.7 via
+    spoof-windows-id.ps1 (ActiveComputerName + Tcpip Hostname).
+    Renomear via Rename-Computer nao e mais necessario.
 
   - GAP #5 e GAP #7 (video device GUIDs adicionais e DHCP
     fingerprint em contextos especificos) ficam para Fase 2
     ou aceitos como risco residual dependendo do anti-cheat.
+
+  - Reconhecimento v2 (docs/emac-recon-v2.md) confirmou que
+    Fase 1.6 (registry-only) fecha GAPs 7/8/9 (disk model,
+    PCI granular HardwareID, Volume GUID). GAPs 1 (network
+    PnPInstanceId) e 2 (ProcessorNameString via CPUID)
+    seguem exigindo kernel/hypervisor - Fase 2.
 
 ========================================================
   PROTOCOLO EMAC / ANTI-CHEATS DE NIVEL AVANCADO
@@ -264,6 +285,59 @@ Profile:
   - Conta de administrador
   - Secure Boot DESABILITADO na BIOS
   - ~10 GB livres (para VS Build Tools + WDK)
+
+========================================================
+  MUDANCAS EM v3.7
+========================================================
+
+  v3.7 - Reconhecimento v2 aplicado. Ver docs/emac-recon-v2.md
+         para findings empiricos completos (procmon 7min baseline
+         + 18min re-registration burst).
+
+         Correcoes de premissa:
+           - MachineGuid E lido pelo EMAC (recon v1 errou).
+             Padrao Buffer Overflow -> Success confirma
+             RegQueryValueEx em HKLM\SOFTWARE\Microsoft\
+             Cryptography\MachineGuid. Hotfix v3.7 restaura
+             o campo no profile e cria spoof-windows-id.ps1.
+           - EMACDRVGLTB.sys nao coleta HWID. Papel real:
+             defesa runtime (ObCallbacks + LoadImage/CreateThread
+             notify). 100% da coleta de HWID e user-mode via
+             registry.
+           - Integrity check do EMAC compara hash de drivers
+             bundled (mssmbios.sys, tpm.sys, netbios.sys) vs
+             copias em System32\drivers. Impacto para nos:
+             NENHUM - so escrevemos no valor de registro
+             mssmbios\Data\SMBiosData, nunca no binario .sys.
+
+         Novidades (Fase 1.6, registry-only):
+           - spoof-windows-id.ps1: MachineGuid + ComputerName
+             + Tcpip\Parameters\Hostname
+           - spoof-disk-registry.ps1: reescreve subkeys de
+             Enum\SCSI\Disk&Ven_*&Prod_* (modelo/vendor de
+             disco falso)
+           - spoof-pci-hardwareid.ps1: reescreve HardwareID
+             REG_MULTI_SZ em Enum\PCI\VEN_*&DEV_*\{inst}
+             (SUBSYS+REV+CC granular)
+           - spoof-volume-guid.ps1: reescreve subkeys de
+             Enum\STORAGE\Volume\{GUID}#offset + entradas
+             correspondentes em MountedDevices. NUNCA toca
+             o GUID do volume de boot (C:) - risco de brick.
+
+         Profile schema v7 -> v8:
+           - Adicionado windows.machine_guid (restaurado)
+           - Adicionado windows.computer_name
+           - Adicionado windows.tcpip_hostname (derivado)
+           - Adicionado bloco disk_registry (vendor/model
+             fakes por instancia SCSI)
+           - Adicionado bloco pci_hardwareid (SUBSYS/REV/CC
+             fakes por instancia PCI)
+           - Adicionado bloco volume_guid (mapa GUID real ->
+             GUID fake por volume nao-boot)
+
+         check-consistency.ps1 estendido com novas secoes de
+         auditoria (Windows identity, disk registry, PCI HWID,
+         volume GUID).
 
 ========================================================
   MUDANCAS EM v3.6
