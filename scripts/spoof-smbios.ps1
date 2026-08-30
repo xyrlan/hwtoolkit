@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 # ============================================================
 #  SMBIOS Spoofer v2 — UUID + Strings (Types 1, 2, 3)
 #
@@ -34,6 +34,18 @@ $taskName    = "SpoofSMBIOS"
 # ============================================================
 if ($Uninstall) {
     Write-Host "`n=== Removendo SMBIOS Spoof ===" -ForegroundColor Yellow
+
+    # Garantir permissao de escrita em mssmbios\Data ANTES de tentar restaurar.
+    # Sem isso, Set-ItemProperty abaixo pode falhar com Access Denied silenciosamente
+    # (o try/catch downgrade para warning e o usuario pensa que restaurou).
+    try {
+        Grant-SmbiosDataWrite
+        Write-OK "ACL de mssmbios\Data ajustada para restore"
+    } catch {
+        Write-Warn "Falha ao ajustar ACL de mssmbios\Data: $_"
+        Write-Warn "Restore da SMBIOS abaixo pode falhar. Rode como Admin com ownership."
+    }
+
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
     # Tenta o nome antigo tambem
     Unregister-ScheduledTask -TaskName "SpoofUUID" -Confirm:$false -ErrorAction SilentlyContinue
@@ -47,6 +59,12 @@ if ($Uninstall) {
             Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay"  -ErrorAction SilentlyContinue
             Write-OK "SmbiosBlob + opt-in flag removidos (sem mais replay em kernel)"
         } catch { Write-Warn "Falha ao restaurar: $_" }
+
+        # v3.7+: limpar cache de CpuStrings do driver
+        try {
+            Remove-ItemProperty -Path $driverParams -Name "CpuStrings" -ErrorAction SilentlyContinue
+            Write-OK "CpuStrings removido do cache do driver"
+        } catch { Write-Warn "Falha ao remover CpuStrings: $_" }
 
         # v3.4: restaurar SMBiosData original se o driver salvou backup
         try {
@@ -320,7 +338,7 @@ if ($type3) {
     # state, security state, oem defined 4 bytes, height, num power cords,
     # contained element count, contained elems...). SKUNumber e o ultimo
     # string index e a distancia depende de contained_element_count *
-    # contained_element_record_length. Formula: offset 0x11 + n*m onde
+    # contained_element_record_length. Formula: offset 0x15 + n*m onde
     # n=Formatted[0x13] e m=Formatted[0x14].
     Set-StructureString $type3 $type3.Formatted[4] $smb.chassis_manufacturer
 
@@ -333,12 +351,12 @@ if ($type3) {
         Set-StructureString $type3 $type3.Formatted[8] $smb.chassis_asset_tag
     }
 
-    # SKUNumber (Type 3, spec 2.7+): offset 0x11 + contained*len.
+    # SKUNumber (Type 3, spec 2.7+): offset 0x15 + contained*len.
     # So mexer se o SMBIOS local expor esse campo (Length grande o bastante).
     if ($smb.PSObject.Properties.Name -contains "chassis_sku" -and $smb.chassis_sku) {
         $containedN   = if ($type3.Length -ge 0x14) { [int]$type3.Formatted[0x13] } else { 0 }
         $containedLen = if ($type3.Length -ge 0x15) { [int]$type3.Formatted[0x14] } else { 0 }
-        $skuOff       = 0x11 + ($containedN * $containedLen)
+        $skuOff       = 0x15 + ($containedN * $containedLen)
         if ($type3.Length -gt $skuOff) {
             Set-StructureString $type3 $type3.Formatted[$skuOff] $smb.chassis_sku
             Write-Info "  Chassis SKU: $($smb.chassis_sku) @ off=0x$($skuOff.ToString('X2'))"
@@ -460,6 +478,8 @@ if ($DisableKernelReplay) {
     if ($driverInstalled -and (Test-Path $driverParams)) {
         Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob"         -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -ErrorAction SilentlyContinue
+        # v3.7+: tambem limpar CpuStrings — todo replay em kernel esta desligado
+        Remove-ItemProperty -Path $driverParams -Name "CpuStrings"         -ErrorAction SilentlyContinue
     }
 } elseif ($driverInstalled) {
     try {
@@ -480,6 +500,48 @@ if ($DisableKernelReplay) {
 } else {
     Write-Warn "Driver RstFlt nao instalado - sem replay em kernel"
     Write-Warn "Instale o driver (03-instalar-driver.bat) para persistencia sem race"
+}
+
+# ============================================================
+#  Step 10c: Cachear strings de CPU (name_string / identifier /
+#  vendor_identifier) no driver para spoof estatico via registry.
+#
+#  So faz sentido se:
+#    - Driver esta instalado (senao nao ha quem consuma o cache)
+#    - Profile tem bloco cpu (v9+)
+#    - -DisableKernelReplay nao esta setado (mesma logica dos
+#      passos anteriores: se o usuario desligou replay para
+#      depurar, tambem nao queremos empilhar spoof de CPU)
+# ============================================================
+if ($driverInstalled -and -not $DisableKernelReplay) {
+    if ($prof.PSObject.Properties.Name -contains "cpu" -and $prof.cpu) {
+        $cpuNameStr = [string]$prof.cpu.name_string
+        $cpuIdent   = [string]$prof.cpu.identifier
+        $cpuVendor  = [string]$prof.cpu.vendor_identifier
+
+        try {
+            if (-not (Test-Path $driverParams)) {
+                New-Item -Path $driverParams -Force | Out-Null
+            }
+            Set-ItemProperty -Path $driverParams -Name "CpuStrings" `
+                -Value @($cpuNameStr, $cpuIdent, $cpuVendor) -Type MultiString
+            Write-OK "CpuStrings gravado no cache do driver (3 valores)"
+
+            $trunc = {
+                param($s)
+                if ($null -eq $s) { return "" }
+                if ($s.Length -gt 60) { return $s.Substring(0, 60) + "..." }
+                return $s
+            }
+            Write-Info "  name_string:       $(& $trunc $cpuNameStr)"
+            Write-Info "  identifier:        $(& $trunc $cpuIdent)"
+            Write-Info "  vendor_identifier: $(& $trunc $cpuVendor)"
+        } catch {
+            Write-Warn "Falha ao gravar CpuStrings no driver: $_"
+        }
+    } else {
+        Write-Info "Profile v< 9 - pulando CpuStrings"
+    }
 }
 
 # ============================================================

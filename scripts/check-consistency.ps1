@@ -117,6 +117,63 @@ if (-not (Test-Path $biosKey)) {
 }
 
 # ============================================================
+#  CPU registry replay audit
+#  (HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N)
+#
+#  Espelho de CPUID em registry. Cada subchave N e um core logico;
+#  os 3 campos abaixo devem bater com profile.cpu se o spoof/replay
+#  cobre esse path. Divergencia = anti-cheat lendo aqui ve valores
+#  reais mesmo com SMBIOS Type 4 spoofado.
+# ============================================================
+Write-Section "CPU registry replay audit (HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N)"
+
+if (-not $hasProfile -or -not $prof.PSObject.Properties['cpu']) {
+    Write-Info "Profile v< 9 sem bloco cpu - secao pulada"
+} else {
+    $cpuRoot = "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor"
+    if (-not (Test-Path $cpuRoot)) {
+        Write-Warn "CentralProcessor key ausente"
+    } else {
+        $cpuProf = $prof.cpu
+        $cpuChecks = @(
+            @{ Field = "ProcessorNameString"; Expected = $(if ($cpuProf.PSObject.Properties['name_string'])       { [string]$cpuProf.name_string })       },
+            @{ Field = "Identifier";          Expected = $(if ($cpuProf.PSObject.Properties['identifier'])        { [string]$cpuProf.identifier })        },
+            @{ Field = "VendorIdentifier";    Expected = $(if ($cpuProf.PSObject.Properties['vendor_identifier']) { [string]$cpuProf.vendor_identifier }) }
+        )
+
+        $cpuSubKeys = Get-ChildItem $cpuRoot -ErrorAction SilentlyContinue
+        foreach ($ck in $cpuSubKeys) {
+            $n = $ck.PSChildName
+            $cp = $null
+            try {
+                $cp = Get-ItemProperty -Path $ck.PSPath -ErrorAction SilentlyContinue
+            } catch { }
+
+            foreach ($chk in $cpuChecks) {
+                $field    = $chk.Field
+                $expected = $chk.Expected
+                $actual = $null
+                if ($cp) {
+                    $prop = $cp.PSObject.Properties | Where-Object { $_.Name -eq $field } | Select-Object -First 1
+                    if ($prop) { $actual = [string]$prop.Value }
+                }
+
+                if ($null -eq $actual) {
+                    Write-Warn ("CPU[{0}] {1} ausente do registro" -f $n, $field)
+                    continue
+                }
+
+                if ([string]$actual -eq [string]$expected) {
+                    Write-OK ("CPU[{0}] {1} OK: {2}" -f $n, $field, $actual)
+                } else {
+                    Write-Gap ("CPU[{0}] {1} vazamento: registro='{2}' profile='{3}'" -f $n, $field, $actual, $expected)
+                }
+            }
+        }
+    }
+}
+
+# ============================================================
 #  2. Manufacturer cross-check entre 3 fontes
 # ============================================================
 Write-Section "Manufacturer cross-check"
@@ -524,7 +581,7 @@ if (-not (Test-Path $emacPath)) {
         # Bitmask (numerico) e mais confiavel do que string-match: quando
         # FileSystemRights carrega uma mascara custom que nao bate com nenhum
         # nome de enum, ToString() retorna um numero decimal ("1245631") e o
-        # regex "Write|Modify|..." nunca casa — falso negativo no lock check.
+        # regex "Write|Modify|..." nunca casa - falso negativo no lock check.
         $writeMask = ([int][System.Security.AccessControl.FileSystemRights]::Write) `
                      -bor ([int][System.Security.AccessControl.FileSystemRights]::Modify) `
                      -bor ([int][System.Security.AccessControl.FileSystemRights]::FullControl) `
@@ -589,8 +646,10 @@ if (-not $hasProfile) {
             Write-Warn ("schema {0} < 7 - versao antiga do profile (pre-v3.6, ainda contem 'storage' block obsoleto). Regenere com 00-gerar-profile.bat." -f $schemaVer)
         } elseif ($verInt -lt 8) {
             Write-Warn ("schema {0} < 8 - versao Fase 1.5. Regenere com 00-gerar-profile.bat para habilitar windows.machine_guid + disk/pci/volume spoof (Fase 1.6)." -f $schemaVer)
+        } elseif ($verInt -lt 9) {
+            Write-Warn ("schema {0} < 9 - versao Fase 1.6/pre-Track-A. Regenere com 00-gerar-profile.bat para habilitar cpu.* replay (rstflt v4.0)." -f $schemaVer)
         } else {
-            Write-OK "schema >= 8 (v3.6 + Fase 1.6: windows identity + disk enum + pci hwid + volume guid)"
+            Write-OK "schema >= 9 (Track A: cpu registry replay incluso + Fase 1.6 completa)"
         }
     }
 }

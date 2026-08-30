@@ -1,6 +1,6 @@
 ========================================================
-  HW TOOLKIT v3.7 + Fase 1.6 (registry-only HWID)
-  Sistema centralizado de profile + SMBIOS boot replay
+  HW TOOLKIT v4.0 + Fase 2 Track A (CPU registry replay)
+  Sistema centralizado de profile + SMBIOS + CPU boot replay
 ========================================================
 
 OBJETIVO:
@@ -155,6 +155,13 @@ Profile:
   SMBIOS boot replay        Driver RstFlt            DriverEntry copia blob cacheado
     (v3.6, IOCTL removidos)                          para mssmbios\Data\SMBiosData
                                                      antes de winmgmt/anti-cheat
+  CPU registry replay       Driver RstFlt v4.0       Worker system-thread queued em
+    (Track A, Fase 2)                                DriverEntry reescreve
+                                                     HKLM\HARDWARE\...\CentralProcessor\N\
+                                                     {ProcessorNameString, Identifier,
+                                                     VendorIdentifier}. Opt-in via
+                                                     EnableCpuReplay=1. Backup em
+                                                     OrigCpuStrings. Fecha GAP #2.
   Machine GUID              spoof-windows-id.ps1     RESTAURADO em v3.7 (recon v2:
                                                      EMAC LE via RegQueryValueEx
                                                      Buffer Overflow -> Success)
@@ -207,11 +214,20 @@ Profile:
     atende esse caso.
 
   - ProcessorNameString em HKLM\HARDWARE\DESCRIPTION\System\
-    CentralProcessor\0 nao spoofado (GAP #2). O SMBIOS Type 4
-    fica coerente com o board escolhido, mas essa chave vem
-    diretamente de CPUID e o registry mirror expoe o modelo
-    real. Anti-cheat que compara SMBIOS vs CPUID detecta
-    inconsistencia. Fase 2.
+    CentralProcessor\0 SPOOFADO em v4.0 (Track A / Fase 2).
+    Kernel driver RstFlt agora replays as tres strings
+    (ProcessorNameString, Identifier, VendorIdentifier) em
+    todos os CentralProcessor\N logicos via CmCallback-free
+    approach (ZwSetValueKey em worker thread apos HAL
+    popular). Opt-in via EnableCpuReplay=1 (mesma pattern
+    do EnableSmbiosReplay). Backup automatico em
+    OrigCpuStrings. Fecha GAP #2 completamente.
+    NOTA: CPUID (via WMI Win32_Processor.ProcessorId) NAO
+    e tocado - vem direto do silicio via cpuid instruction.
+    SMBIOS Type 4 tambem nao mexe em bytes 5-15 (CPUID
+    dword). Anti-cheat que le HKLM CentralProcessor ve o
+    fake; anti-cheat que executa cpuid ve o real. Sao
+    dois vetores distintos.
 
   - GPU Device ID (VEN&DEV) nao esta coberto (filtro PCI
     arriscado, pode causar tela preta com driver NVIDIA).
@@ -230,10 +246,12 @@ Profile:
     ou aceitos como risco residual dependendo do anti-cheat.
 
   - Reconhecimento v2 (docs/emac-recon-v2.md) confirmou que
-    Fase 1.6 (registry-only) fecha GAPs 7/8/9 (disk model,
-    PCI granular HardwareID, Volume GUID). GAPs 1 (network
-    PnPInstanceId) e 2 (ProcessorNameString via CPUID)
-    seguem exigindo kernel/hypervisor - Fase 2.
+    Fase 1.6 (registry-only) fechou GAPs 7/8/9 (disk model,
+    PCI granular HardwareID, Volume GUID). Fase 2 Track A
+    fecha GAP #2 (CPU registry mirror). GAP #1 (network
+    PnPInstanceId) seria fechavel via CmRegisterCallback
+    filtered por PID do RubinOT.exe - considerado pra
+    Track B' se procmon pos-v4.0 mostrar necessidade.
 
 ========================================================
   PROTOCOLO EMAC / ANTI-CHEATS DE NIVEL AVANCADO
@@ -285,6 +303,89 @@ Profile:
   - Conta de administrador
   - Secure Boot DESABILITADO na BIOS
   - ~10 GB livres (para VS Build Tools + WDK)
+
+========================================================
+  MUDANCAS EM v4.0
+========================================================
+
+  v4.0 - Fase 2 Track A: CPU registry replay via driver.
+
+         Fecha GAP #2 (ProcessorNameString / Identifier /
+         VendorIdentifier em HKLM\HARDWARE\DESCRIPTION\
+         System\CentralProcessor\N). Anti-cheat que le esses
+         valores (recon v2 confirmou EMAC le) agora ve o
+         profile em vez do CPUID real.
+
+         Extensao do driver rstflt (v3.6 -> v4.0):
+           - Nova funcao ReplayCpuRegistry queued como worker
+             system-thread em DriverEntry. Nao bloqueia boot.
+           - Opt-in via Parameters\EnableCpuReplay=1 (mesma
+             pattern do EnableSmbiosReplay - default 0).
+           - Backup automatico em Parameters\OrigCpuStrings
+             (REG_MULTI_SZ) na primeira aplicacao.
+           - HAL race hardening: aguarda subkey count atingir
+             KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS)
+             antes de enumerar. Pre-check por-valor via
+             ZwQueryValueKey garante que so sobrescreve apos
+             HAL popular (evita last-writer-wins loss).
+           - Blob validation: rejeita DataLength impar,
+             enforce caps 128/64/16 wchars por string.
+           - Budget total: 10s (100 passes * 100ms). Sem
+             impacto em boot time (worker off-thread).
+
+         Profile schema v8 -> v9:
+           - Novo bloco 'cpu' com 3 strings deterministicas
+             do seed, selecionadas do $CpuPool por socket:
+               name_string       (ex.: "Intel(R) Core(TM) ...")
+               identifier        (ex.: "Intel64 Family 6 ...")
+               vendor_identifier ("GenuineIntel" ou "AuthenticAMD")
+
+         Novo pool em generate-profile.ps1:
+           - $CpuPool com 8+ CPUs realistas cobrindo LGA1200,
+             LGA1700, AM4, AM5. Selecao filtrada por socket.
+           - Parametro -Socket agora funcional (era declarado
+             mas nao usado em v3.7).
+
+         Extensoes de spoof-smbios.ps1:
+           - Novo Step 10c grava CpuStrings REG_MULTI_SZ em
+             Parameters\CpuStrings junto do SmbiosBlob.
+           - -Uninstall agora limpa CpuStrings tambem.
+           - -Uninstall chama Grant-SmbiosDataWrite ANTES do
+             restore (evita silent failure de ACL, v3.7 bug).
+           - Type 3 chassis SKU offset corrigido de 0x11 para
+             0x15 (pre-existente v3.5 bug: escrevia Height
+             byte em vez de SKU string index).
+
+         Extensoes de check-consistency.ps1:
+           - Nova secao "CPU registry replay audit" compara
+             HKLM CentralProcessor\N com profile.cpu.*.
+           - Schema check reconhece v9.
+           - Fixed em-dash U+2014 linha 584 (violava contrato
+             ASCII-only do arquivo).
+
+         Recovery (09-recuperar-boot.bat):
+           - Offline WinRE agora tambem desliga EnableCpuReplay
+             + remove CpuStrings. HARDWARE hive e volatil -
+             reconstruida com valores reais no proximo boot
+             sem intervencao adicional.
+
+         Documentacao Fase 2:
+           - docs/fase2-kickoff.md: handoff completo pra
+             sessao nova.
+           - docs/emac-recon-v2.md: atualizado (GAP #2 fechado).
+
+         Track B (NDIS PnP filter) foi DESCARTADO apos
+         analise: EMAC le PnPInstanceId direto do registry
+         cache (RegQueryValueEx), nao dispara IRP_MN_QUERY_ID
+         em runtime, entao nem LWF nem bus filter cobrem.
+         Alternativa Track B' (CmRegisterCallback filtered
+         por PID) fica pra pos-v4.0 se procmon mostrar
+         necessidade.
+
+         Track C (DSE bypass): decidido aceitar test-signing
+         enquanto target for EMAC. Recon v2 nao confirma
+         leitura de HKLM\SYSTEM\...\Control\CI\State pelo
+         EMAC user-mode.
 
 ========================================================
   MUDANCAS EM v3.7

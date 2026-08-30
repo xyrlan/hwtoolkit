@@ -10,6 +10,16 @@
 .NOTES
     Localizacao do perfil: C:\ProgramData\.hwcfg\profile.json
 
+    Schema v9 (Track A - CPU replay):
+      - ADICIONA bloco 'cpu' com { name_string, identifier, vendor_identifier }
+        para spoof das chaves HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N
+        (ProcessorNameString, Identifier, VendorIdentifier). Recon confirmou que
+        anti-cheats consomem esses valores via registry (nao CPUID direto), entao
+        e seguro reescrever as strings sem tocar no silicio. Entradas sao
+        filtradas por socket (LGA1200/LGA1700/AM4/AM5) via novo $CpuPool para
+        manter consistencia com a placa-mae escolhida (ex.: nunca combinar
+        placa AM5 com CPU LGA1700).
+
     Schema v8 (recon v2 - correcao):
       - RESTAURA bloco 'windows' (parcial): machine_guid, computer_name,
         tcpip_hostname. Recon v2 via procmon confirmou que EMAC LE
@@ -98,6 +108,35 @@ $HardwareDB = @{
     }
 }
 
+# ============================================================
+#  Pool de CPUs para replay via registry (schema v9)
+# ============================================================
+# Cada entrada define os 3 valores string escritos em
+# HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N:
+#   - ProcessorNameString  -> name_string
+#   - Identifier           -> identifier   (formato CPUID: <Arch> Family F Model M Stepping S)
+#   - VendorIdentifier     -> vendor_identifier (GenuineIntel | AuthenticAMD)
+# NAO mexer no CPUID via MSR/CPUID leaves — anti-cheats que fazem cross-check
+# (registry string vs CPUID leaf 1 EAX) quebrariam. Aqui apenas as strings do
+# registro sao spoofadas; recon confirmou que EMAC consome essas strings via
+# Reg_QueryValue e nao emite CPUID direto.
+$CpuPool = @(
+    @{ socket = "LGA1200"; name_string = "Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz"; identifier = "Intel64 Family 6 Model 165 Stepping 5"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1200"; name_string = "Intel(R) Core(TM) i5-10600K CPU @ 4.10GHz"; identifier = "Intel64 Family 6 Model 165 Stepping 5"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1200"; name_string = "Intel(R) Core(TM) i9-10900K CPU @ 3.70GHz"; identifier = "Intel64 Family 6 Model 165 Stepping 5"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1200"; name_string = "Intel(R) Core(TM) i5-11600K CPU @ 3.90GHz"; identifier = "Intel64 Family 6 Model 167 Stepping 1"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1700"; name_string = "12th Gen Intel(R) Core(TM) i7-12700K";      identifier = "Intel64 Family 6 Model 151 Stepping 2"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1700"; name_string = "12th Gen Intel(R) Core(TM) i5-12600K";      identifier = "Intel64 Family 6 Model 151 Stepping 2"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1700"; name_string = "13th Gen Intel(R) Core(TM) i7-13700K";      identifier = "Intel64 Family 6 Model 183 Stepping 1"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "LGA1700"; name_string = "13th Gen Intel(R) Core(TM) i5-13600K";      identifier = "Intel64 Family 6 Model 183 Stepping 1"; vendor_identifier = "GenuineIntel" }
+    @{ socket = "AM4";     name_string = "AMD Ryzen 5 5600X 6-Core Processor";        identifier = "AMD64 Family 25 Model 33 Stepping 0";   vendor_identifier = "AuthenticAMD" }
+    @{ socket = "AM4";     name_string = "AMD Ryzen 7 5800X 8-Core Processor";        identifier = "AMD64 Family 25 Model 33 Stepping 0";   vendor_identifier = "AuthenticAMD" }
+    @{ socket = "AM4";     name_string = "AMD Ryzen 9 5900X 12-Core Processor";       identifier = "AMD64 Family 25 Model 33 Stepping 0";   vendor_identifier = "AuthenticAMD" }
+    @{ socket = "AM5";     name_string = "AMD Ryzen 7 7700X 8-Core Processor";        identifier = "AMD64 Family 25 Model 96 Stepping 2";   vendor_identifier = "AuthenticAMD" }
+    @{ socket = "AM5";     name_string = "AMD Ryzen 5 7600X 6-Core Processor";        identifier = "AMD64 Family 25 Model 96 Stepping 2";   vendor_identifier = "AuthenticAMD" }
+    @{ socket = "AM5";     name_string = "AMD Ryzen 9 7900X 12-Core Processor";       identifier = "AMD64 Family 25 Model 96 Stepping 2";   vendor_identifier = "AuthenticAMD" }
+)
+
 # OUIs reais para geração de MACs
 $IntelOUIs   = @("3C22FB", "A4BB6D", "48210B", "8C8CAA")
 $RealtekOUIs = @("00E04C", "485D36", "2C4D54")
@@ -161,7 +200,7 @@ function Show-Banner {
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
     Write-Host "  ║        HWPROFILE  -  Gerador de Perfil HW       ║" -ForegroundColor DarkCyan
-    Write-Host "  ║            Perfil centralizado v8               ║" -ForegroundColor DarkCyan
+    Write-Host "  ║            Perfil centralizado v9               ║" -ForegroundColor DarkCyan
     Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
     Write-Host ""
 }
@@ -393,6 +432,19 @@ function Invoke-Generate {
 
     # Encontrar socket compatível
     $socket = Match-Socket -CpuName $cpuName
+
+    # Override via -Socket param (Fase 2 fix: parametro estava declarado mas nao usado).
+    # Se o usuario passou -Socket AM5, respeita — util em automacao / VMs onde a CPU
+    # detectada nao casa com nenhum socket do $HardwareDB.
+    if ($Socket) {
+        if (-not $HardwareDB.ContainsKey($Socket)) {
+            Write-Host "  [ERRO] -Socket '$Socket' invalido. Validos: $($HardwareDB.Keys -join ', ')" -ForegroundColor Red
+            exit 1
+        }
+        $socket = $Socket
+        Write-Host "  [*] -Socket=$Socket fornecido - override da deteccao automatica" -ForegroundColor DarkGray
+    }
+
     if (-not $socket) {
         Write-Host ""
         Write-Host "  [AVISO] Não foi possível detectar o socket automaticamente." -ForegroundColor Yellow
@@ -554,9 +606,27 @@ function Invoke-Generate {
         $volumePool += New-GuidBracesLower
     }
 
+    # ---- CPU (schema v9) ----
+    # Filtra o pool global por socket casado e escolhe uma entrada. Escolha
+    # aleatoria criptografica (Get-CryptoRandomItem) mantem paridade com o
+    # resto do gerador. O bloco resultante e escrito no perfil e consumido
+    # por spoof-cpu-registry.ps1, que reescreve as chaves
+    # HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N.
+    $cpuCandidates = @($CpuPool | Where-Object { $_.socket -eq $socket })
+    if ($cpuCandidates.Count -lt 1) {
+        Write-Host ("  [ERRO] Nenhuma entrada em CpuPool para socket {0}. Perfil abortado." -f $socket) -ForegroundColor Red
+        exit 1
+    }
+    $cpuChoice = Get-CryptoRandomItem -Items $cpuCandidates
+    $cpuBlock = [ordered]@{
+        name_string       = $cpuChoice.name_string
+        identifier        = $cpuChoice.identifier
+        vendor_identifier = $cpuChoice.vendor_identifier
+    }
+
     # Montar o objeto do perfil
     $prof = [ordered]@{
-        version        = 8
+        version        = 9
         generated_utc  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         cpu_detected   = $cpuName
         socket_matched = $socket
@@ -652,6 +722,7 @@ function Invoke-Generate {
             # proxima inicializacao.
             rotation_pool = $volumePool
         }
+        cpu = $cpuBlock
     }
 
     # Criar diretório se necessário
@@ -1132,6 +1203,47 @@ function Invoke-Validate {
         }
     }
 
+    # 15. CPU block (schema v9) — 3 strings, formato CPUID, vendor conhecido
+    $checks++
+    $cpuBlk = $prof.cpu
+    if (-not $cpuBlk) {
+        Write-Host "  [AVISO] Secao cpu ausente. Rode -Generate para atualizar (schema v9)." -ForegroundColor Yellow
+        $passed++
+    } else {
+        $cpuOk = $true
+        $ns = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.name_string }       else { $cpuBlk["name_string"] }
+        $id = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.identifier }        else { $cpuBlk["identifier"] }
+        $vi = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.vendor_identifier } else { $cpuBlk["vendor_identifier"] }
+
+        # name_string: nao-vazio, <= 128 chars
+        if (-not $ns -or $ns.Length -lt 1) {
+            Write-Host "  [FALHA] cpu.name_string vazio" -ForegroundColor Red
+            $cpuOk = $false
+        } elseif ($ns.Length -gt 128) {
+            Write-Host "  [FALHA] cpu.name_string excede 128 chars ($($ns.Length))" -ForegroundColor Red
+            $cpuOk = $false
+        }
+        # identifier: formato CPUID "<Arch> Family F Model M Stepping S"
+        $identPattern = "^(Intel64|AMD64|x86) Family \d+ Model \d+ Stepping \d+$"
+        if (-not $id -or $id -notmatch $identPattern) {
+            Write-Host "  [FALHA] cpu.identifier formato invalido: '$id' (esperado: '<Intel64|AMD64|x86> Family N Model N Stepping N')" -ForegroundColor Red
+            $cpuOk = $false
+        }
+        # vendor_identifier: GenuineIntel | AuthenticAMD
+        $knownVendors = @("GenuineIntel", "AuthenticAMD")
+        if (-not $vi -or ($knownVendors -notcontains $vi)) {
+            Write-Host "  [FALHA] cpu.vendor_identifier desconhecido: '$vi' (esperado: GenuineIntel | AuthenticAMD)" -ForegroundColor Red
+            $cpuOk = $false
+        }
+
+        if ($cpuOk) {
+            Write-Host "  [OK]    cpu: name='$ns', id='$id', vendor=$vi" -ForegroundColor Green
+            $passed++
+        } else {
+            $allPassed = $false
+        }
+    }
+
     # Resultado final
     Write-Host ""
     Write-Host "  ──────────────────────────────────────────────────" -ForegroundColor DarkGray
@@ -1163,6 +1275,7 @@ function Show-ProfileData {
     $disk    = if ($p -is [PSCustomObject]) { $p.disk }    else { $p["disk"] }
     $pci     = if ($p -is [PSCustomObject]) { $p.pci_hardwareid } else { $p["pci_hardwareid"] }
     $volume  = if ($p -is [PSCustomObject]) { $p.volume }  else { $p["volume"] }
+    $cpuBlk  = if ($p -is [PSCustomObject]) { $p.cpu }     else { $p["cpu"] }
 
     $version = if ($p -is [PSCustomObject]) { $p.version }       else { $p["version"] }
     $genUtc  = if ($p -is [PSCustomObject]) { $p.generated_utc } else { $p["generated_utc"] }
@@ -1239,6 +1352,23 @@ function Show-ProfileData {
         Write-Host "  Tcpip Hostname       : " -NoNewline -ForegroundColor Gray
         Write-Host $th -ForegroundColor White
         Write-Host "  (aplicado por spoof-windows-id.ps1)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # CPU (registry replay) — schema v9
+    if ($cpuBlk) {
+        Write-Host "  --- CPU (registry replay) ---" -ForegroundColor Cyan
+        $ns = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.name_string }       else { $cpuBlk["name_string"] }
+        $id = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.identifier }        else { $cpuBlk["identifier"] }
+        $vi = if ($cpuBlk -is [PSCustomObject]) { $cpuBlk.vendor_identifier } else { $cpuBlk["vendor_identifier"] }
+        Write-Host "  ProcessorNameString  : " -NoNewline -ForegroundColor Gray
+        Write-Host $ns -ForegroundColor White
+        Write-Host "  Identifier           : " -NoNewline -ForegroundColor Gray
+        Write-Host $id -ForegroundColor White
+        Write-Host "  VendorIdentifier     : " -NoNewline -ForegroundColor Gray
+        Write-Host $vi -ForegroundColor White
+        Write-Host "  (aplicado por spoof-cpu-registry.ps1 — HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N)" -ForegroundColor DarkGray
+        Write-Host "  (CPUID leaf 1 EAX NAO e tocado — apenas strings do registry)" -ForegroundColor DarkGray
         Write-Host ""
     }
 
