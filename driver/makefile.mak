@@ -1,10 +1,9 @@
-# Build script for rstflt.sys + volflt.sys
+# Build script for rstflt.sys
 # Run from a "Developer Command Prompt for VS 2022" or "x64 Native Tools Command Prompt"
 #
 # Usage:
-#   nmake /f makefile.mak            (builds both)
+#   nmake /f makefile.mak            (builds rstflt.sys)
 #   nmake /f makefile.mak rstflt.sys
-#   nmake /f makefile.mak volflt.sys
 #   nmake /f makefile.mak clean
 #
 # Requires:
@@ -35,10 +34,7 @@ LFLAGS_COMMON = /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry \
 # rstflt: legacy WDM upper filter (needs wdmsec.lib)
 RSTFLT_LIBS = wdmsec.lib
 
-# volflt: minifilter (needs fltMgr.lib)
-VOLFLT_LIBS = fltMgr.lib
-
-all: rstflt.sys volflt.sys
+all: rstflt.sys
 
 # ---------------- rstflt ----------------
 rstflt.obj: rstflt.c
@@ -47,12 +43,5 @@ rstflt.obj: rstflt.c
 rstflt.sys: rstflt.obj
 	$(LINK) $(LFLAGS_COMMON) $(RSTFLT_LIBS) rstflt.obj /OUT:rstflt.sys
 
-# ---------------- volflt ----------------
-volflt.obj: volflt.c
-	$(CC) $(CFLAGS_COMMON) /Fo"volflt.obj" /c volflt.c
-
-volflt.sys: volflt.obj
-	$(LINK) $(LFLAGS_COMMON) $(VOLFLT_LIBS) volflt.obj /OUT:volflt.sys
-
 clean:
-	-del /q rstflt.obj rstflt.sys volflt.obj volflt.sys 2>nul
+	-del /q rstflt.obj rstflt.sys 2>nul

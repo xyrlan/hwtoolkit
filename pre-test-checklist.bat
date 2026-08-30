@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 rem ========================================================
 rem   pre-test-checklist.bat
 rem
-rem   Pre-flight para testes com rstflt/volflt.
+rem   Pre-flight para testes com rstflt.
 rem   Modos:
 rem     (default)  : relatorio somente, nao altera nada
 rem     --arm      : aplica todas as mudancas + pede reboot
@@ -12,7 +12,7 @@ rem     --disarm   : desliga Driver Verifier
 rem
 rem   O que cobre (por que existe: no ultimo BSOD nao vimos
 rem   STOP code na tela e nao houve dump em disco):
-rem     1. Driver Verifier em rstflt.sys + volflt.sys
+rem     1. Driver Verifier em rstflt.sys
 rem     2. AutoReboot=0 (para ver o STOP code na tela)
 rem     3. CrashDumpEnabled=7 (Automatic — kernel dump)
 rem     4. DedicatedDumpFile ou pagefile >= RAM
@@ -131,25 +131,14 @@ echo      pagefile precisa ser >= RAM+1GB no volume de dump.
 echo.
 
 rem ----------------------------------------------------------
-rem  5. Estado do driver (rstflt + volflt) e artefatos criticos
+rem  5. Estado do driver (rstflt) e artefatos criticos
 rem ----------------------------------------------------------
-echo [5/6] Estado dos drivers e artefatos
+echo [5/6] Estado do driver e artefatos
 echo -------------------------------------
 
 for /f "tokens=4" %%v in ('sc qc RstFlt 2^>nul ^| findstr START_TYPE') do set "RST_ST=%%v"
 if not defined RST_ST set "RST_ST=(nao instalado)"
 echo    RstFlt START_TYPE  : !RST_ST!    ^(2 = SYSTEM_START recomendado^)
-
-for /f "tokens=4" %%v in ('sc qc VolFlt 2^>nul ^| findstr START_TYPE') do set "VOL_ST=%%v"
-if not defined VOL_ST set "VOL_ST=(nao instalado)"
-echo    VolFlt START_TYPE  : !VOL_ST!
-
-fltmc filters 2>nul | findstr /i "VolFlt" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo    VolFlt carregado   : SIM
-) else (
-    echo    VolFlt carregado   : NAO ^(fltmc load VolFlt para ativar sem reboot^)
-)
 
 echo.
 echo    RstFlt\Parameters:
@@ -189,22 +178,22 @@ rem ----------------------------------------------------------
 echo [6/6] Driver Verifier
 echo -------------------------------------
 
-verifier /query 2>nul | findstr /i "rstflt volflt" >nul 2>&1
+verifier /query 2>nul | findstr /i "rstflt" >nul 2>&1
 if !errorlevel! equ 0 (
-    echo    Verifier          : ATIVO em pelo menos um dos filtros
+    echo    Verifier          : ATIVO em rstflt
     verifier /query 2>nul | findstr /i "Verified Drivers"
-    verifier /query 2>nul | findstr /i "^\s*rstflt\|^\s*volflt"
+    verifier /query 2>nul | findstr /i "^\s*rstflt"
 ) else (
-    echo    Verifier          : NAO ativo em rstflt/volflt
+    echo    Verifier          : NAO ativo em rstflt
 )
 
 if /i "!MODE!"=="arm" (
-    echo    ^> Ativando Verifier /standard para rstflt.sys volflt.sys...
-    verifier /standard /driver rstflt.sys volflt.sys
+    echo    ^> Ativando Verifier /standard para rstflt.sys...
+    verifier /standard /driver rstflt.sys
     if !errorlevel! neq 0 (
         echo    ^> verifier retornou erro — se rstflt.sys ainda nao foi
         echo      copiado para System32\drivers, isso e esperado. Rode
-        echo      03-instalar-driver.bat + 03b-instalar-volflt.bat antes.
+        echo      03-instalar-driver.bat antes.
     )
 )
 if /i "!MODE!"=="disarm" (

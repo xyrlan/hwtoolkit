@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo   PASSO 2 - Compilando rstflt.sys (v3.4) + volflt.sys (v1.0)
+echo   PASSO 2 - Compilando rstflt.sys (driver v3.5 / toolkit v3.5.1)
 echo ========================================================
 echo.
 
@@ -43,15 +43,11 @@ nmake /f makefile.mak
 
 echo.
 set "OK_R=0"
-set "OK_V=0"
 if exist rstflt.sys set "OK_R=1"
-if exist volflt.sys set "OK_V=1"
 
 echo ========================================================
 if "!OK_R!"=="1" ( echo   [OK]  rstflt.sys ) else ( echo   [FAIL] rstflt.sys )
-if "!OK_V!"=="1" ( echo   [OK]  volflt.sys ) else ( echo   [FAIL] volflt.sys )
 echo ========================================================
 if "!OK_R!"=="0" echo   Erros de compilacao acima.
-if "!OK_V!"=="0" echo   Erros de compilacao acima.
 echo.
 pause

@@ -19,9 +19,9 @@ if "!ADM!"=="0" echo [!] SEM admin - rode como administrador para limpeza comple
 echo.
 
 rem ============================================================
-rem  1/12  PROCESSOS
+rem  1/11  PROCESSOS
 rem ============================================================
-echo [*] 1/12  Encerrando processos...
+echo [*] 1/11  Encerrando processos...
 taskkill /f /im "rubinot*" >nul 2>&1
 taskkill /f /im "RubinOT*" >nul 2>&1
 taskkill /f /im "rubinot_dx.exe" >nul 2>&1
@@ -29,9 +29,9 @@ echo     [OK] Processos encerrados
 echo.
 
 rem ============================================================
-rem  2/12  ARQUIVOS E PASTAS
+rem  2/11  ARQUIVOS E PASTAS
 rem ============================================================
-echo [*] 2/12  Removendo arquivos e pastas...
+echo [*] 2/11  Removendo arquivos e pastas...
 
 rem AppData Local - launcher Electron
 if not exist "%LOCALAPPDATA%\rubinot-launcher" goto local_ok
@@ -82,9 +82,9 @@ echo     [OK] Arquivos limpos
 echo.
 
 rem ============================================================
-rem  3/12  REGISTRO - HKCU chaves com nome rubinot
+rem  3/11  REGISTRO - HKCU chaves com nome rubinot
 rem ============================================================
-echo [*] 3/12  Limpando registro HKCU chaves...
+echo [*] 3/11  Limpando registro HKCU chaves...
 
 for /f "tokens=*" %%k in ('reg query "HKCU\Software" /s /f "rubinot" /k 2^>nul ^| findstr /i "HKEY_"') do reg delete "%%k" /f >nul 2>&1 & echo     [X] %%k
 
@@ -92,9 +92,9 @@ echo     [OK] Chaves HKCU limpas
 echo.
 
 rem ============================================================
-rem  4/12  REGISTRO - HKLM precisa admin
+rem  4/11  REGISTRO - HKLM precisa admin
 rem ============================================================
-echo [*] 4/12  Limpando registro HKLM...
+echo [*] 4/11  Limpando registro HKLM...
 
 if "!ADM!"=="0" echo     [!] Pulando - precisa admin & goto skip_hklm
 
@@ -114,9 +114,9 @@ echo     [OK] HKLM limpo
 echo.
 
 rem ============================================================
-rem  5/12  UserAssist ROT13 encoded
+rem  5/11  UserAssist ROT13 encoded
 rem ============================================================
-echo [*] 5/12  Limpando UserAssist ROT13...
+echo [*] 5/11  Limpando UserAssist ROT13...
 echo     rubinot em ROT13 = ehovabg / EhovaBG
 
 powershell -Command "Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $p = $_.PSPath; $_.GetValueNames() | Where-Object { $_ -match 'ehovabg|EhovaBG|EHOVABG' } | ForEach-Object { Remove-ItemProperty -Path $p -Name $_ -Force -ErrorAction SilentlyContinue; Write-Host '    [X] UserAssist entry removed' } }"
@@ -125,9 +125,9 @@ echo     [OK] UserAssist limpo
 echo.
 
 rem ============================================================
-rem  6/12  AppCompatFlags + traces HKCU diversos
+rem  6/11  AppCompatFlags + traces HKCU diversos
 rem ============================================================
-echo [*] 6/12  Limpando AppCompatFlags e traces diversos...
+echo [*] 6/11  Limpando AppCompatFlags e traces diversos...
 
 rem AppCompatFlags Compatibility Assistant Store
 powershell -Command "$p = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store'; if (Test-Path $p) { try { (Get-Item $p).GetValueNames() | Where-Object { $_ -match 'rubinot' } | ForEach-Object { Remove-ItemProperty -Path $p -Name $_ -Force -ErrorAction SilentlyContinue; Write-Host '    [X] AppCompat entry removed' } } catch {} }"
@@ -151,9 +151,9 @@ echo     [OK] Traces diversos limpos
 echo.
 
 rem ============================================================
-rem  7/12  Jump Lists
+rem  7/11  Jump Lists
 rem ============================================================
-echo [*] 7/12  Limpando Jump Lists...
+echo [*] 7/11  Limpando Jump Lists...
 
 for /f "delims=" %%f in ('findstr /m /i "rubinot" "%APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\*" 2^>nul') do del /f /q "%%f" 2>nul & echo     [X] AutoDest: %%~nxf
 for /f "delims=" %%f in ('findstr /m /i "rubinot" "%APPDATA%\Microsoft\Windows\Recent\CustomDestinations\*" 2^>nul') do del /f /q "%%f" 2>nul & echo     [X] CustomDest: %%~nxf
@@ -162,9 +162,9 @@ echo     [OK] Jump Lists limpos
 echo.
 
 rem ============================================================
-rem  8/12  Prefetch admin
+rem  8/11  Prefetch admin
 rem ============================================================
-echo [*] 8/12  Limpando Prefetch...
+echo [*] 8/11  Limpando Prefetch...
 
 if "!ADM!"=="0" echo     [!] Pulando - precisa admin & goto skip_prefetch
 
@@ -176,9 +176,9 @@ echo     [OK] Prefetch limpo
 echo.
 
 rem ============================================================
-rem  9/12  BAM + SRUM + ShimCache admin, deep clean
+rem  9/11  BAM + SRUM + ShimCache admin, deep clean
 rem ============================================================
-echo [*] 9/12  Limpeza profunda BAM, SRUM, ShimCache...
+echo [*] 9/11  Limpeza profunda BAM, SRUM, ShimCache...
 
 if "!ADM!"=="0" echo     [!] Pulando - precisa admin & goto skip_deep
 
@@ -208,17 +208,17 @@ echo     [OK] Limpeza profunda concluida
 echo.
 
 rem ============================================================
-rem  10/12  DNS Cache
+rem  10/11  DNS Cache
 rem ============================================================
-echo [*] 10/12  Limpando DNS cache...
+echo [*] 10/11  Limpando DNS cache...
 ipconfig /flushdns >nul 2>&1
 echo     [OK] DNS cache limpo
 echo.
 
 rem ============================================================
-rem  11/12  GameConfigStore (historico de jogos)
+rem  11/11  GameConfigStore (historico de jogos)
 rem ============================================================
-echo [*] 11/12  Limpando GameConfigStore...
+echo [*] 11/11  Limpando GameConfigStore...
 
 reg delete "HKCU\System\GameConfigStore" /f >nul 2>&1
 if %errorlevel% equ 0 (
@@ -232,36 +232,10 @@ rem  e apagar poderia destruir dados de apps de terceiros sem beneficio real)
 echo.
 
 rem ============================================================
-rem  12/12  Event Logs (admin)
+rem  NOTA: wevtutil cl removido em v3.5.1 - wipe do Security log
+rem  gera Event 1102 (louder than what it hides). Deixar os logs
+rem  intactos e menos suspeito que apaga-los.
 rem ============================================================
-echo [*] 12/12  Limpando Event Logs...
-
-if "!ADM!"=="0" echo     [!] Pulando - precisa admin & goto skip_evtlogs
-
-set "EVTCLEARED=0"
-
-wevtutil cl Application >nul 2>&1
-if %errorlevel% equ 0 echo     [X] Application & set /a EVTCLEARED+=1
-
-wevtutil cl System >nul 2>&1
-if %errorlevel% equ 0 echo     [X] System & set /a EVTCLEARED+=1
-
-wevtutil cl Security >nul 2>&1
-if %errorlevel% equ 0 echo     [X] Security & set /a EVTCLEARED+=1
-
-wevtutil cl "Microsoft-Windows-AppLocker/EXE and DLL" >nul 2>&1
-if %errorlevel% equ 0 echo     [X] AppLocker EXE/DLL & set /a EVTCLEARED+=1
-
-wevtutil cl "Microsoft-Windows-AppLocker/MSI and Script" >nul 2>&1
-if %errorlevel% equ 0 echo     [X] AppLocker MSI/Script & set /a EVTCLEARED+=1
-
-wevtutil cl "Microsoft-Windows-Windows Defender/Operational" >nul 2>&1
-if %errorlevel% equ 0 echo     [X] Defender Operational & set /a EVTCLEARED+=1
-
-echo     [OK] !EVTCLEARED!/6 event logs limpos
-
-:skip_evtlogs
-echo.
 
 rem ============================================================
 rem  RESUMO
@@ -278,8 +252,10 @@ echo     - AppCompatFlags, FeatureUsage, QuietHours
 echo     - Jump Lists, Prefetch, BAM, DNS
 echo     - SRUM, ShimCache
 echo     - GameConfigStore + HKCU device tracking
-echo     - Event Logs (Application, System, Security,
-echo       AppLocker, Defender)
+echo.
+echo   NAO limpo (deliberadamente):
+echo     - Event Logs: wevtutil cl gera Event 1102 (louder
+echo       than what it hides). Removido em v3.5.1.
 echo.
 if "!ADM!"=="0" echo   [!] Para limpeza completa, rode como ADMIN & echo.
 echo   [!] NAO limpaveis online:

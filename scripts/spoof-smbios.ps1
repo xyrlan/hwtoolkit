@@ -22,15 +22,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. "$PSScriptRoot\_ui-common.ps1"
+. "$PSScriptRoot\_smbios-common.ps1"
+
 $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 $keyPath     = "SYSTEM\CurrentControlSet\Services\mssmbios\Data"
 $taskName    = "SpoofSMBIOS"
-
-# ---- Funcoes de output ----
-function Write-OK($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
-function Write-Info($msg)  { Write-Host "  [*] $msg" -ForegroundColor Cyan }
-function Write-Warn($msg)  { Write-Host "  [!] $msg" -ForegroundColor Yellow }
-function Write-Err($msg)   { Write-Host "  [X] $msg" -ForegroundColor Red }
 
 # ============================================================
 #  Uninstall mode
@@ -49,7 +46,7 @@ if ($Uninstall) {
             Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob"          -ErrorAction SilentlyContinue
             Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay"  -ErrorAction SilentlyContinue
             Write-OK "SmbiosBlob + opt-in flag removidos (sem mais replay em kernel)"
-        } catch {}
+        } catch { Write-Warn "Falha ao restaurar: $_" }
 
         # v3.4: restaurar SMBiosData original se o driver salvou backup
         try {
@@ -59,7 +56,7 @@ if ($Uninstall) {
                 Write-OK "SMBiosData restaurado do backup ($($orig.OrigSmbiosData.Length) bytes)"
                 Remove-ItemProperty -Path $driverParams -Name "OrigSmbiosData" -ErrorAction SilentlyContinue
             }
-        } catch {}
+        } catch { Write-Warn "Falha ao restaurar: $_" }
     }
     Write-Host "  Reinicie o PC para restaurar os valores originais.`n"
     exit 0
@@ -82,14 +79,14 @@ Write-Info "Carregando profile de $profilePath..."
 
 if (-not (Test-Path $profilePath)) {
     Write-Err "Profile nao encontrado!"
-    Write-Err "Rode primeiro:  .\hwprofile.ps1 -Generate"
+    Write-Err "Rode primeiro:  .\generate-profile.ps1 -Generate"
     exit 1
 }
 
-$profile = Get-Content $profilePath -Raw | ConvertFrom-Json
-$smb = $profile.smbios
+$prof = Get-Content $profilePath -Raw | ConvertFrom-Json
+$smb = $prof.smbios
 
-Write-OK "Profile carregado (v$($profile.version))"
+Write-OK "Profile carregado (v$($prof.version))"
 Write-Info "Target: $($smb.board_manufacturer) / $($smb.board_product)"
 
 # ============================================================
@@ -212,48 +209,15 @@ function ConvertTo-SmbiosUuidBytes {
 }
 
 # ============================================================
-#  Step 2: Take ownership da chave do registro
+#  Step 2+3: ownership + write permission em mssmbios\Data
 # ============================================================
-Write-Info "Tomando ownership da chave mssmbios\Data..."
+Write-Info "Ajustando ACL de mssmbios\Data (owner + FullControl para Administrators)..."
 
 try {
-    $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-        $keyPath,
-        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-        [System.Security.AccessControl.RegistryRights]::TakeOwnership
-    )
-    $acl = $regKey.GetAccessControl()
-    $admin = [System.Security.Principal.NTAccount]"BUILTIN\Administrators"
-    $acl.SetOwner($admin)
-    $regKey.SetAccessControl($acl)
-    $regKey.Close()
-    Write-OK "Ownership obtido"
+    Grant-SmbiosDataWrite
+    Write-OK "ACL ajustada"
 } catch {
-    Write-Err "Falha ao tomar ownership: $_"
-    exit 1
-}
-
-# ============================================================
-#  Step 3: Permissao de escrita
-# ============================================================
-Write-Info "Concedendo permissao de escrita..."
-
-try {
-    $regKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-        $keyPath,
-        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-        [System.Security.AccessControl.RegistryRights]::ChangePermissions
-    )
-    $acl = $regKey.GetAccessControl()
-    $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-        $admin, "FullControl", "Allow"
-    )
-    $acl.SetAccessRule($rule)
-    $regKey.SetAccessControl($acl)
-    $regKey.Close()
-    Write-OK "Permissao concedida"
-} catch {
-    Write-Err "Falha ao conceder permissao: $_"
+    Write-Err "Falha ao ajustar ACL: $_"
     exit 1
 }
 
@@ -621,8 +585,8 @@ foreach ($t in $modifiedTypes) {
 }
 Write-Host ""
 Write-Host "  Para instalar a tarefa de boot:" -ForegroundColor White
-Write-Host "    .\spoof-uuid.ps1 -InstallTask" -ForegroundColor Yellow
+Write-Host "    .\spoof-smbios.ps1 -InstallTask" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "  Para remover tudo:" -ForegroundColor White
-Write-Host "    .\spoof-uuid.ps1 -Uninstall" -ForegroundColor Yellow
+Write-Host "    .\spoof-smbios.ps1 -Uninstall" -ForegroundColor Yellow
 Write-Host ""

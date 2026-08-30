@@ -35,14 +35,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Write-OK($m)   { Write-Host ("  [OK]   " + $m) -ForegroundColor Green }
-function Write-Info($m) { Write-Host ("  [*]    " + $m) -ForegroundColor Cyan  }
-function Write-Warn($m) { Write-Host ("  [!]    " + $m) -ForegroundColor Yellow}
-function Write-Err($m)  { Write-Host ("  [X]    " + $m) -ForegroundColor Red   }
+. "$PSScriptRoot\_ui-common.ps1"
+. "$PSScriptRoot\_smbios-common.ps1"
 
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor White
-Write-Host "  restore-firmware-smbios.ps1" -ForegroundColor White
+Write-Host "  restore-smbios.ps1" -ForegroundColor White
 Write-Host "========================================================" -ForegroundColor White
 Write-Host ""
 
@@ -97,31 +95,9 @@ Write-Host "[3/3] Restaurando mssmbios\Data\SMBiosData do firmware..." -Foregrou
 $keyPath = "SYSTEM\CurrentControlSet\Services\mssmbios\Data"
 
 # --- 3.0: Take ownership + Full Control para Administrators
-Write-Info "Tomando ownership de mssmbios\Data..."
+Write-Info "Ajustando ACL de mssmbios\Data (owner + FullControl para Administrators)..."
 try {
-    $reg = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-        $keyPath,
-        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-        [System.Security.AccessControl.RegistryRights]::TakeOwnership
-    )
-    $acl = $reg.GetAccessControl()
-    $admin = [System.Security.Principal.NTAccount]"BUILTIN\Administrators"
-    $acl.SetOwner($admin)
-    $reg.SetAccessControl($acl)
-    $reg.Close()
-
-    $reg = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
-        $keyPath,
-        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
-        [System.Security.AccessControl.RegistryRights]::ChangePermissions
-    )
-    $acl = $reg.GetAccessControl()
-    $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
-        $admin, "FullControl", "Allow"
-    )
-    $acl.SetAccessRule($rule)
-    $reg.SetAccessControl($acl)
-    $reg.Close()
+    Grant-SmbiosDataWrite
     Write-OK "Ownership + FullControl concedidos"
 } catch {
     Write-Err "Falha ao tomar ownership: $_"
@@ -136,7 +112,7 @@ if ($DeleteOnly) {
         Write-OK "SMBiosData removido"
         Write-Host ""
         Write-Host "  ==> REBOOT AGORA. mssmbios recria SMBiosData do firmware." -ForegroundColor Yellow
-        Write-Host "      Depois rode consistency-check.ps1 para confirmar." -ForegroundColor Yellow
+        Write-Host "      Depois rode check-consistency.ps1 para confirmar." -ForegroundColor Yellow
     } catch {
         Write-Err "Falha ao deletar: $_"
         exit 1
@@ -210,7 +186,7 @@ try {
 
     Write-Host ""
     Write-Host "  ==> Sem reboot necessario (mas reboot nao machuca)." -ForegroundColor Green
-    Write-Host "      Rode agora: scripts\consistency-check.ps1" -ForegroundColor Green
+    Write-Host "      Rode agora: scripts\check-consistency.ps1" -ForegroundColor Green
     Write-Host "      System/Board/Chassis devem TODOS mostrar MSI real." -ForegroundColor Green
 
 } finally {

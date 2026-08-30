@@ -1,6 +1,6 @@
 ========================================================
-  HW TOOLKIT v3.4 + VolFlt v1.0
-  Sistema centralizado de profile + storage + volume filters
+  HW TOOLKIT v3.5.1 + Fase 1 (EMAC hardening)
+  Sistema centralizado de profile + storage filter
 ========================================================
 
 OBJETIVO:
@@ -16,27 +16,31 @@ HWToolkit/
   LEIA-ME.txt               <- Este arquivo
   00-gerar-profile.bat      <- Gera profile de hardware (1x)
   01-instalar-ferramentas.bat <- VS Build Tools + WDK (1x)
-  02-compilar-driver.bat     <- Compila rstflt.sys + volflt.sys
+  02-compilar-driver.bat     <- Compila rstflt.sys
   03-instalar-driver.bat     <- Instala + registra rstflt (storage)
-  03b-instalar-volflt.bat    <- Instala + carrega volflt (VSN)
   pre-test-checklist.bat     <- Verifier + dump + estado driver (check/arm/disarm)
-  04-aplicar-hwid.bat        <- GUIDs, MACs, Product ID, EDID
+  04-aplicar-hwid.bat        <- GUIDs, MACs, Product ID, EDID, audio, emac-uuid
   05-aplicar-smbios.bat      <- UUID + strings SMBIOS (Types 1/2/3/4/11)
   06-verificar.bat           <- Verifica tudo
-  07-limpar-traces.bat       <- Limpeza de 12 categorias
-  08-desinstalar-driver.bat  <- Remove ambos os drivers
+  07-limpar-traces.bat       <- Limpeza de 11 categorias
+  08-desinstalar-driver.bat  <- Remove o driver rstflt
+  08b-restaurar-smbios.bat   <- Restaura SMBIOS do firmware (limpa spoof)
   09-recuperar-boot.bat      <- Emergencia (WinRE)
   scripts/
-    hwprofile.ps1            <- Gerador de profile (v4 schema)
-    change-hwid-easy.ps1     <- HWID + MAC + EDID changer
-    spoof-uuid.ps1           <- SMBIOS blob modifier
-    consistency-check.ps1    <- Auditoria read-only: BIOS mirror + cross-check
-    restore-firmware-smbios.ps1 <- Restaura SMBIOS do firmware (limpa spoof)
+    _ui-common.ps1           <- Helpers de output compartilhados (dot-source)
+    _smbios-common.ps1       <- Helpers de ACL para mssmbios\Data (dot-source)
+    generate-profile.ps1     <- Gerador de profile (v5 schema) [antes: hwprofile.ps1]
+    spoof-mac.ps1            <- MAC changer via profile [antes: change-hwid-easy.ps1]
+    spoof-smbios.ps1         <- SMBIOS blob modifier (Types 1/2/3/4/11) [antes: spoof-uuid.ps1]
+    spoof-audio-guids.ps1    <- Rotate MMDevices audio endpoint GUIDs (GAP #3a)
+    spoof-edid-full.ps1      <- Full EDID spoof: PNP ID + product + serial + week/year + descriptor blocks
+    manage-emac-uuid.ps1     <- Persist fake emac-uuid file com ACL lock (GAP #6)
+    check-consistency.ps1    <- Auditoria read-only: BIOS mirror + cross-check [antes: consistency-check.ps1]
+    restore-smbios.ps1       <- Restaura SMBIOS do firmware (limpa spoof) [antes: restore-firmware-smbios.ps1]
   driver/
-    rstflt.c                 <- Storage filter v3.4 (source)
+    rstflt.c                 <- Storage filter v3.5 (source)
     rstflt.inf               <- INF do storage filter
-    volflt.c                 <- Volume-serial minifilter v1.0
-    makefile.mak             <- Makefile para ambos
+    makefile.mak             <- Makefile para rstflt.sys
 
 Profile:
   C:\ProgramData\.hwcfg\profile.json
@@ -46,11 +50,15 @@ Profile:
 ========================================================
 
   PRIMEIRA VEZ (setup completo):
-    00 -> 01 -> reboot -> 02 -> 03 -> reboot
-    -> 03b -> 04 -> 05 -> 06 -> 07
+    00 -> 01 -> reboot -> 02 -> pre-test-checklist --arm
+    -> 03 -> reboot -> 04 -> 05 -> 06 -> 07
+
+  Nota: VolFlt (spoof de VSN via minifilter) foi REMOVIDO em
+  v3.5.1. Nao ha 03b. VSN nao esta na cobertura da fingerprint
+  do EMAC (ver PROTOCOLO EMAC abaixo).
 
   DEPOIS (quando quiser novos IDs):
-    00 -> 02 -> 03 -> reboot -> 03b -> 04 -> 05 -> 06 -> 07
+    00 -> 02 -> 03 -> reboot -> 04 -> 05 -> 06 -> 07
 
   EMERGENCIA (Windows nao inicia):
     WinRE > Prompt de Comando > 09
@@ -78,7 +86,15 @@ Profile:
 
   04 - APLICAR HWID
        Altera Machine GUID, SQM, Product ID, MACs
-       (com OUI real), e EDID do monitor (bytes 12-15).
+       (com OUI real), e EDID do monitor (bytes 12-15)
+       via spoof-mac.ps1. Alem disso, invoca:
+         - spoof-audio-guids.ps1  (rotaciona GUIDs dos endpoints
+                                   MMDevices Render/Capture)
+         - spoof-edid-full.ps1    (EDID completo: PNP ID, produto,
+                                   week/year, serial e descriptor
+                                   blocks 0xFC/0xFF)
+         - manage-emac-uuid.ps1   (persiste emac-uuid falso com
+                                   ACL lock; nao apaga o arquivo)
        Tudo lido do profile.
 
   05 - APLICAR SMBIOS
@@ -91,12 +107,21 @@ Profile:
        do profile (fabricantes, socket, UUID, MACs).
 
   07 - LIMPAR TRACES
-       12 etapas: processos, arquivos, registro HKCU/HKLM,
+       11 etapas: processos, arquivos, registro HKCU/HKLM,
        UserAssist ROT13, AppCompat, Jump Lists, Prefetch,
-       BAM/SRUM/ShimCache, DNS, GameConfigStore, Event Logs.
+       BAM/SRUM/ShimCache, DNS, GameConfigStore.
+       (Event Logs removido em v3.5.1: wevtutil cl gera
+       Event 1102 - louder than what it hides.)
 
   08 - DESINSTALAR DRIVER
        Remove servico, restaura UpperFilters, deleta .sys.
+
+  08b - RESTAURAR SMBIOS DO FIRMWARE
+       Limpa o blob SMBIOS spoofado do registro e o cache
+       do driver, e desinstala a task agendada de replay.
+       Apos reboot, o Windows le SMBIOS direto do firmware
+       da placa (valores REAIS). Uso: reverter o spoof
+       completo (pos-BSOD, troca de perfil, uninstall limpo).
 
   09 - RECUPERAR BOOT
        Para WinRE. Carrega registry offline, remove driver
@@ -106,35 +131,37 @@ Profile:
   COBERTURA DE FINGERPRINT
 ========================================================
 
-  Surface               Componente       Metodo
-  -------------------   --------------   ----------------------
-  Disk serial (ATA)     Driver RstFlt    IOCTL intercept (STORAGE_QUERY,
-                                          SMART IDENTIFY, ATA_PASS_THROUGH,
-                                          ATA_PASS_THROUGH_DIRECT)
-  Disk serial (NVMe)    Driver RstFlt    STORAGE_QUERY + STORAGE_PROTOCOL_
-                                          COMMAND (Identify Controller)
-  Volume Serial Number  Driver VolFlt    Minifilter post-callback em
-   (VSN das particoes)                    IRP_MJ_QUERY_VOLUME_INFORMATION
-                                          (FileFsVolumeInformation)
-  SMBIOS UUID           spoof-uuid.ps1   Rebuild + cache no driver
-  SMBIOS strings        spoof-uuid.ps1   Types 1/2/3 completos + Type 3 SKU
-                                          + Type 4 (proc strings) + Type 11
-                                          (OEM Strings). CPUID nao tocado.
-  SMBIOS boot replay    Driver RstFlt    DriverEntry copia blob cacheado
-                                          para mssmbios\Data\SMBiosData
-                                          antes de winmgmt/anti-cheat
-  Machine GUID          change-hwid      Registry
-  SQM Machine ID        change-hwid      Registry
-  Product ID            change-hwid      Registry (formato OEM)
-  MAC address           change-hwid      Registry (OUI real)
-  EDID monitor serial   change-hwid      Registry (bytes 12-15)
-  GameConfigStore       limpar-traces    Registry delete
-  Event Logs            limpar-traces    wevtutil cl (6 logs)
-  BAM/DAM               limpar-traces    Registry values
-  SRUM                  limpar-traces    DB delete
-  ShimCache             limpar-traces    Registry delete
-  Prefetch              limpar-traces    File delete
-  UserAssist            limpar-traces    ROT13 decode + delete
+  Surface                   Componente               Metodo
+  -----------------------   ----------------------   ----------------------
+  Disk serial (ATA)         Driver RstFlt            IOCTL intercept (STORAGE_QUERY,
+                                                     SMART IDENTIFY, ATA_PASS_THROUGH,
+                                                     ATA_PASS_THROUGH_DIRECT)
+  Disk serial (NVMe)        Driver RstFlt            STORAGE_QUERY + STORAGE_PROTOCOL_
+                                                     COMMAND (Identify Controller)
+  SMBIOS UUID               spoof-smbios.ps1         Rebuild + cache no driver
+  SMBIOS strings            spoof-smbios.ps1         Types 1/2/3 completos + Type 3 SKU
+                                                     + Type 4 (proc strings) + Type 11
+                                                     (OEM Strings). CPUID nao tocado.
+  SMBIOS boot replay        Driver RstFlt            DriverEntry copia blob cacheado
+                                                     para mssmbios\Data\SMBiosData
+                                                     antes de winmgmt/anti-cheat
+  Machine GUID              (removido em v3.5.1)     EMAC nao le; diff vs baseline
+  SQM Machine ID            (removido em v3.5.1)     EMAC nao le; diff vs baseline
+  Product ID                (removido em v3.5.1)     EMAC nao le; diff vs baseline
+  MAC address               change-hwid              Registry (OUI real)
+  EDID monitor serial       spoof-edid-full.ps1      Cobertura completa (ver linhas abaixo)
+  Audio endpoint GUIDs      spoof-audio-guids.ps1    HKLM\...\MMDevices\Audio (Render/Capture)
+  EDID descriptor blocks    spoof-edid-full.ps1      Blocks type 0xFC (name) + 0xFF (serial ASCII)
+  EDID mfr PNP ID           spoof-edid-full.ps1      EDID bytes 8-9 (EISA 3-letter code)
+  EDID product/week/year    spoof-edid-full.ps1      EDID bytes 10-11, 16-17
+  emac-uuid persistence     manage-emac-uuid.ps1     C:\Users\<user>\emac-uuid + ACL lock
+  GameConfigStore           limpar-traces            Registry delete
+  Event Logs                (removido em v3.5.1)     wevtutil cl gera Event 1102 - contraproducente
+  BAM/DAM                   limpar-traces            Registry values
+  SRUM                      limpar-traces            DB delete
+  ShimCache                 limpar-traces            Registry delete
+  Prefetch                  limpar-traces            File delete
+  UserAssist                limpar-traces            ROT13 decode + delete
 
 ========================================================
   LIMITACOES CONHECIDAS
@@ -142,6 +169,27 @@ Profile:
 
   - Test signing mode: anti-cheats kernel-level detectam
     a CI policy. Sem DSE bypass, o watermark fica visivel.
+    Anti-cheats de nivel EMAC (kernel driver com telemetria
+    server-side) pegam o test signing bit. Sem EV cert real
+    a ferramenta so passa contra anti-cheats medios.
+
+  - PnPInstanceId dos adapters de rede nao spoofado (GAP #1).
+    Anti-cheats que hasheiam esse ID por interface (ex.: EMAC
+    coleta os 4 adapters e envia junto do fingerprint) ainda
+    identificam a maquina real. Fase 2 (bus filter driver NDIS)
+    atende esse caso.
+
+  - ProcessorNameString em HKLM\HARDWARE\DESCRIPTION\System\
+    CentralProcessor\0 nao spoofado (GAP #2). O SMBIOS Type 4
+    fica coerente com o board escolhido, mas essa chave vem
+    diretamente de CPUID e o registry mirror expoe o modelo
+    real. Anti-cheat que compara SMBIOS vs CPUID detecta
+    inconsistencia. Fase 2.
+
+  - GPU Device ID (VEN&DEV) nao esta coberto (filtro PCI
+    arriscado, pode causar tela preta com driver NVIDIA).
+    Strings da GPU (AdapterString, ChipType) ficam opcionais
+    em Fase 2 e exigem teste caso a caso por modelo.
 
   - NVMe Identify Namespace (CNS=0x00) e Namespace Identification
     Descriptor List (CNS=0x03) nao sao spoofados. Contem NGUID/EUI64
@@ -149,19 +197,58 @@ Profile:
     anti-cheat de jogo. Apenas Identify Controller (CNS=0x01, o
     campo Serial Number) e reescrito.
 
-  - GPU Device ID nao esta coberto (filtro PCI arriscado,
-    pode causar tela preta com driver NVIDIA).
-
-  - EDID spoof so altera bytes 12-15 (serial de fabricacao).
-    Bytes do descriptor block (offset 0x48+) nao sao tocados.
-    Suficiente para a maioria dos anti-cheats.
-
   - Amcache.hve esta locked pelo kernel. Limpar requer
     boot no WinRE.
 
   - Hostname/ComputerName nao e alterado automaticamente.
     Se necessario, mude via:
     Rename-Computer -NewName "DESKTOP-XXXXXXX" -Restart
+
+  - GAP #5 e GAP #7 (video device GUIDs adicionais e DHCP
+    fingerprint em contextos especificos) ficam para Fase 2
+    ou aceitos como risco residual dependendo do anti-cheat.
+
+========================================================
+  PROTOCOLO EMAC / ANTI-CHEATS DE NIVEL AVANCADO
+========================================================
+
+  Resumo do reconhecimento feito sobre o protocolo EMAC (anti-cheat
+  de kernel com telemetria server-side). Vale para qualquer produto
+  similar (BattlEye, EAC, Vanguard usam padroes parecidos).
+
+  - Persistent HWID cache
+      Arquivo: C:\Users\<user>\emac-uuid
+      Formato: UUID v4 em ASCII (36 bytes, plaintext, sem BOM).
+      Escrito na primeira execucao e usado como chave de sessao
+      em todos os logins subsequentes.
+
+  - Composicao do fingerprint
+      Hash server-side aproximado:
+        hash( CPU ProcessorNameString +
+              todos os MACs de adapter ativo +
+              todos os EDIDs de monitor conectado +
+              GUIDs de dispositivo de audio e video )
+      Alterar qualquer uma dessas superficies sem alterar as outras
+      cria inconsistencia. O toolkit rotaciona todas de uma vez
+      via profile centralizado.
+
+  - IMPORTANTE: NAO DELETAR o arquivo emac-uuid
+      Deletar o arquivo dispara registration burst pesado do lado
+      do cliente (32k+ RegOpenKey observados + POSTs em rajada
+      para endpoints Vultr/Cloudflare). Isso e um sinal forte
+      para o backend e pode acelerar ban por analise.
+      Comportamento correto: usar manage-emac-uuid.ps1 sem -Fresh
+      para manter o arquivo persistido, e apenas com -Fresh
+      quando toda a rotacao de HW (MAC/EDID/SMBIOS/audio) tambem
+      for feita no mesmo ciclo.
+
+  - Screenshot request via WebSocket
+      O agente EMAC pode solicitar screenshot on-demand pelo
+      canal de telemetria. Desligar overlays antes de logar:
+        - Discord overlay
+        - MSI Afterburner / RivaTuner
+        - Qualquer overlay de cheat / injector
+      Overlay visivel na screenshot = ban manual quase certo.
 
 ========================================================
   REQUISITOS
@@ -176,5 +263,5 @@ Profile:
 
 
 
-EXECUTAR SCRIPTS NO POWERSHELL 
+EXECUTAR SCRIPTS NO POWERSHELL
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
