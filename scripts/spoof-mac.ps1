@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 # ============================================================
 #  HWID Changer v3.7 (schema v8) - Profile-Based
 #

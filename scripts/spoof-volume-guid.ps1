@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Rotaciona Volume GUIDs de VOLUMES NAO-BOOT no registry - GAP #3d.

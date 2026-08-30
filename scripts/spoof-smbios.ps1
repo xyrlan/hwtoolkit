@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 # ============================================================
 #  SMBIOS Spoofer v2 — UUID + Strings (Types 1, 2, 3)
 #

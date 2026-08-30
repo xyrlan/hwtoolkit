@@ -1,5 +1,5 @@
 /*
- * RstFlt - Minimal SMBIOS + CPU Registry Replay Filter Driver (v4.0)
+ * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.1)
  *
  * SYSTEM_START upper filter of the DiskDrive class. Its jobs are to
  * replay a userspace-cached SMBIOS blob into mssmbios\Data during
@@ -153,6 +153,26 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v4.0.1 - HOTFIX: v4.0 froze physical hardware at boot even with
+ *       EnableCpuReplay=0 (no BSOD, no dump, no bugcheck 1001,
+ *       Verifier /standard armed and clean). Root cause: DriverEntry
+ *       unconditionally allocated the CPU_REPLAY_CTX and queued the
+ *       worker via ExQueueWorkItem; only the worker itself checked
+ *       the EnableCpuReplay gate. The mere act of queueing +
+ *       scheduling the worker during SYSTEM_START driver init
+ *       interacted badly with the boot sequence.
+ *     - Fix: new static helper IsCpuReplayEnabled runs BEFORE any
+ *       allocation or queue. If EnableCpuReplay is absent, zero, or
+ *       unreadable, DriverEntry skips the entire CPU-replay path,
+ *       leaving the driver functionally equivalent to v3.6
+ *       (SMBIOS-only) — a configuration proven stable in production.
+ *     - Fix (compile): three FIELD_OFFSET(..., Data) comparisons
+ *       against ULONG needSize/curNeed now cast to (ULONG) at the
+ *       FIELD_OFFSET site to silence C4018 signed/unsigned mismatch.
+ *       Prior versions required CL=/wd4018 to build under MSVC
+ *       14.44 + WDK 10.0.22621 (both raise C4018 where older
+ *       toolchains did not); with the cast the driver builds
+ *       cleanly under /W4 /WX without any warning suppression.
  *
  * WARNING: Kernel drivers can BSOD your machine if buggy.
  * Test signing mode required to load unsigned drivers.
@@ -219,6 +239,7 @@ static VOID    ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath);
 static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length);
 static VOID    ReplayCpuRegistry(PUNICODE_STRING RegPath);
 static VOID    CpuReplayWorker(PVOID Context);
+static BOOLEAN IsCpuReplayEnabled(PUNICODE_STRING RegPath);
 
 /* ================================================================
  *  ValidateSmbiosBlob - sanity-check a cached SMBIOS blob before
@@ -422,7 +443,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     if (st != STATUS_BUFFER_TOO_SMALL &&
         st != STATUS_BUFFER_OVERFLOW)
         goto out;                        /* no cached blob → nothing to do */
-    if (needSize < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 32)
+    if (needSize < (ULONG)(FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 32))
         goto out;                        /* smaller than any real SMBIOS */
 
     allocSize = needSize;
@@ -480,7 +501,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
                                  NULL, 0, &curNeed);
             if ((st == STATUS_BUFFER_TOO_SMALL ||
                  st == STATUS_BUFFER_OVERFLOW) &&
-                curNeed > FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data))
+                curNeed > (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data))
             {
                 origInfo = (PKEY_VALUE_PARTIAL_INFORMATION)
                     ExAllocatePoolWithTag(NonPagedPool, curNeed, POOL_TAG);
@@ -652,8 +673,8 @@ static VOID ReplayCpuRegistry(PUNICODE_STRING RegPath)
 #endif
         goto out;
     }
-    if (needSize < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) +
-                   3 * sizeof(WCHAR))
+    if (needSize < (ULONG)(FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) +
+                           3 * sizeof(WCHAR)))
         goto out;
 
     allocSize = needSize;
@@ -1102,6 +1123,79 @@ out:
 }
 
 /* ================================================================
+ *  IsCpuReplayEnabled - early opt-in gate check for DriverEntry.
+ *
+ *  v4.0.1 hotfix: previously the worker queue was unconditional in
+ *  DriverEntry and only ReplayCpuRegistry (inside the worker) read
+ *  EnableCpuReplay. That configuration froze boot on physical
+ *  hardware even with the gate = 0, because the worker's very act
+ *  of being scheduled + starting to run at SYSTEM_START interacted
+ *  badly with the boot sequence (no BSOD, no dump, just hang —
+ *  ruling out pool/IRQL/deadlock via Verifier /standard).
+ *
+ *  Fix: read the gate HERE, before we allocate the ctx or queue the
+ *  work item. If the flag is absent or zero, DriverEntry does not
+ *  touch the worker path at all — the driver becomes functionally
+ *  equivalent to v3.6 (SMBIOS-only) on this boot, matching a proven
+ *  stable configuration.
+ *
+ *  Any failure to open Parameters or read the value is treated as
+ *  "gate off" — conservative. Returns TRUE only when we successfully
+ *  read a REG_DWORD value equal to 1.
+ * ================================================================ */
+static BOOLEAN IsCpuReplayEnabled(PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+    HANDLE   hParams = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING paramsPath, tail, valName;
+    WCHAR    paramsBuf[512];
+    ULONG    needSize = 0;
+    UCHAR    flagBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION flagInfo =
+        (PKEY_VALUE_PARTIAL_INFORMATION)flagBuf;
+    ULONG    flagVal = 0;
+    BOOLEAN  enabled = FALSE;
+
+    if (RegPath == NULL || RegPath->Buffer == NULL || RegPath->Length == 0)
+        return FALSE;
+
+    /* Build "<RegPath>\Parameters" */
+    paramsPath.Buffer        = paramsBuf;
+    paramsPath.Length        = 0;
+    paramsPath.MaximumLength = sizeof(paramsBuf);
+
+    st = RtlAppendUnicodeStringToString(&paramsPath, RegPath);
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    RtlInitUnicodeString(&tail, L"\\Parameters");
+    st = RtlAppendUnicodeStringToString(&paramsPath, &tail);
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    InitializeObjectAttributes(&oa, &paramsPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwOpenKey(&hParams, KEY_READ, &oa);
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    RtlInitUnicodeString(&valName, L"EnableCpuReplay");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &needSize);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) {
+            enabled = TRUE;
+        }
+    }
+
+    ZwClose(hParams);
+    return enabled;
+}
+
+/* ================================================================
  *  CpuReplayWorker - system worker thread entry point.
  *
  *  Runs at PASSIVE_LEVEL, off DriverEntry's thread. Consumes the
@@ -1428,15 +1522,27 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     ULONG           ctxSize;
     USHORT          copyLen;
 
-    /* v4.0: queue the CPU-registry replay work item BEFORE the
-       SMBIOS blob apply. The IO manager's RegPath UNICODE_STRING
-       is stack-scoped on our caller — we must copy the buffer into
-       a nonpaged allocation the worker owns.
+    /* v4.0.1 hotfix — EARLY GATE CHECK before allocating ctx or
+       queuing any worker. Prior versions queued the worker
+       unconditionally and let the worker itself read the
+       EnableCpuReplay gate; that produced a reproducible boot
+       freeze on physical hardware even with the gate = 0 (no
+       BSOD, no dump, no bugcheck event — hang during driver
+       init). Isolating the CPU-replay code path behind an
+       explicit gate check here makes the driver functionally
+       equivalent to v3.6 (SMBIOS-only) whenever the gate is
+       absent or zero, which matches a proven stable config.
 
-       Ctx allocation failure is silently non-fatal: the driver
-       still loads, dispatch is set up, SMBIOS replay still runs,
-       only the CPU registry stays genuine for this boot. */
-    if (RegPath != NULL && RegPath->Buffer != NULL && RegPath->Length > 0) {
+       Gate check itself uses only ZwOpenKey/ZwQueryValueKey on
+       Parameters — the same primitives DriverEntry has always
+       used for the SMBIOS opt-in and are known safe here. */
+    if (IsCpuReplayEnabled(RegPath)) {
+        /* Copy RegPath into a nonpaged allocation the worker owns.
+           The IO manager's RegPath UNICODE_STRING is stack-scoped
+           on our caller. Ctx alloc failure is silently non-fatal:
+           the driver still loads, dispatch is set up, SMBIOS
+           replay still runs, only CPU registry stays genuine for
+           this boot. */
         copyLen = RegPath->Length;                          /* bytes    */
         ctxSize = (ULONG)(FIELD_OFFSET(CPU_REPLAY_CTX, RegPathBuffer) +
                           copyLen + sizeof(WCHAR));         /* + NUL    */
@@ -1455,7 +1561,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
                                  ctx);
             ExQueueWorkItem(&ctx->WorkItem, DelayedWorkQueue);
 #if DBG
-            DbgPrint("[RstFlt] CPU replay: worker queued\n");
+            DbgPrint("[RstFlt] CPU replay: gate ON, worker queued\n");
 #endif
         }
 #if DBG
@@ -1464,6 +1570,11 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
         }
 #endif
     }
+#if DBG
+    else {
+        DbgPrint("[RstFlt] CPU replay: gate OFF, worker not queued\n");
+    }
+#endif
 
     /* Replay cached SMBIOS blob (if the userspace tool has ever run
        AND EnableSmbiosReplay=1) into mssmbios\Data\SMBiosData.
@@ -1487,7 +1598,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v4.0, SMBIOS + CPU replay)\n");
+    DbgPrint("[RstFlt] DriverEntry OK (v4.0.1, SMBIOS + gated CPU replay)\n");
 #endif
     return STATUS_SUCCESS;
 }
