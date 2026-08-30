@@ -5,11 +5,14 @@
 .DESCRIPTION
     Gera um conjunto completo e CONSISTENTE de identificadores falsos de hardware,
     salva em um perfil JSON, e escreve o seed do driver no registro.
-    Todos os outros scripts (change-hwid-easy.ps1, spoof-uuid.ps1, e o driver kernel)
+    Todos os outros scripts (spoof-mac.ps1, spoof-smbios.ps1, e o driver kernel)
     devem ler deste perfil ao invés de gerar valores aleatórios independentemente.
 .NOTES
     Localização do perfil: C:\ProgramData\.hwcfg\profile.json
-    Schema v5 — adiciona audio (rotation pool de GUIDs), monitor EDID completo,
+    Schema v6 — remove bloco 'windows' (machine_guid, sqm_machine_id,
+    product_id): EMAC nao le esses campos, e a reescrita criava diff
+    detectavel contra baseline do Windows sem ganho de anti-fingerprint.
+    Schema v5 adicionou audio (rotation pool), monitor EDID completo,
     e emac (UUID persistente falso).
 #>
 
@@ -114,20 +117,20 @@ function Show-Banner {
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
     Write-Host "  ║        HWPROFILE  -  Gerador de Perfil HW       ║" -ForegroundColor DarkCyan
-    Write-Host "  ║            Perfil centralizado v5               ║" -ForegroundColor DarkCyan
+    Write-Host "  ║            Perfil centralizado v6               ║" -ForegroundColor DarkCyan
     Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
     Write-Host ""
 }
 
 function Show-Usage {
     Write-Host "  Uso:" -ForegroundColor Yellow
-    Write-Host "    .\hwprofile.ps1 -Generate    " -NoNewline -ForegroundColor White
+    Write-Host "    .\generate-profile.ps1 -Generate    " -NoNewline -ForegroundColor White
     Write-Host "Gerar novo perfil completo" -ForegroundColor Gray
-    Write-Host "    .\hwprofile.ps1 -Show        " -NoNewline -ForegroundColor White
+    Write-Host "    .\generate-profile.ps1 -Show        " -NoNewline -ForegroundColor White
     Write-Host "Exibir perfil atual" -ForegroundColor Gray
-    Write-Host "    .\hwprofile.ps1 -Validate    " -NoNewline -ForegroundColor White
+    Write-Host "    .\generate-profile.ps1 -Validate    " -NoNewline -ForegroundColor White
     Write-Host "Validar consistência do perfil" -ForegroundColor Gray
-    Write-Host "    .\hwprofile.ps1 -WriteDriver " -NoNewline -ForegroundColor White
+    Write-Host "    .\generate-profile.ps1 -WriteDriver " -NoNewline -ForegroundColor White
     Write-Host "Escrever seed do driver no registro" -ForegroundColor Gray
     Write-Host ""
     Write-Host "  Localização do perfil: " -NoNewline -ForegroundColor Gray
@@ -234,20 +237,6 @@ function New-GuidBracesLower {
     return "{$g}"
 }
 
-function New-GuidBracesUpper {
-    # Gera GUID em maiúsculas com chaves
-    $bytes = Get-CryptoRandomBytes -Count 16
-    $bytes[6] = ($bytes[6] -band 0x0F) -bor 0x40
-    $bytes[8] = ($bytes[8] -band 0x3F) -bor 0x80
-    $hex = ($bytes | ForEach-Object { $_.ToString("X2") }) -join ""
-    return "{{{0}-{1}-{2}-{3}-{4}}}" -f `
-        $hex.Substring(0,8),
-        $hex.Substring(8,4),
-        $hex.Substring(12,4),
-        $hex.Substring(16,4),
-        $hex.Substring(20,12)
-}
-
 function Get-CryptoRandomItem {
     # Seleciona item aleatório de um array usando RNG criptográfico
     param([array]$Items)
@@ -304,16 +293,9 @@ function Generate-MAC {
     return ($oui + $suffix).ToUpper()
 }
 
-function Generate-ProductID {
-    # Gera Product ID no formato 00330-80000-XXXXXXX-AAXXX
-    $mid = Get-CryptoRandomDigits -Count 7
-    $suffix = Get-CryptoRandomDigits -Count 3
-    return "00330-80000-$mid-AA$suffix"
-}
-
 function Convert-Uint32ToLeHex {
     # Converte uint32 -> 8 hex chars (bytes LE em ordem: b0 b1 b2 b3)
-    # Compatibilidade com change-hwid-easy.ps1: aquele script itera bytes 12-15
+    # Compatibilidade com spoof-mac.ps1: aquele script itera bytes 12-15
     # na ordem em que estao no array, entao a string hex deve ser
     # LSB primeiro. Ex: 0x12345678 -> "78563412".
     param([uint32]$Value)
@@ -333,8 +315,8 @@ function Load-Profile {
     }
     try {
         $json = Get-Content -Path $ProfilePath -Raw -Encoding UTF8
-        $profile = $json | ConvertFrom-Json
-        return $profile
+        $prof = $json | ConvertFrom-Json
+        return $prof
     }
     catch {
         Write-Host "  [ERRO] Falha ao ler perfil: $_" -ForegroundColor Red
@@ -422,11 +404,6 @@ function Invoke-Generate {
     # Chassis version vem da mesma versão da placa
     $chassisVersion = $selectedBoard.Version
 
-    # Windows GUIDs
-    $machineGuid = New-GuidLower
-    $sqmMachineId = New-GuidBracesUpper
-    $productId = Generate-ProductID
-
     # MACs de rede
     $networkEntries = @()
     foreach ($adapter in $NetworkAdapters) {
@@ -455,7 +432,7 @@ function Invoke-Generate {
     # Serial number (uint32 LE, bytes 12-15 do EDID)
     $serialNum = Get-CryptoRandomUInt32
     # Legacy edid_serial: string hex derivada dos 4 bytes LE de serialNum.
-    # change-hwid-easy.ps1 le esta string e a aplica em bytes[12..15] na
+    # spoof-mac.ps1 le esta string e a aplica em bytes[12..15] na
     # ordem em que aparecem — por isso emitimos LSB primeiro.
     $edidSerialHex = Convert-Uint32ToLeHex -Value $serialNum
 
@@ -484,8 +461,8 @@ function Invoke-Generate {
     $emacUuid = New-UUIDv4
 
     # Montar o objeto do perfil
-    $profile = [ordered]@{
-        version        = 5
+    $prof = [ordered]@{
+        version        = 6
         generated_utc  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         cpu_detected   = $cpuName
         socket_matched = $socket
@@ -521,11 +498,6 @@ function Invoke-Generate {
             # nao popula. Deixamos duas strings genericas "safe".
             oem_strings          = @("Default string", "Default string")
         }
-        windows = [ordered]@{
-            machine_guid   = $machineGuid
-            sqm_machine_id = $sqmMachineId
-            product_id     = $productId
-        }
         network = $networkEntries
         storage = [ordered]@{
             seed_b64      = $storageSeedB64
@@ -540,7 +512,7 @@ function Invoke-Generate {
             mfg_year     = $mfgYear
             serial_ascii = $serialAscii
             model_name   = $modelName
-            # Legacy field — mantido para compat com change-hwid-easy.ps1.
+            # Legacy field — mantido para compat com spoof-mac.ps1.
             # 8 hex chars = 4 bytes LE de serial_num.
             edid_serial  = $edidSerialHex
         }
@@ -566,7 +538,7 @@ function Invoke-Generate {
     # Salvar perfil (atomico: escreve em .tmp, depois Move-Item para evitar
     # race com leitores concorrentes que fariam ConvertFrom-Json em arquivo
     # truncado durante o Set-Content).
-    $jsonOut = $profile | ConvertTo-Json -Depth 10
+    $jsonOut = $prof | ConvertTo-Json -Depth 10
     $tmpPath = "$ProfilePath.tmp"
     Set-Content -Path $tmpPath -Value $jsonOut -Encoding UTF8 -Force
     Move-Item -Path $tmpPath -Destination $ProfilePath -Force
@@ -574,7 +546,7 @@ function Invoke-Generate {
     Write-Host ""
 
     # Escrever valores do driver no registro
-    Write-DriverRegistry -Profile $profile
+    Write-DriverRegistry -Profile $prof
 
     # Exibir resumo
     Write-Host ""
@@ -582,7 +554,7 @@ function Invoke-Generate {
     Write-Host "               RESUMO DO PERFIL GERADO             " -ForegroundColor Cyan
     Write-Host "  ══════════════════════════════════════════════════" -ForegroundColor DarkCyan
     Write-Host ""
-    Show-ProfileData -Profile $profile
+    Show-ProfileData -Profile $prof
 }
 
 # ============================================================
@@ -665,9 +637,9 @@ function Write-DriverRegistry {
 }
 
 function Invoke-WriteDriver {
-    $profile = Load-Profile
-    if (-not $profile) { return }
-    Write-DriverRegistry -Profile $profile
+    $prof = Load-Profile
+    if (-not $prof) { return }
+    Write-DriverRegistry -Profile $prof
 }
 
 # ============================================================
@@ -692,7 +664,7 @@ function Invoke-Validate {
 
     try {
         $json = Get-Content -Path $ProfilePath -Raw -Encoding UTF8
-        $profile = $json | ConvertFrom-Json
+        $prof = $json | ConvertFrom-Json
         Write-Host "  [OK]    Perfil existe e é JSON válido" -ForegroundColor Green
         $passed++
     }
@@ -704,9 +676,9 @@ function Invoke-Validate {
 
     # 2. Fabricantes system/board/chassis batem
     $checks++
-    $sysMfr     = $profile.smbios.system_manufacturer
-    $boardMfr   = $profile.smbios.board_manufacturer
-    $chassisMfr = $profile.smbios.chassis_manufacturer
+    $sysMfr     = $prof.smbios.system_manufacturer
+    $boardMfr   = $prof.smbios.board_manufacturer
+    $chassisMfr = $prof.smbios.chassis_manufacturer
     if ($sysMfr -eq $boardMfr -and $boardMfr -eq $chassisMfr) {
         Write-Host "  [OK]    Fabricantes system/board/chassis são iguais: $sysMfr" -ForegroundColor Green
         $passed++
@@ -722,11 +694,11 @@ function Invoke-Validate {
     $checks++
     $cpuName = Detect-CPU
     $currentSocket = Match-Socket -CpuName $cpuName
-    $profileSocket = $profile.socket_matched
+    $profileSocket = $prof.socket_matched
 
     if ($currentSocket -and $currentSocket -eq $profileSocket) {
         # Verificar se a placa está no banco de dados do socket
-        $boardProduct = $profile.smbios.board_product
+        $boardProduct = $prof.smbios.board_product
         $boardsForSocket = $HardwareDB[$currentSocket].Boards
         $found = $false
         foreach ($b in $boardsForSocket) {
@@ -752,7 +724,7 @@ function Invoke-Validate {
 
     # 4. UUID é v4 válido
     $checks++
-    $uuid = $profile.smbios.uuid
+    $uuid = $prof.smbios.uuid
     $uuidv4Pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     if ($uuid -match $uuidv4Pattern) {
         Write-Host "  [OK]    UUID é v4 válido: $uuid" -ForegroundColor Green
@@ -766,7 +738,7 @@ function Invoke-Validate {
     $checks++
     $macOk = $true
     $allKnownOUIs = $IntelOUIs + $RealtekOUIs
-    foreach ($net in $profile.network) {
+    foreach ($net in $prof.network) {
         $macStr = $net.mac
         if ($macStr.Length -ge 2) {
             $firstByte = [Convert]::ToByte($macStr.Substring(0, 2), 16)
@@ -784,22 +756,10 @@ function Invoke-Validate {
         $passed++
     }
 
-    # 6. Product ID no formato esperado
-    $checks++
-    $pidPattern = "^00330-80000-\d{7}-AA\d{3}$"
-    $pid = $profile.windows.product_id
-    if ($pid -match $pidPattern) {
-        Write-Host "  [OK]    Product ID no formato correto: $pid" -ForegroundColor Green
-        $passed++
-    } else {
-        Write-Host "  [FALHA] Product ID fora do formato esperado: $pid" -ForegroundColor Red
-        $allPassed = $false
-    }
-
-    # 7. Storage seed tem 32 bytes
+    # 6. Storage seed tem 32 bytes
     $checks++
     try {
-        $seedBytes = [Convert]::FromBase64String($profile.storage.seed_b64)
+        $seedBytes = [Convert]::FromBase64String($prof.storage.seed_b64)
         if ($seedBytes.Length -eq 32) {
             Write-Host "  [OK]    Storage seed tem 32 bytes" -ForegroundColor Green
             $passed++
@@ -813,10 +773,10 @@ function Invoke-Validate {
         $allPassed = $false
     }
 
-    # 8. EDID legacy serial (compat com change-hwid-easy.ps1)
+    # 8. EDID legacy serial (compat com spoof-mac.ps1)
     $checks++
-    if ($profile.monitor -and $profile.monitor.edid_serial) {
-        $edidHex = $profile.monitor.edid_serial
+    if ($prof.monitor -and $prof.monitor.edid_serial) {
+        $edidHex = $prof.monitor.edid_serial
         if ($edidHex -match "^[0-9A-Fa-f]{8}$") {
             Write-Host "  [OK]    EDID serial (legacy) valido (4 bytes): $edidHex" -ForegroundColor Green
             $passed++
@@ -832,7 +792,7 @@ function Invoke-Validate {
     # 9. Monitor EDID v5 — mfr_pnp_id, product_code, serial_num, week/year
     $checks++
     $monOk = $true
-    $mon = $profile.monitor
+    $mon = $prof.monitor
     if (-not $mon) {
         Write-Host "  [AVISO] Secao monitor ausente" -ForegroundColor Yellow
         $passed++
@@ -920,8 +880,8 @@ function Invoke-Validate {
     # 11. Audio rotation pool — >=2 GUIDs validos
     $checks++
     $guidBracesPattern = "^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$"
-    if ($profile.audio -and $profile.audio.rotation_pool) {
-        $pool = @($profile.audio.rotation_pool)
+    if ($prof.audio -and $prof.audio.rotation_pool) {
+        $pool = @($prof.audio.rotation_pool)
         if ($pool.Count -lt 2) {
             Write-Host "  [FALHA] audio.rotation_pool tem $($pool.Count) entradas (min: 2)" -ForegroundColor Red
             $allPassed = $false
@@ -947,8 +907,8 @@ function Invoke-Validate {
 
     # 12. EMAC persistent_uuid — UUID v4
     $checks++
-    if ($profile.emac -and $profile.emac.persistent_uuid) {
-        $emacU = $profile.emac.persistent_uuid
+    if ($prof.emac -and $prof.emac.persistent_uuid) {
+        $emacU = $prof.emac.persistent_uuid
         if ($emacU -match $uuidv4Pattern) {
             Write-Host "  [OK]    emac.persistent_uuid e v4 valido: $emacU" -ForegroundColor Green
             $passed++
@@ -984,7 +944,6 @@ function Show-ProfileData {
 
     # Acessar dados de forma compatível com PSCustomObject e Hashtable
     $smbios  = if ($p -is [PSCustomObject]) { $p.smbios }  else { $p["smbios"] }
-    $windows = if ($p -is [PSCustomObject]) { $p.windows } else { $p["windows"] }
     $network = if ($p -is [PSCustomObject]) { $p.network } else { $p["network"] }
     $storage = if ($p -is [PSCustomObject]) { $p.storage } else { $p["storage"] }
     $monitor = if ($p -is [PSCustomObject]) { $p.monitor } else { $p["monitor"] }
@@ -1036,21 +995,6 @@ function Show-ProfileData {
     foreach ($field in $smbiosFields) {
         $label = $field[0].PadRight(22)
         $val   = if ($smbios -is [PSCustomObject]) { $smbios.($field[1]) } else { $smbios[$field[1]] }
-        Write-Host "  $label : " -NoNewline -ForegroundColor Gray
-        Write-Host $val -ForegroundColor White
-    }
-    Write-Host ""
-
-    # Windows
-    Write-Host "  --- Windows ---" -ForegroundColor Cyan
-    $winFields = @(
-        @("Machine GUID",   "machine_guid"),
-        @("SQM Machine ID", "sqm_machine_id"),
-        @("Product ID",     "product_id")
-    )
-    foreach ($field in $winFields) {
-        $label = $field[0].PadRight(22)
-        $val   = if ($windows -is [PSCustomObject]) { $windows.($field[1]) } else { $windows[$field[1]] }
         Write-Host "  $label : " -NoNewline -ForegroundColor Gray
         Write-Host $val -ForegroundColor White
     }
@@ -1163,14 +1107,14 @@ function Show-ProfileData {
 }
 
 function Invoke-Show {
-    $profile = Load-Profile
-    if (-not $profile) { return }
+    $prof = Load-Profile
+    if (-not $prof) { return }
 
     Write-Host "  ══════════════════════════════════════════════════" -ForegroundColor DarkCyan
     Write-Host "              PERFIL DE HARDWARE ATUAL              " -ForegroundColor Cyan
     Write-Host "  ══════════════════════════════════════════════════" -ForegroundColor DarkCyan
     Write-Host ""
-    Show-ProfileData -Profile $profile
+    Show-ProfileData -Profile $prof
 }
 
 # ============================================================

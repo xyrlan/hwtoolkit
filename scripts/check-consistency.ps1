@@ -19,8 +19,6 @@
            - CPU Type 4 SMBIOS vs Win32_Processor.Name (que vem de CPUID)
            - MAC OUI vs adapter vendor no PnP enum
            - Disk Model (nao spoofado) vs Serial prefix (spoofado)
-           - Volume Serial Number: mostra os de C:/D:/E: para conferir
-             se volflt esta ativo (VSN deve ser deterministico do seed)
 
     Codigo de saida:
       0 = tudo bate
@@ -34,13 +32,15 @@
 $ErrorActionPreference = "Stop"
 $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 
-function Write-Section($t) { Write-Host ""; Write-Host ("== " + $t + " ==") -ForegroundColor Cyan }
-function Write-OK($m)      { Write-Host ("  [OK]   " + $m) -ForegroundColor Green }
-function Write-Gap($m)     { Write-Host ("  [GAP]  " + $m) -ForegroundColor Yellow; $script:GapCount++ }
-function Write-Warn($m)    { Write-Host ("  [!]    " + $m) -ForegroundColor Yellow; $script:GapCount++ }
-function Write-Info($m)    { Write-Host ("  [*]    " + $m) -ForegroundColor Gray }
+. "$PSScriptRoot\_ui-common.ps1"
 
+# consistency-check conta gaps: precisamos que Warn/Gap incrementem
+# $script:GapCount. As helpers em _ui-common.ps1 nao mexem em contador
+# (sao usadas por outros scripts que nao contam). Sobrescrevemos aqui
+# as duas versoes contadoras. ASCII only.
 $script:GapCount = 0
+function Write-Gap($m)  { Write-Host ("  [GAP]  " + $m) -ForegroundColor Yellow; $script:GapCount++ }
+function Write-Warn($m) { Write-Host ("  [!]    " + $m) -ForegroundColor Yellow; $script:GapCount++ }
 
 # ============================================================
 #  Load profile (opcional - sem profile, viramos "baseline mode":
@@ -152,7 +152,7 @@ Write-Info ("Win32_Processor.Manufacturer  : {0}" -f $cpu.Manufacturer)
 Write-Info ("Win32_Processor.ProcessorId   : {0}" -f $cpu.ProcessorId)
 
 # ProcessorId de CPUID come de EAX=1 e nao deve mudar. Se mudou,
-# alguma coisa alterou Type 4 CPUID (bug em spoof-uuid.ps1).
+# alguma coisa alterou Type 4 CPUID (bug em spoof-smbios.ps1).
 $expectedVendor = switch -Regex ($cpu.Manufacturer) {
     "Intel" { "GenuineIntel"; break }
     "AMD"   { "AuthenticAMD"; break }
@@ -216,39 +216,7 @@ foreach ($d in $disks) {
 }
 
 # ============================================================
-#  6. Volume Serial Numbers - comprova volflt ativo
-# ============================================================
-Write-Section "Volume Serial Numbers (checa volflt ativo)"
-
-$fltActive = $false
-try {
-    $flt = & fltmc filters 2>$null
-    if ($flt -match "VolFlt") {
-        Write-OK "VolFlt carregado no fltmc"
-        $fltActive = $true
-    } else {
-        Write-Warn "VolFlt NAO aparece em 'fltmc filters' - VSN spoof inativo"
-    }
-} catch {
-    Write-Warn "fltmc indisponivel"
-}
-
-Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
-    $vsn = $null
-    try {
-        $filter = "DeviceID='{0}:'" -f $_.DriveLetter
-        $ld = Get-CimInstance Win32_LogicalDisk -Filter $filter -ErrorAction SilentlyContinue
-        if ($ld) { $vsn = $ld.VolumeSerialNumber }
-    } catch { }
-    Write-Info ("{0}:  VSN={1}  Label='{2}'  FS={3}" -f $_.DriveLetter, $vsn, $_.FileSystemLabel, $_.FileSystem)
-}
-
-if (-not $fltActive) {
-    Write-Gap "VSN acima sao os REAIS (VolFlt nao esta filtrando)"
-}
-
-# ============================================================
-#  7. Audio MMDevices GUIDs match profile pool
+#  6. Audio MMDevices GUIDs match profile pool
 #
 #  spoof-audio-guids.ps1 gera novos endpoint GUIDs em
 #  HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio
@@ -275,16 +243,16 @@ if (-not (Test-Path $audioMapPath)) {
     }
 
     if ($audioMap) {
-        # Coleta GUIDs "novos" do mapa (aceita tanto propriedade "new"
-        # quanto valores diretos - depende de como spoof-audio-guids.ps1
-        # serializa. Cobrimos os dois formatos.)
+        # Schema real: { "Render": [ {old, new}, ... ], "Capture": [ {old, new}, ... ] }
+        # Colecta o campo "new" de cada entrada em ambos os arrays.
         $newGuids = New-Object System.Collections.Generic.HashSet[string]
-        foreach ($p in $audioMap.PSObject.Properties) {
-            $v = $p.Value
-            if ($v -is [string]) {
-                [void]$newGuids.Add($v.ToLower().Trim('{','}'))
-            } elseif ($v -and $v.PSObject.Properties['new']) {
-                [void]$newGuids.Add(([string]$v.new).ToLower().Trim('{','}'))
+        foreach ($section in @('Render','Capture')) {
+            if ($audioMap.PSObject.Properties[$section]) {
+                foreach ($entry in @($audioMap.$section)) {
+                    if ($entry -and $entry.PSObject.Properties['new']) {
+                        [void]$newGuids.Add(([string]$entry.new).ToLower().Trim('{','}'))
+                    }
+                }
             }
         }
 
@@ -323,7 +291,7 @@ if (-not (Test-Path $audioMapPath)) {
 }
 
 # ============================================================
-#  8. EDID full-spoof coherency
+#  7. EDID full-spoof coherency
 #
 #  spoof-edid-full.ps1 reescreve o EDID inteiro (PNP ID, product
 #  code, serial num, week/year, descriptor blocks 0xFC nome e 0xFF
@@ -500,7 +468,7 @@ if (-not (Test-Path $displayRoot)) {
 }
 
 # ============================================================
-#  9. emac-uuid file persistente + ACL locked
+#  8. emac-uuid file persistente + ACL locked
 #
 #  EMAC guarda HWID plaintext em %USERPROFILE%\emac-uuid. Deletar
 #  triggera burst de 32k+ RegOpenKey re-registrando. A estrategia
@@ -621,6 +589,134 @@ if (-not $hasProfile) {
         } else {
             Write-OK "schema >= 5 (Fase 1 fields presentes)"
         }
+    }
+}
+
+# ============================================================
+#  11. Per-adapter MAC vs profile.network
+#
+#  profile.network eh um array de entries { match, mac } onde
+#  'match' e um regex contra InterfaceDescription e 'mac' o MAC
+#  esperado (12 hex chars, upper). Se algum adapter que casa com
+#  o pattern tem MAC diferente, spoof nao aplicou naquele NIC.
+# ============================================================
+Write-Section "Per-adapter MAC vs profile.network"
+
+if (-not $hasProfile) {
+    Write-Info "Sem profile - pulando comparacao per-adapter."
+} elseif (-not $prof.PSObject.Properties['network']) {
+    Write-Info "profile sem secao 'network' - pulando."
+} else {
+    $netEntries = @($prof.network)
+    if ($netEntries.Count -eq 0) {
+        Write-Info "profile.network vazio."
+    } else {
+        foreach ($entry in $netEntries) {
+            if (-not ($entry.PSObject.Properties['match']) -or -not ($entry.PSObject.Properties['mac'])) {
+                Write-Info "entrada network sem 'match' ou 'mac' - pulando"
+                continue
+            }
+            $expectedMac = ([string]$entry.mac -replace '[:\-]', '').ToUpper()
+            $pattern = [string]$entry.match
+            $matched = Get-NetAdapter -ErrorAction SilentlyContinue |
+                       Where-Object { $_.InterfaceDescription -match $pattern }
+            if (-not $matched) {
+                Write-Info ("match=`"{0}`" : nenhum adapter casou" -f $pattern)
+                continue
+            }
+            foreach ($ad in $matched) {
+                $curMac = ([string]$ad.MacAddress -replace '[:\-]', '').ToUpper()
+                $desc = $ad.InterfaceDescription
+                $shortDesc = if ($desc.Length -gt 40) { $desc.Substring(0,40) } else { $desc }
+                if ($curMac -eq $expectedMac) {
+                    Write-OK ("{0,-40} MAC={1}" -f $shortDesc, $curMac)
+                } else {
+                    Write-Gap ("{0,-40} MAC atual={1}  profile={2}" -f $shortDesc, $curMac, $expectedMac)
+                }
+            }
+        }
+    }
+}
+
+# ============================================================
+#  12. CPU coherency: registry CPUID vendor vs WMI Manufacturer
+#
+#  HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\VendorIdentifier
+#  vem cru do CPUID leaf 0 (GenuineIntel / AuthenticAMD). Comparamos
+#  com Win32_Processor.Manufacturer que anti-cheat cruza com SMBIOS
+#  Type 4. Divergencia = flag.
+# ============================================================
+Write-Section "CPU coherency: CPUID vendor vs WMI Manufacturer"
+
+$cpuidVendor = $null
+try {
+    $cp0 = Get-ItemProperty -Path "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0" -ErrorAction SilentlyContinue
+    if ($cp0 -and $cp0.VendorIdentifier) { $cpuidVendor = [string]$cp0.VendorIdentifier }
+} catch { }
+
+$wmiMfr = $null
+try {
+    $cpu2 = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cpu2) { $wmiMfr = [string]$cpu2.Manufacturer }
+} catch { }
+
+if ($null -eq $cpuidVendor -or $null -eq $wmiMfr) {
+    Write-Info ("CPUID vendor: {0}  WMI Manufacturer: {1}" -f $cpuidVendor, $wmiMfr)
+} else {
+    Write-Info ("CPUID VendorIdentifier : {0}" -f $cpuidVendor)
+    Write-Info ("WMI  Manufacturer      : {0}" -f $wmiMfr)
+    $coherent = $false
+    if     ($cpuidVendor -eq "GenuineIntel" -and $wmiMfr -match "Intel") { $coherent = $true }
+    elseif ($cpuidVendor -eq "AuthenticAMD" -and $wmiMfr -match "AMD")   { $coherent = $true }
+    if ($coherent) {
+        Write-OK "CPUID vendor bate com WMI Manufacturer"
+    } else {
+        Write-Gap "SMBIOS Type 4 CPU manufacturer diverges from CPUID vendor"
+    }
+}
+
+# ============================================================
+#  13. Storage serial deterministico (info-only)
+#
+#  Se RstFlt esta ativo e tem SerialSeed em Parameters, os seriais
+#  reportados por Win32_DiskDrive devem ser derivados via FNV-1a
+#  do seed + SerialPrefix do profile. Nao reimplementamos o hash
+#  aqui - apenas imprimimos model + serial atual para auditor
+#  cruzar visualmente com o prefixo esperado.
+# ============================================================
+Write-Section "Storage serial deterministico (RstFlt info)"
+
+$rstfltPresent = $false
+try {
+    $svc = Get-Service -Name RstFlt -ErrorAction SilentlyContinue
+    if ($svc) { $rstfltPresent = $true }
+} catch { }
+
+if (-not $rstfltPresent) {
+    Write-Info "RstFlt nao instalado - pulando check de seriais deterministicos"
+} else {
+    $seed = $null
+    try {
+        $rp = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters" -ErrorAction SilentlyContinue
+        if ($rp -and $rp.PSObject.Properties['SerialSeed']) { $seed = $rp.SerialSeed }
+    } catch { }
+
+    if ($null -eq $seed) {
+        Write-Info "RstFlt presente mas sem Parameters\SerialSeed - driver nao seedado"
+    } else {
+        Write-Info ("RstFlt SerialSeed: {0}" -f $seed)
+        $expectedPrefix = $null
+        if ($hasProfile -and $prof.PSObject.Properties['storage'] -and $prof.storage.PSObject.Properties['SerialPrefix']) {
+            $expectedPrefix = [string]$prof.storage.SerialPrefix
+            Write-Info ("profile.storage.SerialPrefix esperado: {0}" -f $expectedPrefix)
+        }
+        try {
+            $dd = Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue
+            foreach ($d in $dd) {
+                $ser = if ($d.SerialNumber) { $d.SerialNumber.Trim() } else { "(vazio)" }
+                Write-Info ("{0,-35} Serial: {1}" -f $d.Model, $ser)
+            }
+        } catch { }
     }
 }
 

@@ -47,20 +47,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. "$PSScriptRoot\_ui-common.ps1"
+
 $profilePath  = "C:\ProgramData\.hwcfg\profile.json"
 $mappingPath  = "C:\ProgramData\.hwcfg\audio-rotation.json"
 $mmRoot       = "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
 $mmRootPs     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio"
 $audioRootPs  = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio"
-
-# ============================================================
-#  Helpers
-# ============================================================
-function Write-Section($t) { Write-Host ""; Write-Host ("== " + $t + " ==") -ForegroundColor Cyan }
-function Write-OK($m)      { Write-Host ("  [OK]   " + $m) -ForegroundColor Green }
-function Write-Warn($m)    { Write-Host ("  [!]    " + $m) -ForegroundColor Yellow }
-function Write-Err($m)     { Write-Host ("  [X]    " + $m) -ForegroundColor Red }
-function Write-Info($m)    { Write-Host ("  [*]    " + $m) -ForegroundColor Gray }
 
 # Regex para GUID no formato registry {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
 $guidRegex = '\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}'
@@ -292,8 +285,18 @@ if ($Restore) {
         Rewrite-Audio-References -Map $reverseMap
     }
 
-    Remove-Item $mappingPath -Force -ErrorAction SilentlyContinue
-    Write-OK ("Mapping removido: " + $mappingPath)
+    # Atomic delete: rename para .bak antes de remover (se algo falhar durante,
+    # o mapping original nao fica truncado no meio).
+    try {
+        $bakPath = $mappingPath + ".bak"
+        if (Test-Path $bakPath) { Remove-Item $bakPath -Force -ErrorAction SilentlyContinue }
+        Move-Item -Path $mappingPath -Destination $bakPath -Force
+        Remove-Item $bakPath -Force -ErrorAction SilentlyContinue
+        Write-OK ("Mapping removido: " + $mappingPath)
+    } catch {
+        Remove-Item $mappingPath -Force -ErrorAction SilentlyContinue
+        Write-OK ("Mapping removido: " + $mappingPath)
+    }
 
     # AudioEndpointBuilder cacheia o enumeration de MMDevices. Reinicia-lo
     # (com -Force pra levar dependentes junto: AudioSrv) forca o Windows a
@@ -492,7 +495,10 @@ if (-not (Test-Path $mappingDir)) {
     New-Item -ItemType Directory -Path $mappingDir -Force | Out-Null
 }
 
-$mergedMap | ConvertTo-Json -Depth 5 | Set-Content -Path $mappingPath -Encoding UTF8
+# Atomic write: escreve em tmp e move (mesmo padrao de generate-profile.ps1)
+$tmpMap = $mappingPath + ".tmp"
+$mergedMap | ConvertTo-Json -Depth 5 | Set-Content -Path $tmpMap -Encoding UTF8
+Move-Item -Path $tmpMap -Destination $mappingPath -Force
 Write-OK ("Mapping salvo em: " + $mappingPath)
 
 # ============================================================

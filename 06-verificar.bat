@@ -20,18 +20,6 @@ powershell -Command "Get-CimInstance Win32_BaseBoard | Select-Object Manufacture
 echo === CHASSIS ===
 powershell -Command "Get-CimInstance Win32_SystemEnclosure | Select-Object Manufacturer,SerialNumber | Format-List"
 
-echo === MACHINE GUID ===
-reg query "HKLM\SOFTWARE\Microsoft\Cryptography" /v MachineGuid 2>nul
-echo.
-
-echo === SQM MACHINE ID ===
-reg query "HKLM\SOFTWARE\Microsoft\SQMClient" /v MachineId 2>nul
-echo.
-
-echo === PRODUCT ID ===
-reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion" /v ProductId 2>nul
-echo.
-
 echo === MAC ADDRESSES ===
 powershell -Command "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | Select-Object Name,InterfaceDescription,MacAddress | Format-Table -AutoSize"
 
@@ -40,24 +28,23 @@ powershell -Command "Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\DISPLAY'
 echo.
 
 echo === VALIDACAO DO PROFILE ===
-if exist "%~dp0scripts\hwprofile.ps1" (
-    powershell -ExecutionPolicy Bypass -File "%~dp0scripts\hwprofile.ps1" -Validate
+if exist "%~dp0scripts\generate-profile.ps1" (
+    powershell -ExecutionPolicy Bypass -File "%~dp0scripts\generate-profile.ps1" -Validate
 ) else (
-    echo [!] hwprofile.ps1 nao encontrado
+    echo [!] generate-profile.ps1 nao encontrado
 )
 
 echo.
 echo === CONSISTENCY CROSS-CHECK + BIOS MIRROR AUDIT ===
-if exist "%~dp0scripts\consistency-check.ps1" (
+if exist "%~dp0scripts\check-consistency.ps1" (
     rem  Read-only. Sinaliza GAPs onde:
     rem    - HARDWARE\DESCRIPTION\System\BIOS ainda mostra a placa REAL
     rem      (SMBIOS spoof furado nesse ponto)
     rem    - Manufacturer diverge entre ComputerSystem/BaseBoard/Chassis
     rem    - Disk Model vs Serial format inconsistente
-    rem    - VolFlt nao esta filtrando (VSN mostrado sao os reais)
-    powershell -ExecutionPolicy Bypass -File "%~dp0scripts\consistency-check.ps1"
+    powershell -ExecutionPolicy Bypass -File "%~dp0scripts\check-consistency.ps1"
 ) else (
-    echo [!] scripts\consistency-check.ps1 nao encontrado
+    echo [!] scripts\check-consistency.ps1 nao encontrado
 )
 
 echo.

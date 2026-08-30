@@ -134,7 +134,7 @@ if %errorlevel% neq 0 (
 
 rem --- v3.4: garantir que SMBIOS replay em kernel NAO herda estado de
 rem     um install anterior. O opt-in flag agora e explicito e default
-rem     off. spoof-uuid.ps1 seta este flag em 1 depois de validar via WMI.
+rem     off. spoof-smbios.ps1 seta este flag em 1 depois de validar via WMI.
 reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters" /v EnableSmbiosReplay /t REG_DWORD /d 0 /f >nul 2>&1
 
 rem --- Definir grupo de carga ---
@@ -167,16 +167,16 @@ if %errorlevel% neq 0 (
 
 rem --- Escrever seed do profile ---
 echo [*] Verificando profile para seed do driver...
-if exist "%~dp0scripts\hwprofile.ps1" (
-    echo [*] Escrevendo seed do driver via hwprofile...
-    powershell -ExecutionPolicy Bypass -Command "& '%~dp0scripts\hwprofile.ps1' -WriteDriver" 2>nul
+if exist "%~dp0scripts\generate-profile.ps1" (
+    echo [*] Escrevendo seed do driver via generate-profile...
+    powershell -ExecutionPolicy Bypass -Command "& '%~dp0scripts\generate-profile.ps1' -WriteDriver" 2>nul
     if !errorlevel! equ 0 (
         echo [OK] Seed do driver configurado
     ) else (
         echo [!] Falha ao escrever seed - rode 00-gerar-profile.bat primeiro
     )
 ) else (
-    echo [!] hwprofile.ps1 nao encontrado em scripts\
+    echo [!] generate-profile.ps1 nao encontrado em scripts\
 )
 
 echo.

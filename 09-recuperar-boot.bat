@@ -44,7 +44,6 @@ powershell -ExecutionPolicy Bypass -Command ^
   "if ($swOk) { try { $orig = (Get-ItemProperty -Path 'HKLM:\OFFSW\HWToolkit' -Name OrigUpperFilters -ErrorAction Stop).OrigUpperFilters } catch {} }" ^
   "foreach ($cs in @('ControlSet001','ControlSet002')) {" ^
   "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\RstFlt\" -f $cs)     -Recurse -Force -ErrorAction SilentlyContinue;" ^
-  "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\VolFlt\" -f $cs)     -Recurse -Force -ErrorAction SilentlyContinue;" ^
   "  Remove-Item -Path (\"HKLM:\OFFSYS\{0}\Services\DiskFilter\" -f $cs) -Recurse -Force -ErrorAction SilentlyContinue;" ^
   "  $classKey = \"HKLM:\OFFSYS\{0}\Control\Class\{1}\" -f $cs, $classGuid;" ^
   "  if ($orig) {" ^
@@ -78,7 +77,6 @@ powershell -ExecutionPolicy Bypass -Command ^
 
 echo [*] Removendo arquivos do driver...
 del /f "%WINDRV%\Windows\System32\drivers\rstflt.sys"      2>nul
-del /f "%WINDRV%\Windows\System32\drivers\volflt.sys"      2>nul
 del /f "%WINDRV%\Windows\System32\drivers\diskfilter.sys"  2>nul
 
 echo.

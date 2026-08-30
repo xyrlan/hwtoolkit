@@ -1,6 +1,6 @@
 @echo off
 echo ========================================================
-echo   Desinstalar RstFlt (Storage Filter) + VolFlt (VSN)
+echo   Desinstalar RstFlt (Storage Filter)
 echo ========================================================
 echo.
 
@@ -10,16 +10,6 @@ if %errorlevel% neq 0 (
     echo [!] ERRO: Execute como Administrador!
     pause
     goto :eof
-)
-
-rem --- Parar e remover VolFlt (minifilter) primeiro ---
-sc query VolFlt >nul 2>&1
-if %errorlevel% equ 0 (
-    echo [*] Descarregando VolFlt via fltmc...
-    fltmc unload VolFlt >nul 2>&1
-    echo [*] Removendo servico VolFlt...
-    sc delete VolFlt >nul 2>&1
-    del /f "%SystemRoot%\System32\drivers\volflt.sys" 2>nul
 )
 
 rem --- Parar e remover servico RstFlt ---

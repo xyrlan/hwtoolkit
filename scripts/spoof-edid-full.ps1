@@ -2,7 +2,7 @@
 # ============================================================
 #  EDID Full Spoof v1 - GAP #4 (post-BSOD hardening v3.5)
 #
-#  Substitui o spoof parcial (bytes 12-15) do change-hwid-easy.ps1
+#  Substitui o spoof parcial (bytes 12-15) do spoof-mac.ps1
 #  por um spoof COMPLETO do EDID:
 #    - PNP ID (bytes 8-9, EISA 3-letter compressed)
 #    - Product code (bytes 10-11 little-endian)
@@ -309,18 +309,18 @@ Write-Host ""
 $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 if (-not (Test-Path $profilePath)) {
     Write-Host "  [X] Profile nao encontrado: $profilePath" -ForegroundColor Red
-    Write-Host "  [X] Rode primeiro:  .\hwprofile.ps1 -Generate" -ForegroundColor Red
+    Write-Host "  [X] Rode primeiro:  .\generate-profile.ps1 -Generate" -ForegroundColor Red
     exit 1
 }
 
-$profile = Get-Content $profilePath -Raw | ConvertFrom-Json
+$prof = Get-Content $profilePath -Raw | ConvertFrom-Json
 
-if (-not $profile.monitor) {
+if (-not $prof.monitor) {
     Write-Host "  [X] Profile nao tem secao 'monitor'. Regenerar o perfil." -ForegroundColor Red
     exit 1
 }
 
-$mon = $profile.monitor
+$mon = $prof.monitor
 
 # ------------------------------------------------------------
 #  Resolver campos do profile (com fallback estavel)

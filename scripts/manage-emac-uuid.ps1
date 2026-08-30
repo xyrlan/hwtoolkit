@@ -46,6 +46,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. "$PSScriptRoot\_ui-common.ps1"
+
 $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 
 # Detecta contexto SYSTEM: $env:USERPROFILE resolveria para
@@ -72,11 +74,6 @@ $emacPath    = Join-Path $env:USERPROFILE "emac-uuid"
 # Se o profile ainda tem esse valor, o operador nunca gerou um proprio.
 $placeholderUuid = "d9f4202f-e108-4fc8-8389-c3c8d4b9689e"
 
-function Write-Section($t) { Write-Host ""; Write-Host ("== " + $t + " ==") -ForegroundColor Cyan }
-function Write-OK($m)      { Write-Host ("  [OK]   " + $m) -ForegroundColor Green }
-function Write-Info($m)    { Write-Host ("  [*]    " + $m) -ForegroundColor Gray }
-function Write-Warn($m)    { Write-Host ("  [!]    " + $m) -ForegroundColor Yellow }
-function Write-Err($m)     { Write-Host ("  [X]    " + $m) -ForegroundColor Red }
 
 # ============================================================
 #  AVISO DE RECONHECIMENTO
@@ -96,7 +93,7 @@ Write-Host ""
 # ============================================================
 if (-not (Test-Path $profilePath)) {
     Write-Err "Profile nao encontrado em $profilePath"
-    Write-Err "Rode primeiro:  .\hwprofile.ps1 -Generate"
+    Write-Err "Rode primeiro:  .\generate-profile.ps1 -Generate"
     exit 1
 }
 
@@ -104,7 +101,7 @@ $profileObj = Get-Content $profilePath -Raw | ConvertFrom-Json
 
 if (-not $profileObj.PSObject.Properties['emac']) {
     Write-Err "Profile nao tem secao 'emac'. Regenere com a versao nova"
-    Write-Err "do hwprofile.ps1 que emite emac.persistent_uuid + emac.lock_file."
+    Write-Err "do generate-profile.ps1 que emite emac.persistent_uuid + emac.lock_file."
     exit 1
 }
 

@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-powershell -ExecutionPolicy Bypass -File "%~dp0scripts\hwprofile.ps1" -Generate
+powershell -ExecutionPolicy Bypass -File "%~dp0scripts\generate-profile.ps1" -Generate
 
 echo.
 pause
