@@ -463,14 +463,13 @@ if (-not (Test-Path $displayRoot)) {
 }
 
 # ============================================================
-#  (Reservado — sem section 9 dedicada. Antes do v3.6 aqui havia
-#  o dump de driver storage state / disk-serial spoof check; foi
-#  removido junto com o intercept de IOCTL_STORAGE_QUERY_PROPERTY
-#  no driver.)
+#  8. (Reservado) - antes do v3.6 aqui havia o dump de driver
+#  storage state / disk-serial spoof check; foi removido junto
+#  com o intercept de IOCTL_STORAGE_QUERY_PROPERTY no driver.
 # ============================================================
 
 # ============================================================
-#  8. emac-uuid file persistente + ACL locked
+#  9. emac-uuid file persistente + ACL locked
 #
 #  EMAC guarda HWID plaintext em %USERPROFILE%\emac-uuid. Deletar
 #  triggera burst de 32k+ RegOpenKey re-registrando. A estrategia
@@ -588,8 +587,10 @@ if (-not $hasProfile) {
         [int]::TryParse([string]$schemaVer, [ref]$verInt) | Out-Null
         if ($verInt -lt 7) {
             Write-Warn ("schema {0} < 7 - versao antiga do profile (pre-v3.6, ainda contem 'storage' block obsoleto). Regenere com 00-gerar-profile.bat." -f $schemaVer)
+        } elseif ($verInt -lt 8) {
+            Write-Warn ("schema {0} < 8 - versao Fase 1.5. Regenere com 00-gerar-profile.bat para habilitar windows.machine_guid + disk/pci/volume spoof (Fase 1.6)." -f $schemaVer)
         } else {
-            Write-OK "schema >= 7 (v3.6+ minimal driver, sem storage IOCTL spoof)"
+            Write-OK "schema >= 8 (v3.6 + Fase 1.6: windows identity + disk enum + pci hwid + volume guid)"
         }
     }
 }
@@ -674,6 +675,412 @@ if ($null -eq $cpuidVendor -or $null -eq $wmiMfr) {
         Write-OK "CPUID vendor bate com WMI Manufacturer"
     } else {
         Write-Gap "SMBIOS Type 4 CPU manufacturer diverges from CPUID vendor"
+    }
+}
+
+# ============================================================
+#  13. Windows identity (MachineGuid + ComputerName + Hostname)
+#
+#  Fase 1.6 hotfix: EMAC user-mode le esses 3 valores via registry
+#  (confirmado por procmon reconn-v2). Rewriter em spoof-windows-id.ps1
+#  aplica todos de uma vez. Aqui checamos que registry bate com profile.
+# ============================================================
+Write-Section "Windows identity (MachineGuid + ComputerName + Hostname)"
+
+if (-not $hasProfile) {
+    Write-Info "Sem profile - pulando checks de windows identity."
+} elseif (-not $prof.PSObject.Properties['windows']) {
+    Write-Info "profile sem secao 'windows' - schema antigo (pre-v8)? Regenere profile."
+} else {
+    $wProf = $prof.windows
+
+    # MachineGuid
+    if ($wProf.PSObject.Properties['machine_guid']) {
+        $expected = [string]$wProf.machine_guid
+        $actual = $null
+        try {
+            $mg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid -ErrorAction SilentlyContinue
+            if ($mg) { $actual = [string]$mg.MachineGuid }
+        } catch { }
+        if ($null -eq $actual) {
+            Write-Gap "MachineGuid    : chave HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid ausente"
+        } elseif ($actual -ieq $expected) {
+            Write-OK ("MachineGuid    : `"{0}`"" -f $actual)
+        } else {
+            Write-Gap ("MachineGuid    : actual=`"{0}`"  profile=`"{1}`"" -f $actual, $expected)
+        }
+    } else {
+        Write-Info "profile.windows.machine_guid ausente"
+    }
+
+    # ComputerName (ActiveComputerName)
+    if ($wProf.PSObject.Properties['computer_name']) {
+        $expected = [string]$wProf.computer_name
+        $actual = $null
+        try {
+            $cn = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName" -Name ComputerName -ErrorAction SilentlyContinue
+            if ($cn) { $actual = [string]$cn.ComputerName }
+        } catch { }
+        if ($null -eq $actual) {
+            Write-Gap "ComputerName   : chave ActiveComputerName\ComputerName ausente"
+        } elseif ($actual -ieq $expected) {
+            Write-OK ("ComputerName   : `"{0}`"" -f $actual)
+        } else {
+            Write-Gap ("ComputerName   : actual=`"{0}`"  profile=`"{1}`"" -f $actual, $expected)
+        }
+    } else {
+        Write-Info "profile.windows.computer_name ausente"
+    }
+
+    # Tcpip Hostname
+    if ($wProf.PSObject.Properties['tcpip_hostname']) {
+        $expected = [string]$wProf.tcpip_hostname
+        $actual = $null
+        try {
+            $tp = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name Hostname -ErrorAction SilentlyContinue
+            if ($tp) { $actual = [string]$tp.Hostname }
+        } catch { }
+        if ($null -eq $actual) {
+            Write-Gap "TcpipHostname  : chave Tcpip\Parameters\Hostname ausente"
+        } elseif ($actual -ieq $expected) {
+            Write-OK ("TcpipHostname  : `"{0}`"" -f $actual)
+        } else {
+            Write-Gap ("TcpipHostname  : actual=`"{0}`"  profile=`"{1}`"" -f $actual, $expected)
+        }
+    } else {
+        Write-Info "profile.windows.tcpip_hostname ausente"
+    }
+}
+
+# ============================================================
+#  14. Disk SCSI enum (registry cache) vs disk-mapping
+#
+#  EMAC user-mode le HKLM\SYSTEM\CurrentControlSet\Enum\SCSI\
+#  Disk&Ven_XXX&Prod_YYY para descobrir vendor/model de cada disco.
+#  spoof-disk-registry.ps1 reescreve FriendlyName + HardwareID.
+#  Aqui checamos cada instancia (exceto boot disk) contra disk-mapping.
+# ============================================================
+Write-Section "Disk SCSI enum vs disk-mapping"
+
+$diskMapPath = "C:\ProgramData\.hwcfg\disk-mapping.json"
+if (-not $hasProfile) {
+    Write-Info "Sem profile - pulando disk enum check."
+} elseif (-not (Test-Path $diskMapPath)) {
+    Write-Info "disk-mapping.json ausente - spoof-disk-registry.ps1 ainda nao rodou."
+} else {
+    $diskMap = $null
+    try {
+        $diskMap = Get-Content $diskMapPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warn ("disk-mapping.json ilegivel: {0}" -f $_.Exception.Message)
+    }
+
+    if ($diskMap) {
+        # Descobrir boot disk (o que hospeda C:) - excluir da checagem.
+        $bootDiskModel = $null
+        try {
+            $sysDrive = ($env:SystemDrive).TrimEnd(':')
+            $part = Get-Partition -DriveLetter $sysDrive -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($part) {
+                $bd = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue
+                if ($bd) { $bootDiskModel = [string]$bd.Model }
+            }
+        } catch { }
+        if ($bootDiskModel) {
+            Write-Info ("boot disk (excluido): `"{0}`"" -f $bootDiskModel)
+        }
+
+        $scsiRoot = "HKLM:\SYSTEM\CurrentControlSet\Enum\SCSI"
+        if (-not (Test-Path $scsiRoot)) {
+            Write-Info "Enum\SCSI ausente."
+        } else {
+            $diskKeys = Get-ChildItem $scsiRoot -ErrorAction SilentlyContinue |
+                        Where-Object { $_.PSChildName -like "Disk&Ven_*&Prod_*" }
+            if (-not $diskKeys -or $diskKeys.Count -eq 0) {
+                Write-Info "Nenhuma entrada Disk&Ven_*&Prod_* em Enum\SCSI."
+            } else {
+                foreach ($dk in $diskKeys) {
+                    $instances = Get-ChildItem $dk.PSPath -ErrorAction SilentlyContinue
+                    foreach ($inst in $instances) {
+                        $friendly = $null
+                        $hwid1    = $null
+                        try {
+                            $ip = Get-ItemProperty -Path $inst.PSPath -ErrorAction SilentlyContinue
+                            if ($ip) {
+                                if ($ip.PSObject.Properties['FriendlyName']) { $friendly = [string]$ip.FriendlyName }
+                                if ($ip.PSObject.Properties['HardwareID'])   {
+                                    $hw = @($ip.HardwareID)
+                                    if ($hw.Count -gt 0) { $hwid1 = [string]$hw[0] }
+                                }
+                            }
+                        } catch { }
+
+                        $tag = "{0}\{1}" -f $dk.PSChildName, $inst.PSChildName
+                        if ($bootDiskModel -and $friendly -and ($friendly -match [regex]::Escape($bootDiskModel))) {
+                            Write-Info ("{0} : boot disk - skip" -f $tag)
+                            continue
+                        }
+
+                        # spoof-disk-registry.ps1 escreve o mapping como HASHTABLE:
+                        #   { "<orig_key>": { new_key: "...", fake: {vendor, product, class} }, ... }
+                        # A checagem: existe alguma entry cujo new_key bata com a
+                        # subchave atual (dk.PSChildName)?
+                        $curKey = $dk.PSChildName
+                        $match = $null
+                        $matchOrigKey = $null
+                        foreach ($origKey in $diskMap.PSObject.Properties.Name) {
+                            $ent = $diskMap.$origKey
+                            if (-not $ent) { continue }
+                            $newKey = $null
+                            if ($ent.PSObject.Properties['new_key']) { $newKey = [string]$ent.new_key }
+                            if ($newKey -and $newKey -ieq $curKey) {
+                                $match = $ent
+                                $matchOrigKey = $origKey
+                                break
+                            }
+                        }
+                        if ($match) {
+                            Write-OK ("{0} : new_key match (orig={1})" -f $tag, $matchOrigKey)
+                        } else {
+                            Write-Gap ("{0} : FriendlyName=`"{1}`" - subchave nao aparece como new_key em disk-mapping (spoof nao aplicado?)" -f $tag, $friendly)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ============================================================
+#  15. PCI HardwareID (SUBSYS/REV/CC granular)
+#
+#  EMAC le HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_*&DEV_*\{inst}
+#  \HardwareID (REG_MULTI_SZ) e agrega VEN&DEV&SUBSYS&REV&CC pra HWID.
+#  spoof-pci-hardwareid.ps1 usa FNV(seed + VEN&DEV) pra derivar SUBSYS
+#  deterministico. Sampleamos 5 devices e conferimos.
+# ============================================================
+Write-Section "PCI HardwareID (5 devices sample)"
+
+$pciMapPath = "C:\ProgramData\.hwcfg\pci-hardwareid-mapping.json"
+if (-not $hasProfile) {
+    Write-Info "Sem profile - pulando check PCI HardwareID."
+} elseif (-not (Test-Path $pciMapPath)) {
+    Write-Info "pci-hardwareid-mapping.json ausente - spoof-pci-hardwareid.ps1 ainda nao rodou."
+} else {
+    $pciMap = $null
+    try {
+        $pciMap = Get-Content $pciMapPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warn ("pci-hardwareid-mapping.json ilegivel: {0}" -f $_.Exception.Message)
+    }
+
+    $seed = $null
+    if ($prof.PSObject.Properties['pci_hardwareid'] -and $prof.pci_hardwareid.PSObject.Properties['randomize_seed']) {
+        $seed = [string]$prof.pci_hardwareid.randomize_seed
+    }
+    if ($null -eq $seed) {
+        Write-Info "profile.pci_hardwareid.randomize_seed ausente - so validaremos presenca no mapping."
+    } else {
+        Write-Info ("randomize_seed : {0}" -f $seed)
+    }
+
+    if ($pciMap) {
+        # Enumera devices PCI e amostra 5.
+        $pciRoot = "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI"
+        if (-not (Test-Path $pciRoot)) {
+            Write-Info "Enum\PCI ausente."
+        } else {
+            $venDevKeys = Get-ChildItem $pciRoot -ErrorAction SilentlyContinue |
+                          Where-Object { $_.PSChildName -match '^VEN_[0-9A-F]{4}&DEV_[0-9A-F]{4}$' }
+            $allInstances = @()
+            foreach ($vk in $venDevKeys) {
+                $ins = Get-ChildItem $vk.PSPath -ErrorAction SilentlyContinue
+                foreach ($i in $ins) {
+                    $allInstances += [pscustomobject]@{
+                        VenDev = $vk.PSChildName
+                        InstancePath = $i.PSPath
+                        InstanceName = $i.PSChildName
+                    }
+                }
+            }
+            if ($allInstances.Count -eq 0) {
+                Write-Info "Nenhum device em Enum\PCI."
+            } else {
+                $sampleCount = [Math]::Min(5, $allInstances.Count)
+                $sample = $allInstances | Get-Random -Count $sampleCount
+                foreach ($s in $sample) {
+                    $hwids = $null
+                    try {
+                        $ip = Get-ItemProperty -Path $s.InstancePath -Name HardwareID -ErrorAction SilentlyContinue
+                        if ($ip) { $hwids = @($ip.HardwareID) }
+                    } catch { }
+
+                    if (-not $hwids -or $hwids.Count -eq 0) {
+                        Write-Info ("{0}\{1} : HardwareID ausente" -f $s.VenDev, $s.InstanceName)
+                        continue
+                    }
+
+                    # Extrai primeiro SUBSYS_XXXXXXXX presente em qualquer entry.
+                    $currentSubsys = $null
+                    foreach ($h in $hwids) {
+                        if ([string]$h -match 'SUBSYS_([0-9A-Fa-f]{8})') {
+                            $currentSubsys = $matches[1].ToUpper()
+                            break
+                        }
+                    }
+                    if ($null -eq $currentSubsys) {
+                        Write-Info ("{0}\{1} : sem SUBSYS_ no HardwareID (device sem subsystem)" -f $s.VenDev, $s.InstanceName)
+                        continue
+                    }
+
+                    # spoof-pci-hardwareid.ps1 escreve mapping como:
+                    #   { version, created_at, seed, entries: [ {vendev, instance,
+                    #     new_subsys, new_rev, ...}, ... ] }
+                    $pciEntries = @()
+                    if ($pciMap.PSObject.Properties['entries']) {
+                        $pciEntries = @($pciMap.entries)
+                    }
+                    $mapEntry = $null
+                    foreach ($m in $pciEntries) {
+                        if (-not $m) { continue }
+                        $mv = $null
+                        if ($m.PSObject.Properties['vendev']) { $mv = [string]$m.vendev }
+                        elseif ($m.PSObject.Properties['ven_dev']) { $mv = [string]$m.ven_dev }
+                        if ($mv -and $mv -ieq $s.VenDev) { $mapEntry = $m; break }
+                    }
+
+                    if (-not $mapEntry) {
+                        # Skip esperado: spoofer pula devices de classe unsafe
+                        # (storage/TPM/bridge), instancias com so 1 HardwareID,
+                        # ou sem SUBSYS/REV. Ausencia no mapping nao e gap.
+                        Write-Info ("{0}\{1} : SUBSYS={2} sem entrada (spoofer pulou por politica ou classe unsafe)" -f $s.VenDev, $s.InstanceName, $currentSubsys)
+                        continue
+                    }
+
+                    $expectedSubsys = $null
+                    if ($mapEntry.PSObject.Properties['new_subsys']) { $expectedSubsys = ([string]$mapEntry.new_subsys).ToUpper() }
+                    elseif ($mapEntry.PSObject.Properties['subsys_new']) { $expectedSubsys = ([string]$mapEntry.subsys_new).ToUpper() }
+
+                    if ($null -eq $expectedSubsys) {
+                        Write-Info ("{0}\{1} : mapping sem subsys_new - schema inesperado" -f $s.VenDev, $s.InstanceName)
+                    } elseif ($currentSubsys -eq $expectedSubsys) {
+                        Write-OK ("{0}\{1} : SUBSYS={2}" -f $s.VenDev, $s.InstanceName, $currentSubsys)
+                    } else {
+                        Write-Gap ("{0}\{1} : SUBSYS actual={2}  mapping={3}" -f $s.VenDev, $s.InstanceName, $currentSubsys, $expectedSubsys)
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ============================================================
+#  16. Volume GUIDs (registry cache) vs volume-guid-backup
+#
+#  EMAC le HKLM\SYSTEM\CurrentControlSet\Enum\STORAGE\Volume\{GUID}#offset
+#  pra colecionar 3 GUIDs de volume. spoof-volume-guid.ps1 gera novos
+#  GUIDs para volumes NAO-boot e reescreve Enum + MountedDevices.
+#  CRITICO: boot volume nunca eh spoofado. Aqui excluimos ele e comparamos
+#  drive letters restantes contra o backup mapping.
+# ============================================================
+Write-Section "Volume GUIDs vs volume-guid-backup"
+
+$volMapPath = "C:\ProgramData\.hwcfg\volume-guid-backup.json"
+if (-not (Test-Path $volMapPath)) {
+    Write-Info "volume-guid-backup.json ausente - spoof-volume-guid.ps1 ainda nao rodou."
+} else {
+    $volMap = $null
+    try {
+        $volMap = Get-Content $volMapPath -Raw | ConvertFrom-Json
+    } catch {
+        Write-Warn ("volume-guid-backup.json ilegivel: {0}" -f $_.Exception.Message)
+    }
+
+    if ($volMap) {
+        $bootLetter = ($env:SystemDrive).TrimEnd(':').ToUpper()
+
+        # Obter drive letter -> GUID atual usando GetVolumeNameForVolumeMountPoint.
+        # Assinatura P/Invoke definida inline.
+        if (-not ("HwtVolApi" -as [type])) {
+            $sig = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class HwtVolApi {
+    [DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)]
+    public static extern bool GetVolumeNameForVolumeMountPoint(
+        string lpszVolumeMountPoint,
+        StringBuilder lpszVolumeName,
+        int cchBufferLength);
+}
+"@
+            try { Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue } catch { }
+        }
+
+        # Enumera drive letters fixos.
+        $drives = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DriveType -eq 3 }
+        foreach ($dr in $drives) {
+            $letter = ([string]$dr.DeviceID).TrimEnd(':').ToUpper()
+            if ($letter -eq $bootLetter) {
+                Write-Info ("{0}: : boot volume - skip (nunca deve ser spoofado)" -f $letter)
+                continue
+            }
+
+            $mount = "$letter" + ":\"
+            $sb = New-Object System.Text.StringBuilder 260
+            $ok = $false
+            try { $ok = [HwtVolApi]::GetVolumeNameForVolumeMountPoint($mount, $sb, $sb.Capacity) } catch { }
+            if (-not $ok) {
+                Write-Info ("{0}: : GetVolumeNameForVolumeMountPoint falhou" -f $letter)
+                continue
+            }
+            $volName = $sb.ToString()
+            # Formato: \\?\Volume{GUID}\ - extrai o GUID.
+            $currentGuid = $null
+            if ($volName -match 'Volume\{([0-9a-fA-F\-]+)\}') {
+                $currentGuid = $matches[1].ToLower()
+            }
+            if ($null -eq $currentGuid) {
+                Write-Info ("{0}: : sem GUID em `"{1}`"" -f $letter, $volName)
+                continue
+            }
+
+            # spoof-volume-guid.ps1 salva backup como:
+            #   { schema, timestamp, boot_guid, entries: [ {drive, old, new}, ... ] }
+            $volEntries = @()
+            if ($volMap.PSObject.Properties['entries']) {
+                $volEntries = @($volMap.entries)
+            }
+            $entry = $null
+            foreach ($v in $volEntries) {
+                if (-not $v) { continue }
+                $dl = $null
+                if ($v.PSObject.Properties['drive']) { $dl = [string]$v.drive }
+                elseif ($v.PSObject.Properties['drive_letter']) { $dl = [string]$v.drive_letter }
+                elseif ($v.PSObject.Properties['letter']) { $dl = [string]$v.letter }
+                if ($dl -and $dl.TrimEnd(':').ToUpper() -eq $letter) { $entry = $v; break }
+            }
+
+            if (-not $entry) {
+                Write-Info ("{0}: : GUID={1} - drive nao consta em volume-guid-backup" -f $letter, $currentGuid)
+                continue
+            }
+
+            $expected = $null
+            if ($entry.PSObject.Properties['new']) { $expected = ([string]$entry.new).ToLower().Trim('{','}') }
+            elseif ($entry.PSObject.Properties['new_guid']) { $expected = ([string]$entry.new_guid).ToLower().Trim('{','}') }
+            if ($null -eq $expected) {
+                Write-Info ("{0}: : entry sem campo 'new' - schema inesperado" -f $letter)
+                continue
+            }
+
+            if ($currentGuid -eq $expected) {
+                Write-OK ("{0}: : GUID={{{1}}}" -f $letter, $currentGuid)
+            } else {
+                Write-Gap ("{0}: : GUID actual={{{1}}}  mapping new={{{2}}}" -f $letter, $currentGuid, $expected)
+            }
+        }
     }
 }
 

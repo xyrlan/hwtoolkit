@@ -1,13 +1,13 @@
 #Requires -RunAsAdministrator
 # ============================================================
-#  HWID Changer v3.6 (schema v7) - Profile-Based
+#  HWID Changer v3.7 (schema v8) - Profile-Based
 #
-#  Escopo reduzido em v3.5.1:
+#  Escopo em v3.7 (Fase 1.6):
 #    - Somente MAC addresses (OUI real, sem bit LA).
-#    - Machine GUID / SQM Machine ID / Product ID REMOVIDOS
-#      (Fase 1.5): EMAC nao le esses campos, e re-escrever
-#      cria diff detectavel contra o baseline do Windows sem
-#      qualquer beneficio de anti-fingerprint.
+#    - Machine GUID / ComputerName / TCPIP Hostname REINSERIDOS
+#      em v3.7 mas aplicados por spoof-windows-id.ps1 (nao aqui).
+#    - SQM Machine ID / Product ID NAO restaurados (recon v2
+#      confirmou zero leituras EMAC).
 #    - EDID serial partial REMOVIDO: spoof-edid-full.ps1
 #      cobre isso com bloco 0xFF + descritores completos.
 # ============================================================
@@ -18,7 +18,7 @@ $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 
 # ---- Carregar profile ----
 Write-Host ""
-Write-Host "=== HWID Changer v3.6 (Profile-Based) ===" -ForegroundColor Cyan
+Write-Host "=== HWID Changer v3.7 (Profile-Based) ===" -ForegroundColor Cyan
 
 if (-not (Test-Path $profilePath)) {
     Write-Host "  [X] Profile nao encontrado!" -ForegroundColor Red
@@ -31,17 +31,17 @@ if (-not (Test-Path $profilePath)) {
 $prof = Get-Content $profilePath -Raw | ConvertFrom-Json
 $net = $prof.network
 
-# Schema version guard (v3.6 = schema v7; ainda aceita v6 legado)
+# Schema version guard (v3.7 = schema v8; ainda aceita v6/v7 legado)
 $profVer = 0
 if ($prof.PSObject.Properties['version']) {
     [int]::TryParse([string]$prof.version, [ref]$profVer) | Out-Null
 }
 Write-Host "  [OK] Profile carregado (v$profVer)" -ForegroundColor Green
 if ($profVer -lt 6) {
-    Write-Host "  [!] Profile schema v$profVer detectado; recomendado v7+ (v3.6)." -ForegroundColor Yellow
-    Write-Host "  [!] Campos legado (windows.*) sao ignorados; regenere com 00-gerar-profile.bat." -ForegroundColor Yellow
-} elseif ($profVer -eq 6) {
-    Write-Host "  [i] Profile v6 legado — ainda funciona, mas regenere para v7 quando puder." -ForegroundColor DarkGray
+    Write-Host "  [!] Profile schema v$profVer detectado; recomendado v8+ (v3.7)." -ForegroundColor Yellow
+    Write-Host "  [!] Regenere com 00-gerar-profile.bat para habilitar Fase 1.6." -ForegroundColor Yellow
+} elseif ($profVer -lt 8) {
+    Write-Host "  [i] Profile v$profVer legado — ainda funciona, mas regenere para v8 para Fase 1.6." -ForegroundColor DarkGray
 }
 if (-not $net) {
     Write-Host "  [X] Profile nao contem bloco 'network' - regenere o profile." -ForegroundColor Red

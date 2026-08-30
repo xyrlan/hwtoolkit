@@ -9,14 +9,31 @@
     devem ler deste perfil ao inves de gerar valores aleatorios independentemente.
 .NOTES
     Localizacao do perfil: C:\ProgramData\.hwcfg\profile.json
-    Schema v7 — remove bloco 'storage' (seed_b64, serial_prefix,
+
+    Schema v8 (recon v2 - correcao):
+      - RESTAURA bloco 'windows' (parcial): machine_guid, computer_name,
+        tcpip_hostname. Recon v2 via procmon confirmou que EMAC LE
+        HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+        e HKLM\System\...\ComputerName + Tcpip\Parameters\Hostname.
+        NAO restaura sqm_machine_id / product_id / hardware_config
+        (recon v2 confirmou zero leituras EMAC nesses caminhos).
+      - ADICIONA bloco 'disk' com pool de vendor+product realistas para
+        reescrita das chaves Enum\SCSI\Disk&Ven_*&Prod_* (spoof-disk-registry).
+      - ADICIONA bloco 'pci_hardwareid' com seed para spoof de SUBSYS+REV nos
+        HardwareID granulares sob Enum\PCI\VEN_*&DEV_*. Nao mexe em VEN/DEV/CC
+        (bindings de driver quebram).
+      - ADICIONA bloco 'volume' com pool de GUIDs para spoof de
+        Enum\STORAGE\Volume\{GUID} e MountedDevices. CRITICO: boot volume
+        NUNCA e spoofado (brick garantido).
+
+    Schema v7 removeu bloco 'storage' (seed_b64, serial_prefix,
     serial_length). O driver rstflt v3.6 nao intercepta mais IOCTLs
     de storage (fonte historica de BSOD); a spoofagem de serial de
     disco foi removida do toolkit. EMAC nao consome serial de disco
     via IOCTL, entao o custo (BSOD) > beneficio.
     Schema v6 removeu bloco 'windows' (machine_guid, sqm_machine_id,
-    product_id): EMAC nao le esses campos, e a reescrita criava diff
-    detectavel contra baseline do Windows sem ganho de anti-fingerprint.
+    product_id) — v8 reverte essa remocao APENAS para os campos que
+    recon v2 confirmou serem lidos pelo EMAC.
     Schema v5 adicionou audio (rotation pool), monitor EDID completo,
     e emac (UUID persistente falso).
 #>
@@ -115,6 +132,28 @@ $MonitorBrands = @(
 )
 
 # ============================================================
+#  Banco de dados de discos (SCSI Enum)
+# ============================================================
+# Pool de vendor+product realistas para reescrita das chaves
+# HKLM\SYSTEM\CurrentControlSet\Enum\SCSI\Disk&Ven_<vendor>&Prod_<product>.
+# Convencoes:
+#  - NVMe reais geralmente reportam vendor VAZIO (Prod carrega a marca).
+#  - SATA reais reportam vendor curto (ex.: "SAMSUNG", "WDC") + Prod com modelo.
+#  - Nomes reais observados: Kingston SA400S3, ADATA IM2P33F3, XPG GAMMIX S70 B.
+# Underscores no Prod imitam o formato real do enum PnP (espacos -> "_").
+$DiskPool = @(
+    @{ vendor = "";        product = "SAMSUNG_MZVLB512HAJQ";      class = "NVMe" }
+    @{ vendor = "";        product = "WDC_WDS500G2B0C-00PXH0";    class = "NVMe" }
+    @{ vendor = "";        product = "CT500P2SSD8";               class = "NVMe" }  # Crucial P2
+    @{ vendor = "";        product = "KINGSTON_SNVS500G";         class = "NVMe" }
+    @{ vendor = "";        product = "SEAGATE_FIRECUDA_530";      class = "NVMe" }
+    @{ vendor = "";        product = "TEAM_MP34_500G";            class = "NVMe" }
+    @{ vendor = "";        product = "SAMSUNG_SSD_870_EVO_500G";  class = "SATA" }
+    @{ vendor = "";        product = "WDC_WDS500G3B0A-00CL30";    class = "SATA" }
+    @{ vendor = "";        product = "CT500MX500SSD1";            class = "SATA" }  # Crucial MX500
+)
+
+# ============================================================
 #  Funções auxiliares
 # ============================================================
 
@@ -122,7 +161,7 @@ function Show-Banner {
     Write-Host ""
     Write-Host "  ╔══════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
     Write-Host "  ║        HWPROFILE  -  Gerador de Perfil HW       ║" -ForegroundColor DarkCyan
-    Write-Host "  ║            Perfil centralizado v7               ║" -ForegroundColor DarkCyan
+    Write-Host "  ║            Perfil centralizado v8               ║" -ForegroundColor DarkCyan
     Write-Host "  ╚══════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
     Write-Host ""
 }
@@ -160,6 +199,12 @@ function Get-CryptoRandomHex {
     $bytes = Get-CryptoRandomBytes -Count $needed
     $hex = ($bytes | ForEach-Object { $_.ToString("X2") }) -join ""
     return $hex.Substring(0, $Length)
+}
+
+function Get-CryptoRandomHexLower {
+    # Retorna string hexadecimal aleatória com N caracteres (minúsculo)
+    param([int]$Length)
+    return (Get-CryptoRandomHex -Length $Length).ToLower()
 }
 
 function Get-CryptoRandomDigits {
@@ -238,8 +283,15 @@ function New-GuidLower {
 
 function New-GuidBracesLower {
     # Gera GUID em minusculas com chaves — formato usado nas chaves MMDevices
+    # e nas chaves Enum\STORAGE\Volume + MountedDevices.
     $g = New-GuidLower
     return "{$g}"
+}
+
+function New-ComputerName {
+    # Gera nome NetBIOS estilo Windows OOBE: DESKTOP-XXXXXXX (7 alnum uppercase).
+    # NetBIOS limita nomes a 15 chars; DESKTOP- (8) + 7 = 15 exatos.
+    return "DESKTOP-" + (Get-CryptoRandomAlnum -Count 7)
 }
 
 function Get-CryptoRandomItem {
@@ -419,6 +471,17 @@ function Invoke-Generate {
         }
     }
 
+    # ---- Windows identifiers (schema v8, restaurado parcial) ----
+    # Recon v2 confirmou que EMAC LE:
+    #  - HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid  (UUID lowercase)
+    #  - HKLM\System\CurrentControlSet\Control\ComputerName\ActiveComputerName\ComputerName
+    #  - HKLM\System\CurrentControlSet\Services\Tcpip\Parameters\Hostname
+    # NAO ha leituras EMAC em SqmMachineId / ProductId / HardwareConfig,
+    # entao esses NAO sao restaurados.
+    $machineGuid    = New-UUIDv4  # lowercase (New-UUIDv4 emite lowercase)
+    $computerName   = New-ComputerName
+    $tcpipHostname  = $computerName  # spec permite diferir, mas Windows os mantem alinhados
+
     # ---- Monitor EDID (schema v5, completo) ----
     # Escolhe marca primeiro, depois modelo pertencente a essa marca para
     # que anti-cheat que hash o EDID inteiro nao veja combinacoes impossiveis
@@ -461,9 +524,39 @@ function Invoke-Generate {
     # Manter constante e proteger com ACL para evitar burst de re-registration.
     $emacUuid = New-UUIDv4
 
+    # ---- Disk pool (schema v8) ----
+    # Snapshot do pool disponivel; spoof-disk-registry.ps1 escolhe N entradas
+    # (uma por disco fisico detectado) na execucao.
+    $diskDrives = @()
+    foreach ($d in $DiskPool) {
+        $diskDrives += [ordered]@{
+            vendor  = $d.vendor
+            product = $d.product
+            class   = $d.class
+        }
+    }
+
+    # ---- PCI HardwareID (schema v8) ----
+    # 128-bit seed (32 hex chars) para FNV/PRNG deterministico usado por
+    # spoof-pci-hardwareid.ps1 ao derivar SUBSYS+REV falsos por device real.
+    # Deterministico = ao rodar o spoofer novamente, mesma VEN&DEV -> mesmo
+    # SUBSYS falso (evita rotacao acidental entre reboots).
+    $pciSeed = Get-CryptoRandomHexLower -Length 32
+
+    # ---- Volume GUID pool (schema v8) ----
+    # 32 GUIDs frescos com chaves para spoof-volume-guid.ps1 alocar em volumes
+    # SECUNDARIOS. Boot volume (C:) NUNCA e spoofado — spoofer deve pular.
+    # 32 cobre workstations com muitos volumes (Storage Spaces, VHDs mount,
+    # containers) sem cair no fallback New-Guid on-the-fly (que quebraria
+    # determinismo entre reruns).
+    $volumePool = @()
+    for ($i = 0; $i -lt 32; $i++) {
+        $volumePool += New-GuidBracesLower
+    }
+
     # Montar o objeto do perfil
     $prof = [ordered]@{
-        version        = 7
+        version        = 8
         generated_utc  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         cpu_detected   = $cpuName
         socket_matched = $socket
@@ -500,6 +593,19 @@ function Invoke-Generate {
             oem_strings          = @("Default string", "Default string")
         }
         network = $networkEntries
+        windows = [ordered]@{
+            # MachineGuid: Windows gera na instalacao e nunca rotaciona.
+            # EMAC le em HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid.
+            # Formato: UUID v4 lowercase SEM chaves.
+            machine_guid    = $machineGuid
+            # ComputerName: EMAC le ActiveComputerName.
+            # NetBIOS max 15 chars; formato OOBE Windows: "DESKTOP-<7 alnum>".
+            computer_name   = $computerName
+            # TCP/IP Hostname: EMAC le Services\Tcpip\Parameters\Hostname.
+            # Windows OOBE mantem hostname == computer_name; o spec RFC permite
+            # diferir mas isso levanta flag por si so.
+            tcpip_hostname  = $tcpipHostname
+        }
         monitor = [ordered]@{
             mfr_pnp_id   = $mfrPnP
             product_code = $productCode
@@ -522,6 +628,29 @@ function Invoke-Generate {
             # Habilitar ACL lock no arquivo emac-uuid (o applier bloqueia
             # escrita/delete pelo processo do jogo).
             lock_file       = $true
+        }
+        disk = [ordered]@{
+            # Pool de vendor+product para spoof-disk-registry.ps1.
+            # O spoofer escolhe N entradas (uma por disco fisico) na execucao.
+            # Cada entrada: { vendor, product, class }.
+            # NOTA: o SCSI enum path e Disk&Ven_<vendor>&Prod_<product>;
+            # vendor vazio para NVMe e a norma real.
+            drives = $diskDrives
+        }
+        pci_hardwareid = [ordered]@{
+            # Seed 128-bit deterministico para spoof-pci-hardwareid.ps1.
+            # O spoofer deriva SUBSYS+REV por VEN&DEV usando FNV(seed, ven_dev).
+            # Mesmo seed => mesmo SUBSYS entre execucoes (evita rotacao entre
+            # boots). Regenerar seed = perfil novo.
+            # NAO mexer em VEN/DEV/CC (class code) — bindings de driver quebram.
+            randomize_seed = $pciSeed
+        }
+        volume = [ordered]@{
+            # Pool de GUIDs para spoof-volume-guid.ps1 alocar em volumes
+            # SECUNDARIOS (D:, E:, ...). Boot volume (C:) NUNCA e spoofado —
+            # brick garantido se o Windows nao encontrar o BootDevice na
+            # proxima inicializacao.
+            rotation_pool = $volumePool
         }
     }
 
@@ -889,6 +1018,120 @@ function Invoke-Validate {
         $passed++
     }
 
+    # 11. Windows block (schema v8) — machine_guid, computer_name, tcpip_hostname
+    $checks++
+    $win = $prof.windows
+    if (-not $win) {
+        Write-Host "  [AVISO] Secao windows ausente. Rode -Generate para atualizar (schema v8)." -ForegroundColor Yellow
+        $passed++
+    } else {
+        $winOk = $true
+        # machine_guid: UUID v4 lowercase, sem chaves
+        $mg = $win.machine_guid
+        if (-not $mg -or $mg -notmatch $uuidv4Pattern) {
+            Write-Host "  [FALHA] windows.machine_guid nao e v4 lowercase valido: '$mg'" -ForegroundColor Red
+            $winOk = $false
+        }
+        # computer_name: 1..15 chars, alnum + hyphen (NetBIOS)
+        $cn = $win.computer_name
+        if (-not $cn -or $cn.Length -lt 1 -or $cn.Length -gt 15 -or $cn -notmatch "^[A-Za-z0-9-]+$") {
+            Write-Host "  [FALHA] windows.computer_name invalido: '$cn' (1..15 chars alnum+hyphen)" -ForegroundColor Red
+            $winOk = $false
+        }
+        # tcpip_hostname: mesmas regras
+        $th = $win.tcpip_hostname
+        if (-not $th -or $th.Length -lt 1 -or $th.Length -gt 15 -or $th -notmatch "^[A-Za-z0-9-]+$") {
+            Write-Host "  [FALHA] windows.tcpip_hostname invalido: '$th' (1..15 chars alnum+hyphen)" -ForegroundColor Red
+            $winOk = $false
+        }
+        if ($winOk) {
+            Write-Host "  [OK]    windows: machine_guid=$mg, name=$cn, host=$th" -ForegroundColor Green
+            $passed++
+        } else {
+            $allPassed = $false
+        }
+    }
+
+    # 12. Disk pool (schema v8) — pelo menos 1 entrada com vendor/product
+    $checks++
+    $dsk = $prof.disk
+    if (-not $dsk -or -not $dsk.drives) {
+        Write-Host "  [AVISO] Secao disk ausente. Rode -Generate para atualizar (schema v8)." -ForegroundColor Yellow
+        $passed++
+    } else {
+        $drives = @($dsk.drives)
+        if ($drives.Count -lt 1) {
+            Write-Host "  [FALHA] disk.drives esta vazio" -ForegroundColor Red
+            $allPassed = $false
+        } else {
+            $drOk = $true
+            foreach ($d in $drives) {
+                # vendor pode ser string vazia (NVMe), mas a propriedade tem que existir
+                $vendor  = if ($d -is [PSCustomObject]) { $d.vendor }  else { $d["vendor"] }
+                $product = if ($d -is [PSCustomObject]) { $d.product } else { $d["product"] }
+                if ($null -eq $vendor) {
+                    Write-Host "  [FALHA] disk.drives entry sem campo 'vendor'" -ForegroundColor Red
+                    $drOk = $false
+                }
+                if (-not $product -or $product.Length -lt 1) {
+                    Write-Host "  [FALHA] disk.drives entry com 'product' vazio" -ForegroundColor Red
+                    $drOk = $false
+                }
+            }
+            if ($drOk) {
+                Write-Host "  [OK]    disk.drives tem $($drives.Count) entrada(s) valida(s)" -ForegroundColor Green
+                $passed++
+            } else {
+                $allPassed = $false
+            }
+        }
+    }
+
+    # 13. PCI HardwareID seed (schema v8) — 32 hex chars
+    $checks++
+    $pci = $prof.pci_hardwareid
+    if (-not $pci -or -not $pci.randomize_seed) {
+        Write-Host "  [AVISO] Secao pci_hardwareid ausente. Rode -Generate para atualizar (schema v8)." -ForegroundColor Yellow
+        $passed++
+    } else {
+        $seed = $pci.randomize_seed
+        if ($seed -match "^[0-9a-fA-F]{32}$") {
+            Write-Host "  [OK]    pci_hardwareid.randomize_seed valido (128-bit): $seed" -ForegroundColor Green
+            $passed++
+        } else {
+            Write-Host "  [FALHA] pci_hardwareid.randomize_seed invalido: '$seed' (esperado: 32 hex chars)" -ForegroundColor Red
+            $allPassed = $false
+        }
+    }
+
+    # 14. Volume rotation pool (schema v8) — >=4 GUIDs validos com chaves
+    $checks++
+    $vol = $prof.volume
+    if (-not $vol -or -not $vol.rotation_pool) {
+        Write-Host "  [AVISO] Secao volume ausente. Rode -Generate para atualizar (schema v8)." -ForegroundColor Yellow
+        $passed++
+    } else {
+        $vpool = @($vol.rotation_pool)
+        if ($vpool.Count -lt 4) {
+            Write-Host "  [FALHA] volume.rotation_pool tem $($vpool.Count) entradas (min: 4)" -ForegroundColor Red
+            $allPassed = $false
+        } else {
+            $vpOk = $true
+            foreach ($g in $vpool) {
+                if ($g -notmatch $guidBracesPattern) {
+                    Write-Host "  [FALHA] volume.rotation_pool contem GUID invalido: '$g'" -ForegroundColor Red
+                    $vpOk = $false
+                }
+            }
+            if ($vpOk) {
+                Write-Host "  [OK]    volume.rotation_pool tem $($vpool.Count) GUIDs validos" -ForegroundColor Green
+                $passed++
+            } else {
+                $allPassed = $false
+            }
+        }
+    }
+
     # Resultado final
     Write-Host ""
     Write-Host "  ──────────────────────────────────────────────────" -ForegroundColor DarkGray
@@ -913,9 +1156,13 @@ function Show-ProfileData {
     # Acessar dados de forma compatível com PSCustomObject e Hashtable
     $smbios  = if ($p -is [PSCustomObject]) { $p.smbios }  else { $p["smbios"] }
     $network = if ($p -is [PSCustomObject]) { $p.network } else { $p["network"] }
+    $windows = if ($p -is [PSCustomObject]) { $p.windows } else { $p["windows"] }
     $monitor = if ($p -is [PSCustomObject]) { $p.monitor } else { $p["monitor"] }
     $audio   = if ($p -is [PSCustomObject]) { $p.audio }   else { $p["audio"] }
     $emac    = if ($p -is [PSCustomObject]) { $p.emac }    else { $p["emac"] }
+    $disk    = if ($p -is [PSCustomObject]) { $p.disk }    else { $p["disk"] }
+    $pci     = if ($p -is [PSCustomObject]) { $p.pci_hardwareid } else { $p["pci_hardwareid"] }
+    $volume  = if ($p -is [PSCustomObject]) { $p.volume }  else { $p["volume"] }
 
     $version = if ($p -is [PSCustomObject]) { $p.version }       else { $p["version"] }
     $genUtc  = if ($p -is [PSCustomObject]) { $p.generated_utc } else { $p["generated_utc"] }
@@ -978,6 +1225,22 @@ function Show-ProfileData {
         Write-Host $macFormatted -ForegroundColor White
     }
     Write-Host ""
+
+    # Windows identifiers (schema v8)
+    if ($windows) {
+        Write-Host "  --- Windows Identifiers ---" -ForegroundColor Cyan
+        $mg  = if ($windows -is [PSCustomObject]) { $windows.machine_guid }   else { $windows["machine_guid"] }
+        $cn  = if ($windows -is [PSCustomObject]) { $windows.computer_name }  else { $windows["computer_name"] }
+        $th  = if ($windows -is [PSCustomObject]) { $windows.tcpip_hostname } else { $windows["tcpip_hostname"] }
+        Write-Host "  MachineGuid          : " -NoNewline -ForegroundColor Gray
+        Write-Host $mg -ForegroundColor White
+        Write-Host "  Computer Name        : " -NoNewline -ForegroundColor Gray
+        Write-Host $cn -ForegroundColor White
+        Write-Host "  Tcpip Hostname       : " -NoNewline -ForegroundColor Gray
+        Write-Host $th -ForegroundColor White
+        Write-Host "  (aplicado por spoof-windows-id.ps1)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
 
     # Monitor / EDID (schema v5, completo)
     if ($monitor) {
@@ -1050,6 +1313,59 @@ function Show-ProfileData {
         Write-Host "  ACL lock file        : " -NoNewline -ForegroundColor Gray
         Write-Host $lock -ForegroundColor White
         Write-Host "  (substitui C:\Users\<user>\emac-uuid — NAO deletar)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Disk pool (schema v8)
+    if ($disk) {
+        Write-Host "  --- Disk Pool (SCSI Enum) ---" -ForegroundColor Cyan
+        $drives = if ($disk -is [PSCustomObject]) { $disk.drives } else { $disk["drives"] }
+        if ($drives) {
+            $drives = @($drives)
+            Write-Host "  Pool size            : " -NoNewline -ForegroundColor Gray
+            Write-Host "$($drives.Count) drive(s)" -ForegroundColor White
+            for ($i = 0; $i -lt $drives.Count; $i++) {
+                $d = $drives[$i]
+                $v = if ($d -is [PSCustomObject]) { $d.vendor }  else { $d["vendor"] }
+                $pr= if ($d -is [PSCustomObject]) { $d.product } else { $d["product"] }
+                $c = if ($d -is [PSCustomObject]) { $d.class }   else { $d["class"] }
+                $vLbl = if ([string]::IsNullOrEmpty($v)) { "(empty)" } else { $v }
+                $label = ("  [$($i+1)] $c").PadRight(22)
+                Write-Host "$label : " -NoNewline -ForegroundColor Gray
+                Write-Host "Ven=$vLbl Prod=$pr" -ForegroundColor White
+            }
+            Write-Host "  (aplicado por spoof-disk-registry.ps1)" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+    }
+
+    # PCI HardwareID seed (schema v8)
+    if ($pci) {
+        Write-Host "  --- PCI HardwareID Spoof Seed ---" -ForegroundColor Cyan
+        $seed = if ($pci -is [PSCustomObject]) { $pci.randomize_seed } else { $pci["randomize_seed"] }
+        Write-Host "  Randomize seed       : " -NoNewline -ForegroundColor Gray
+        Write-Host $seed -ForegroundColor White
+        Write-Host "  (128-bit seed FNV/PRNG — deterministico por VEN&DEV)" -ForegroundColor DarkGray
+        Write-Host "  (aplicado por spoof-pci-hardwareid.ps1 — apenas SUBSYS+REV)" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    # Volume GUID pool (schema v8)
+    if ($volume) {
+        Write-Host "  --- Volume GUID Pool ---" -ForegroundColor Cyan
+        $vpool = if ($volume -is [PSCustomObject]) { $volume.rotation_pool } else { $volume["rotation_pool"] }
+        if ($vpool) {
+            $vpool = @($vpool)
+            Write-Host "  Pool size            : " -NoNewline -ForegroundColor Gray
+            Write-Host "$($vpool.Count) GUID(s) disponiveis" -ForegroundColor White
+            for ($i = 0; $i -lt $vpool.Count; $i++) {
+                $label = ("  [$($i+1)] GUID").PadRight(22)
+                Write-Host "$label : " -NoNewline -ForegroundColor Gray
+                Write-Host $vpool[$i] -ForegroundColor White
+            }
+            Write-Host "  (aplicado por spoof-volume-guid.ps1 — SOMENTE volumes secundarios)" -ForegroundColor DarkGray
+            Write-Host "  (boot volume C: NUNCA e spoofado — brick garantido)" -ForegroundColor DarkYellow
+        }
         Write-Host ""
     }
 }
