@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Gerencia o arquivo de cache do EMAC anti-cheat (~\emac-uuid).

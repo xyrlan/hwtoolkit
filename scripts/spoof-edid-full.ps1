@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 # ============================================================
 #  EDID Full Spoof v1 - GAP #4 (post-BSOD hardening v3.5)
 #

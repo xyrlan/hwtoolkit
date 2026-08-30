@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Reescreve HardwareID / CompatibleIDs granulares em Enum\PCI\* - Fase 1.6.

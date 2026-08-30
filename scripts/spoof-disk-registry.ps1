@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Reescreve entradas Enum\SCSI\Disk&Ven_*&Prod_* no registro para spoofar

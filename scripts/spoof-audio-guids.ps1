@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Rotaciona GUIDs de endpoints de audio (MMDevices) - GAP #3a.
