@@ -279,6 +279,28 @@ function Build-SmbiosBlob {
         }
     }
 
+    # v4.0.10 hardening: recomputar o DWORD LE de raw-table-size no
+    # wrapper mssmbios (bytes 4-7). O firmware original devolve o
+    # wrapper com esse campo apontando pro tamanho do raw SMBIOS que
+    # vem logo depois; se a gente reemite strings de tamanho diferente,
+    # o total muda e o campo antigo passa a mentir. Isso NAO era a
+    # causa raiz do 0x03 VALIDATION-FAIL (o validador do driver nunca
+    # le esse campo — usa DataLength do REG_BINARY), mas o mssmbios
+    # ler o wrapper stale pode causar over-read/under-read do raw
+    # table na hora do consumo. Ver docs/postmortem-v4-phase5/
+    # incident-v410-smbios-validator-scan-window.md secao "Latent bugs".
+    #
+    # Assume wrapper de 8 bytes (Used21CallingMethod, Major, Minor,
+    # DmiRev, RawSize DWORD LE). Se o Header passado tem tamanho
+    # diferente de 8, pula esse fix — layout desconhecido.
+    if ($Header.Length -eq 8 -and $result.Count -ge 8) {
+        $rawLen = $result.Count - 8
+        $result[4] = [byte]($rawLen -band 0xFF)
+        $result[5] = [byte](($rawLen -shr 8)  -band 0xFF)
+        $result[6] = [byte](($rawLen -shr 16) -band 0xFF)
+        $result[7] = [byte](($rawLen -shr 24) -band 0xFF)
+    }
+
     return ,$result.ToArray()
 }
 
