@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo   PASSO 2 - Compilando rstflt.sys (driver v4.0.6)
+echo   PASSO 2 - Compilando rstflt.sys (driver v4.0.10)
 echo ========================================================
 echo.
 

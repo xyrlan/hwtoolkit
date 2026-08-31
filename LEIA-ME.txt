@@ -305,6 +305,127 @@ Profile:
   - ~10 GB livres (para VS Build Tools + WDK)
 
 ========================================================
+  MUDANCAS EM v4.0.10 (ValidateSmbiosBlob scan window + Build-SmbiosBlob wrapper size)
+========================================================
+
+  v4.0.10 - Fix do ValidateSmbiosBlob no driver que rejeitava spuriamente
+            TODO blob SMBIOS reconstruido pelo scripts\spoof-smbios.ps1
+            em Hyper-V (e provavelmente na maioria dos hosts Windows
+            modernos). O breadcrumb LastReplayStatus=0x0300003E que a
+            v4.0.9 gerava era esse falso rejeito: o driver rejeitava o
+            blob ANTES de sequer tentar escrever no mssmbios\Data.
+            Doc principal: docs/postmortem-v4-phase5/incident-v410-smbios-validator-scan-window.md
+
+  Causa (scan window):
+    O scan inicial do validador procurava um cabecalho SMBIOS
+    (Type 0/1/2/3, Length>=4) nos primeiros 64 bytes do blob,
+    comecando em offset 0. Mas os primeiros 8 bytes do blob que
+    o driver le do registro sao o wrapper mssmbios documentado:
+      [0]  Used21CallingMethod
+      [1]  MajVer
+      [2]  MinVer
+      [3]  DmiRev              (valor 0-3 em Windows moderno)
+      [4]  ULONG rawSize LE    (bytes 4..7 = tamanho da tabela)
+    O byte 3 (DmiRev) casava com Type 0/1/2/3, e o byte 4 (low
+    byte de rawSize DWORD, >=4 pra qualquer tabela nao-vazia)
+    casava com o gate Length>=4. A heuristica dava match e
+    tableStart colava em 3 em vez de 8. Consequencia: o walker
+    das structs rodava tres bytes cedo, nunca alcancava o Type
+    127 (End-of-Table), e ValidateSmbiosBlob retornava FALSE.
+
+  Fix:
+    - driver/rstflt.c linha 432: loop de scan mudou de
+        for (i = 0; ...)
+      para
+        for (i = 8; ...)
+      Ou seja: pula o wrapper mssmbios documentado antes de
+      procurar o primeiro header SMBIOS. Impacto zero em blobs
+      sem wrapper (nao existe em Windows moderno).
+    - driver/rstflt.c linha 442: fallback endurecido de
+        tableStart == 0 && Blob[0] > 127
+      para
+        tableStart == 0
+      Bloqueia definitivamente qualquer blob onde o scan nao
+      achou header valido, em vez de aceitar por chute.
+    - scripts/spoof-smbios.ps1 Build-SmbiosBlob: agora
+      recomputa os 4 bytes de raw-size do wrapper (bytes 4..7)
+      APOS reemitir as structs Types 1/2/3/4/11. Antes ficava
+      stale apontando pro tamanho original do firmware, o que
+      podia dessincronizar o wrapper do payload real e trigar
+      falhas de walker fora do driver (ex: WMI parsers).
+    - scripts/test-smbios-blob.ps1 (novo): porta ValidateSmbiosBlob
+      pro PowerShell pra rodar offline. Modos disponiveis:
+        -Live       le mssmbios\Data\SMBiosData e valida
+        -Cached     le RstFlt\Parameters\SmbiosBlob e valida
+        -File <p>   valida arquivo binario em disco
+        -Synthetic  gera blob sintetico Hyper-V-like pra
+                    validar que o proprio fix da v4.0.10
+                    funciona sem instalar driver
+    - scripts/spoof-smbios.ps1 Step 10c: agora liga
+      Parameters\EnableCpuReplay=1 junto com CpuStrings quando o
+      combined arm (sem flags) e usado. Bug historico descoberto na
+      verificacao in-VM de v4.0.10: pre-fix, o combined arm cacheava
+      CpuStrings mas NUNCA setava EnableCpuReplay=1, entao o
+      IsCpuReplayEnabled() do driver retornava FALSE em DriverEntry
+      e o worker de CpuReplay nem era enfileirado. Resultado: usuario
+      "sente" que armou tudo, mas CPU vazava silenciosamente. Ver
+      secao "Second latent bug" no postmortem v4.0.10 para trace
+      completo.
+    - scripts/spoof-smbios.ps1 -DisableKernelReplay cleanup: agora
+      remove tambem EnableCpuReplay junto com CpuStrings. Antes de
+      v4.0.10 essa remocao era implicita (a flag nunca era setada,
+      entao nao precisava limpar). Agora que Step 10c liga a flag,
+      o cleanup precisa remover.
+    - Marker RstFltVersion bumpou pra RstFlt-v4.0.10-BUILD-MARKER.
+
+  Como validar apos update:
+    .\02-compilar-driver.bat
+    .\03-instalar-driver.bat
+    # Reiniciar
+    .\scripts\spoof-smbios.ps1 -SmbiosOnly
+    # Reiniciar
+    .\scripts\check-consistency.ps1
+
+    Esperado apos o segundo reboot:
+      LastReplayStatus=0x04000000  (tag 0x04 MSSMBIOS-OPEN-FAIL)
+    Esse e o steady state documentado em Hyper-V porque o
+    mssmbios.sys e SYSTEM_START (Start=1) e sua chave Data
+    ainda nao existe quando nosso BOOT_START RstFlt roda.
+    Nao e bug: e a evidencia de que passamos da validacao e
+    tentamos a escrita no momento certo (so nao encontramos
+    o alvo por race natural com o load order).
+
+    NAO deve mais aparecer 0x0300003E. Se ainda aparecer, ver
+    docs\postmortem-v4-phase5\incident-v410-smbios-validator-scan-window.md.
+
+  O que este fix NAO resolve:
+    WMI-visible spoof em Hyper-V continua ineficaz. O mssmbios
+    serve WMI (Win32_ComputerSystemProduct, Win32_BaseBoard,
+    Win32_SystemEnclosure, MSSmBios_RawSMBiosTables) DIRETO do
+    cache in-kernel populado do firmware no boot, ignorando o
+    registro mssmbios\Data completamente. Isso e o Bug 3
+    arquitetural confirmado ao vivo na v4.0.9 e permanece
+    aberto. Ver docs/roadmap-v41-wmi-intercept.md para o
+    proximo passo: IRP_MJ_SYSTEM_CONTROL intercept em
+    \Driver\mssmbios ou UMDF WMI provider shadow.
+
+  Descoberta bonus da verificacao in-VM (CpuReplay E WMI-visivel):
+    Diferente do Win32_ComputerSystemProduct/BaseBoard/SystemEnclosure
+    (Bug 3 arquitetural, servidos do cache in-kernel do mssmbios),
+    Win32_Processor.Name le direto do registro
+    HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N\ProcessorNameString,
+    exatamente onde nosso driver reescreve. Prova concreta: apos
+    ligar EnableCpuReplay=1 manualmente + reboot, check-consistency
+    mostrou CPU[0..7] ProcessorNameString todos OK spoofados para
+    i5-10600K, E Win32_Processor.Name tambem. Isso significa que
+    v4.0.10 nao e so um bug-fix: e uma vitoria real de WMI-spoof
+    pra CPU, independente da limitacao arquitetural
+    SMBIOS-em-Hyper-V.
+
+  Referencia:
+    docs/postmortem-v4-phase5/incident-v410-smbios-validator-scan-window.md
+
+========================================================
   MUDANCAS EM v4.0.9 (Bug 4 fechado + build signing + evidencia ao vivo)
 ========================================================
 

@@ -35,6 +35,20 @@ if ($SmbiosOnly -and $CpuOnly) {
     exit 1
 }
 
+# v4.0.10: rejeitar -CpuOnly + -DisableKernelReplay explicitamente.
+# O bloco -CpuOnly abaixo faz early-exit apos armar CpuStrings +
+# EnableCpuReplay=1, ANTES de qualquer handling de DisableKernelReplay.
+# Pre v4.0.10 esse combo era silenciosamente contraditorio mas sem
+# consequencia (a flag EnableCpuReplay nunca era efetivamente honrada
+# porque o combined arm nunca armava ela). Agora que a fix do combined
+# arm liga a flag de verdade, permitir esse combo violaria a intencao
+# do usuario ("no kernel replay"). -SmbiosOnly + -DisableKernelReplay
+# ainda e valido (spoof user-mode de SMBiosData sem driver no loop).
+if ($CpuOnly -and $DisableKernelReplay) {
+    Write-Host "[!] -CpuOnly + -DisableKernelReplay sao contraditorios (CpuReplay so existe em kernel)." -ForegroundColor Red
+    exit 1
+}
+
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\_ui-common.ps1"
@@ -76,10 +90,19 @@ if ($Uninstall) {
         } catch { Write-Warn "Falha ao restaurar: $_" }
 
         # v3.7+: limpar cache de CpuStrings do driver
+        # v4.0.10: tambem limpar EnableCpuReplay - pre v4.0.10 essa
+        # linha nao existia porque o combined arm nunca setava a flag,
+        # entao a chave nunca existia no Uninstall. Agora que Step 10c
+        # a liga, o Uninstall tem que remover pra manter simetria com
+        # SmbiosBlob + EnableSmbiosReplay (ambos removidos no bloco
+        # acima). Sem essa remocao, driver-side IsCpuReplayEnabled
+        # retornaria TRUE em boot subsequente mas CpuStrings estaria
+        # absent - safe (driver bail cedo) mas assimetrico.
         try {
-            Remove-ItemProperty -Path $driverParams -Name "CpuStrings" -ErrorAction SilentlyContinue
-            Write-OK "CpuStrings removido do cache do driver"
-        } catch { Write-Warn "Falha ao remover CpuStrings: $_" }
+            Remove-ItemProperty -Path $driverParams -Name "CpuStrings"      -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $driverParams -Name "EnableCpuReplay" -ErrorAction SilentlyContinue
+            Write-OK "CpuStrings + EnableCpuReplay removidos do cache do driver"
+        } catch { Write-Warn "Falha ao remover CpuStrings/EnableCpuReplay: $_" }
 
         # v3.4: restaurar SMBiosData original se o driver salvou backup
         try {
@@ -277,6 +300,28 @@ function Build-SmbiosBlob {
             }
             $result.Add(0)
         }
+    }
+
+    # v4.0.10 hardening: recomputar o DWORD LE de raw-table-size no
+    # wrapper mssmbios (bytes 4-7). O firmware original devolve o
+    # wrapper com esse campo apontando pro tamanho do raw SMBIOS que
+    # vem logo depois; se a gente reemite strings de tamanho diferente,
+    # o total muda e o campo antigo passa a mentir. Isso NAO era a
+    # causa raiz do 0x03 VALIDATION-FAIL (o validador do driver nunca
+    # le esse campo — usa DataLength do REG_BINARY), mas o mssmbios
+    # ler o wrapper stale pode causar over-read/under-read do raw
+    # table na hora do consumo. Ver docs/postmortem-v4-phase5/
+    # incident-v410-smbios-validator-scan-window.md secao "Latent bugs".
+    #
+    # Assume wrapper de 8 bytes (Used21CallingMethod, Major, Minor,
+    # DmiRev, RawSize DWORD LE). Se o Header passado tem tamanho
+    # diferente de 8, pula esse fix — layout desconhecido.
+    if ($Header.Length -eq 8 -and $result.Count -ge 8) {
+        $rawLen = $result.Count - 8
+        $result[4] = [byte]($rawLen -band 0xFF)
+        $result[5] = [byte](($rawLen -shr 8)  -band 0xFF)
+        $result[6] = [byte](($rawLen -shr 16) -band 0xFF)
+        $result[7] = [byte](($rawLen -shr 24) -band 0xFF)
     }
 
     return ,$result.ToArray()
@@ -566,6 +611,12 @@ if ($DisableKernelReplay) {
         Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -ErrorAction SilentlyContinue
         # v3.7+: tambem limpar CpuStrings — todo replay em kernel esta desligado
         Remove-ItemProperty -Path $driverParams -Name "CpuStrings"         -ErrorAction SilentlyContinue
+        # v4.0.10: e limpar EnableCpuReplay, senao a flag ficaria stuck em 1
+        # do run anterior mesmo pedindo -DisableKernelReplay agora.
+        # Antes de v4.0.10 essa linha faltava porque o combined arm nunca
+        # ligava EnableCpuReplay — cleanup implicito de "flag nunca setada".
+        # Agora que Step 10c liga a flag, a cleanup tem que remover.
+        Remove-ItemProperty -Path $driverParams -Name "EnableCpuReplay"    -ErrorAction SilentlyContinue
     }
 } elseif ($driverInstalled) {
     try {
@@ -614,6 +665,21 @@ if ($driverInstalled -and -not $DisableKernelReplay -and -not $SmbiosOnly) {
                 -Value @($cpuNameStr, $cpuIdent, $cpuVendor) -Type MultiString
             Write-OK "CpuStrings gravado no cache do driver (3 valores)"
 
+            # v4.0.10 fix: Bug histórico — pré v4.0.10 o combined arm
+            # (spoof-smbios.ps1 sem flags) cacheava CpuStrings AQUI mas
+            # NUNCA ligava EnableCpuReplay=1, então o driver's
+            # IsCpuReplayEnabled() retornava FALSE em DriverEntry e o
+            # worker de CpuReplay nem era enfileirado. Só o modo
+            # -CpuOnly (linhas ~165-168) armava a flag; o combined
+            # silenciosamente NÃO spoofava CPU. Bug descoberto em VM
+            # 2026-08-31 durante verificação pré-bare-metal de v4.0.10.
+            # Fix: arma a flag junto com CpuStrings, mirroring o pattern
+            # do bloco -CpuOnly. Ver docs/postmortem-v4-phase5/
+            # incident-v410-smbios-validator-scan-window.md secao
+            # "Second latent bug: combined arm never lit EnableCpuReplay".
+            Set-ItemProperty -Path $driverParams -Name "EnableCpuReplay" -Value 1 -Type DWord
+            Write-OK "EnableCpuReplay=1 armado (driver aplicara CpuStrings no proximo boot)"
+
             $trunc = {
                 param($s)
                 if ($null -eq $s) { return "" }
@@ -624,7 +690,7 @@ if ($driverInstalled -and -not $DisableKernelReplay -and -not $SmbiosOnly) {
             Write-Info "  identifier:        $(& $trunc $cpuIdent)"
             Write-Info "  vendor_identifier: $(& $trunc $cpuVendor)"
         } catch {
-            Write-Warn "Falha ao gravar CpuStrings no driver: $_"
+            Write-Warn "Falha ao gravar CpuStrings/EnableCpuReplay no driver: $_"
         }
     } else {
         Write-Info "Profile v< 9 - pulando CpuStrings"

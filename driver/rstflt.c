@@ -1,5 +1,5 @@
 /*
- * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.9)
+ * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.10)
  *
  * SYSTEM_START upper filter of the DiskDrive class. Its jobs are to
  * replay a userspace-cached SMBIOS blob into mssmbios\Data during
@@ -153,6 +153,64 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v4.0.10 - HOTFIX: ValidateSmbiosBlob scan-window bug that produced
+ *       spurious 0x03 VALIDATION-FAIL breadcrumbs on Hyper-V (and on
+ *       ANY host whose mssmbios wrapper had DmiRevision in {0,1,2,3},
+ *       which covers most modern Windows). Root cause: the initial
+ *       Type-0/1/2/3 header scan (rstflt.c:432 loop) started at offset
+ *       0, so it walked INTO the fixed 8-byte mssmbios wrapper. On
+ *       Hyper-V Gen2 the wrapper looks like
+ *           [03 03 00 00 XX XX XX XX]
+ *       (Used21CallingMethod, MajVer=3, MinVer=0, DmiRev=0, then a
+ *       ULONG-LE raw-table size). At i=3 the pair (Blob[3]=DmiRev=0,
+ *       Blob[4]=size_lo>=4) satisfies (t in {0,1,2,3}, L>=4, i+L<=Len),
+ *       so tableStart pinned to 3 instead of 8. The subsequent walk
+ *       ran misaligned inside the wrapper, blew past the real Type 127
+ *       End-of-Table, and returned FALSE with sawEnd=FALSE, producing
+ *       breadcrumb 0x0300003E. The scan was intentionally loose (see
+ *       comment at ValidateSmbiosBlob) but the looseness collided with
+ *       the wrapper. Fix: start the scan at i=8, past the documented
+ *       fixed-size mssmbios wrapper. Also tightened the fallback at
+ *       rstflt.c:442 from `tableStart == 0 && Blob[0] > 127` to
+ *       `tableStart == 0` because with i>=8 the only way tableStart
+ *       stays 0 is "no plausible header found anywhere in the scan
+ *       window", which is genuinely malformed input.
+ *       Root cause identified via multi-agent workflow investigation
+ *       (three independent readers + local host repro with synthetic
+ *       Hyper-V-shaped blob + two adversarial verifiers, one CONFIRMED
+ *       one PARTIAL-with-fix-agreement) — findings in
+ *       docs/postmortem-v4-phase5/incident-v410-smbios-validator-scan-
+ *       window.md.
+ *       Companion script hardening: scripts/spoof-smbios.ps1
+ *       Build-SmbiosBlob now recomputes the mssmbios wrapper's raw-
+ *       size DWORD (bytes 4-7) after rebuild, so downstream mssmbios
+ *       consumers see a wrapper that matches the actual raw-table byte
+ *       count (previously it was left stale at the firmware's original
+ *       value, silently over-declaring the raw size after a spoof
+ *       shortened it — a latent bug the workflow surfaced independent
+ *       of the primary scan-window cause).
+ *       New tool: scripts/test-smbios-blob.ps1 - ports ValidateSmbios-
+ *       Blob to PowerShell so a user can offline-check a firmware blob
+ *       or the currently-cached SmbiosBlob before rebooting into the
+ *       driver replay path. Modes: -Live, -Cached, -File, -Synthetic.
+ *       Second latent bug closed in the same ship: pre-v4.0.10
+ *       scripts/spoof-smbios.ps1 Step 10c cached CpuStrings but NEVER
+ *       set Parameters\EnableCpuReplay=1 in combined mode (no flags).
+ *       IsCpuReplayEnabled() therefore returned FALSE in DriverEntry
+ *       and the CpuReplay worker was never queued - CPU silently
+ *       leaked despite combined arm looking successful. Broken since
+ *       v4.0.6 switch introduction; nobody caught it because CPU
+ *       validation always went through -CpuOnly (which explicitly
+ *       sets the flag). Fix: Step 10c now writes EnableCpuReplay=1
+ *       alongside CpuStrings, mirroring the -CpuOnly pattern. The
+ *       -DisableKernelReplay cleanup also removes EnableCpuReplay
+ *       now (was implicit no-op pre-v4.0.10). No driver changes -
+ *       driver-side CpuReplay path itself was correct all along;
+ *       verification in Hyper-V VM confirmed all 8 logical processors
+ *       spoof to profile CPU AND Win32_Processor.Name reflects the
+ *       spoof (unlike SMBIOS Types 1/2/3 which serve WMI from
+ *       mssmbios in-kernel cache, Win32_Processor reads directly from
+ *       HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N registry).
  * v4.0.9 - HOTFIX: added Authenticode signing to build pipeline. The
  *       "Automatic Repair loop after v4.0.6 install" family of failures
  *       was NOT caused by any source-code regression — bisection through
@@ -275,7 +333,7 @@
  * Marker` can validate the installed driver came from v4.0.9+ source
  * without depending on the PE TimeDateStamp (which changes on relink). */
 #pragma comment(linker, "/INCLUDE:RstFltVersion")
-const char RstFltVersion[] = "RstFlt-v4.0.9-BUILD-MARKER";
+const char RstFltVersion[] = "RstFlt-v4.0.10-BUILD-MARKER";
 
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
@@ -426,10 +484,27 @@ static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length)
     if (Length > 65536) return FALSE;      /* too big — reject       */
 
     /* Find first byte that looks like a Type 0/1/2/3 header with a
-       reasonable Length (>=4, fits within Length). Scan the first
-       64 bytes. Uses `<=` on the fit test so a blob whose only header
-       sits at exact end is still accepted. */
-    for (i = 0; i + 2 <= Length && i < 64; i++) {
+       reasonable Length (>=4, fits within Length). Scan the fixed
+       64-byte window AFTER the 8-byte mssmbios wrapper. Uses `<=` on
+       the fit test so a blob whose only header sits at exact end is
+       still accepted.
+
+       v4.0.10: scan now STARTS at i=8, not i=0. The mssmbios REG_BINARY
+       layout begins with an 8-byte wrapper
+           [Used21CallingMethod, MajVer, MinVer, DmiRev, RawSize DWORD LE]
+       whose byte values collide with the "plausible Type 0/1/2/3
+       header" heuristic. On Hyper-V (and typical modern Windows) the
+       wrapper is 03 03 00 00 XX XX XX XX with DmiRev in {0,1,2,3},
+       and Blob[4] = size_lo is always >= 4 for a non-empty raw table,
+       so pre-v4.0.10 the scan false-matched at i=3, pinned tableStart
+       into the wrapper, and the subsequent walk desynchronized before
+       reaching Type 127 - producing spurious 0x0300003E VALIDATION-FAIL
+       breadcrumbs on every arm of scripts/spoof-smbios.ps1. Starting
+       at i=8 makes the scan land on the first real SMBIOS struct
+       header (typically Type 0 BIOS Info) exactly where the raw table
+       begins per the documented mssmbios layout. If Windows ever
+       reshapes this wrapper, revisit here. */
+    for (i = 8; i + 2 <= Length && i < 64; i++) {
         UCHAR t = Blob[i];
         UCHAR L = Blob[i + 1];
         if ((t == 0 || t == 1 || t == 2 || t == 3) &&
@@ -439,7 +514,14 @@ static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length)
             break;
         }
     }
-    if (tableStart == 0 && Blob[0] > 127) return FALSE;
+    /* v4.0.10: with i starting at 8, tableStart==0 uniquely means the
+       scan window [8,63] never matched any plausible SMBIOS struct
+       header - genuinely malformed input, reject. The pre-v4.0.10
+       "Blob[0]>127" side condition made sense only when the scan
+       started at 0 (permissive fallback for weird pre-wrapper layouts)
+       and is now nonsensical since tableStart is never 0 on a valid
+       accept path. */
+    if (tableStart == 0) return FALSE;
 
     /* Walk structures. Each iteration advances past the formatted
        area, then over the string table (sequence of NUL-terminated
