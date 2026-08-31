@@ -76,7 +76,7 @@ Documented explicitly: the toolchain that produces the working driver **is** VS 
 - `driver/rstflt.c` — bumped v4.0.6 changelog entry to v4.0.9, restored WriteLastReplayStatus active body + RstFltVersion marker after their (rejected) v4.0.7/8 removal-bisection attempts.
 - `driver/makefile.mak` — added SIGNTOOL/SIGN_SHA1/SIGN_STORE/TSA_URL vars + `signtool sign` step to rstflt.sys build rule.
 - `docs/postmortem-v4-phase5/incident-v407-driver-boot-regression.md` — this file.
-- `LEIA-ME.txt` — new MUDANCAS EM v4.0.9 section.
+- `README.md` — new MUDANCAS EM v4.0.9 section.
 
 ## References
 

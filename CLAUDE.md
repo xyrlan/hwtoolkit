@@ -2,7 +2,7 @@
 
 Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (`driver/rstflt.c`, DiskDrive class UpperFilter) + PowerShell user-mode spoofers (`scripts/`) + sequential `NN-*.bat` pipeline in the repo root. Targets: Fase 5 anti-cheat detection surfaces (WMI, SMBIOS, CPU registry, MAC, EDID, disk serial, Windows machine identity). Primary threat model docs: `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`.
 
-**Language conventions in-repo**: user-facing prose in `LEIA-ME.txt`, `.bat`, script output, and PowerShell comments is Portuguese-BR. Driver code comments, postmortems, and technical rationale in English. Commit messages in English. Keep this split when adding content.
+**Language conventions in-repo**: user-facing prose in `README.md`, `.bat`, script output, and PowerShell comments is Portuguese-BR. Driver code comments, postmortems, and technical rationale in English. Commit messages in English. Keep this split when adding content.
 
 ## Toolchain — DO NOT deviate
 
@@ -52,7 +52,7 @@ Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (
 
 ## Documentation map
 
-- `LEIA-ME.txt` — the main user-facing changelog and setup guide, Portuguese, ~55KB. Everything user-facing goes there.
+- `README.md` — the main user-facing changelog and setup guide, Portuguese, ~55KB. Everything user-facing goes there.
 - `docs/postmortem-v4-phase5/` — incident writeups by version. Read the latest (`incident-v407-driver-boot-regression.md`) first for the current stable-driver context; the `incident-v405-vm-pipeline-validation.md` header shows the closure status of every open bug.
 - `docs/roadmap-v41-wmi-intercept.md` — the next architectural pivot for real WMI-visible spoofing. Explicit PatchGuard warnings against the naive `DriverObject` dispatch swap. UMDF WMI provider shadow to test first.
 - `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`, `docs/fase2-track-a-windows-test-kickoff.md` — anti-cheat threat model + phase planning.
@@ -60,7 +60,7 @@ Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (
 ## Style
 
 - Every driver change requires a corresponding changelog block at the top of `driver/rstflt.c` (`v4.0.x - ...`) — do not merge without.
-- Every non-trivial toolkit-behavior discovery gets a new `docs/postmortem-v4-phase5/incident-v40X-*.md`. Reference the file from `LEIA-ME.txt` and from the corresponding `v4.0.x` changelog block in the driver.
+- Every non-trivial toolkit-behavior discovery gets a new `docs/postmortem-v4-phase5/incident-v40X-*.md`. Reference the file from `README.md` and from the corresponding `v4.0.x` changelog block in the driver.
 - Commit messages end with `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` when the assistant did substantial work.
 - PR bodies end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 - Squash-merge is the convention (`gh pr merge <n> --squash --delete-branch`).

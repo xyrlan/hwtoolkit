@@ -8,7 +8,7 @@ This document is the self-contained handoff for a **fresh Claude Code session** 
 
 1. Read this file (`docs/fase2-kickoff.md`) first — end to end.
 2. Read `docs/emac-recon-v2.md` second — it is the authoritative EMAC target recon.
-3. Read `LEIA-ME.txt` third — user-facing operational docs.
+3. Read `README.md` third — user-facing operational docs.
 4. Then, and only then, propose the Fase 2 plan back to the user for confirmation.
 
 ---
@@ -48,7 +48,7 @@ hwtoolkit/
 ├── 06-verificar.bat  07-limpar-traces.bat  08-desinstalar-driver.bat
 ├── 08b-restaurar-smbios.bat  09-recuperar-boot.bat
 ├── pre-test-checklist.bat
-└── LEIA-ME.txt
+└── README.md
 ```
 
 **Ethical framing:** defensive recon; no distribution of bypass code; no modification of anti-cheat binaries (integrity-checked by EMAC anyway); personal use only.
@@ -242,14 +242,14 @@ Three parallel tracks.
 
 Ordered — do not reorder without user consent.
 
-1. Fresh session reads `docs/fase2-kickoff.md` (this file) + `docs/emac-recon-v2.md` + `LEIA-ME.txt`.
+1. Fresh session reads `docs/fase2-kickoff.md` (this file) + `docs/emac-recon-v2.md` + `README.md`.
 2. Ask the user to confirm Fase 2 scope: all three tracks (A + B + C), or a subset?
 3. **Track A first** — extends existing `rstflt.c`, lower risk. Workflow with adversarial review + brick-boot lens.
 4. **Track B second** — new driver, higher risk. Workflow with adversarial review + brick-boot lens + brick-network lens.
 5. **Track C** — doc only. Present analysis; user decides among EV cert / BYOVD / accept.
 6. **Each track:** separate branch → PR → adversarial review → squash merge.
 7. **User tests each track on Windows box between merges.** Wait for green light before starting the next.
-8. **Final integration:** `04-aplicar-hwid.bat` invokes any new spoofers; `LEIA-ME.txt` updated; docs updated; version bump v3.7 → v4.0.
+8. **Final integration:** `04-aplicar-hwid.bat` invokes any new spoofers; `README.md` updated; docs updated; version bump v3.7 → v4.0.
 9. **Post-Fase 2:** recon v3 based on user's real EMAC test results — did the fingerprint fully spoof? Any leaks in Wireshark / procmon / EMAC telemetry replies?
 
 ---
@@ -281,7 +281,7 @@ Ordered — do not reorder without user consent.
 ## 13. Reference links
 
 - **EMAC recon v2 (authoritative target reconnaissance):** `docs/emac-recon-v2.md`
-- **User-facing operational docs:** `LEIA-ME.txt`
+- **User-facing operational docs:** `README.md`
 - **Recent PR history:**
   - PR #1 — Fase 1 (base spoofers, v3.5)
   - PR #2 — v3.6 driver strip (IOCTL removal, minimal `rstflt`)

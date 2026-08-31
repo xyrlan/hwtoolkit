@@ -9,7 +9,7 @@ Self-contained handoff for a **new Claude Code session running on the user's Win
 1. Read this file (`docs/fase2-track-a-windows-test-kickoff.md`) — end to end.
 2. Read `docs/fase2-kickoff.md` — Fase 2 overall context.
 3. Read `docs/emac-recon-v2.md` — EMAC target recon.
-4. Read `LEIA-ME.txt` sections "MUDANCAS EM v4.0" and "COBERTURA DE FINGERPRINT".
+4. Read `README.md` sections "MUDANCAS EM v4.0" and "COBERTURA DE FINGERPRINT".
 5. Then confirm to the user which phase to start.
 
 ---

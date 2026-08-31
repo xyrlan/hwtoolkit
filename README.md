@@ -1,7 +1,10 @@
-========================================================
-  HW TOOLKIT v4.0 + Fase 2 Track A (CPU registry replay)
-  Sistema centralizado de profile + SMBIOS + CPU boot replay
-========================================================
+# hwtoolkit
+
+Toolkit de spoof de hardware fingerprint para Windows (driver kernel + PowerShell).
+
+## HW TOOLKIT v4.0 + Fase 2 Track A (CPU registry replay)
+
+Sistema centralizado de profile + SMBIOS + CPU boot replay
 
 OBJETIVO:
   Toolkit completo de spoofing de identificadores de hardware.
@@ -15,12 +18,11 @@ RECONHECIMENTO (LEITURA OBRIGATORIA):
   acontecem. Base para decisoes de arquitetura v3.6 (driver
   minimal) e v3.7 (Fase 1.6 registry-only + hotfix MachineGuid).
 
-========================================================
-  ESTRUTURA
-========================================================
+## ESTRUTURA
 
+```
 HWToolkit/
-  LEIA-ME.txt               <- Este arquivo
+  README.md                 <- Este arquivo
   00-gerar-profile.bat      <- Gera profile de hardware (1x)
   01-instalar-ferramentas.bat <- VS Build Tools + WDK (1x)
   02-compilar-driver.bat     <- Compila rstflt.sys (v3.6, SMBIOS replay minimal)
@@ -51,10 +53,9 @@ HWToolkit/
 
 Profile:
   C:\ProgramData\.hwcfg\profile.json
+```
 
-========================================================
-  ORDEM DE EXECUCAO
-========================================================
+## ORDEM DE EXECUCAO
 
   PRIMEIRA VEZ (setup completo):
     00 -> 01 -> reboot -> 02 -> pre-test-checklist --arm
@@ -77,9 +78,7 @@ Profile:
   EMERGENCIA (Windows nao inicia):
     WinRE > Prompt de Comando > 09
 
-========================================================
-  O QUE CADA PASSO FAZ
-========================================================
+## O QUE CADA PASSO FAZ
 
   00 - GERAR PROFILE
        Detecta CPU, seleciona board compativel, gera
@@ -142,10 +141,9 @@ Profile:
        Para WinRE. Carrega registry offline, remove driver
        de ambos ControlSets, restaura UpperFilters.
 
-========================================================
-  COBERTURA DE FINGERPRINT
-========================================================
+## COBERTURA DE FINGERPRINT
 
+```
   Surface                   Componente               Metodo
   -----------------------   ----------------------   ----------------------
   SMBIOS UUID               spoof-smbios.ps1         Rebuild + cache no driver
@@ -187,10 +185,9 @@ Profile:
   ShimCache                 limpar-traces            Registry delete
   Prefetch                  limpar-traces            File delete
   UserAssist                limpar-traces            ROT13 decode + delete
+```
 
-========================================================
-  LIMITACOES CONHECIDAS
-========================================================
+## LIMITACOES CONHECIDAS
 
   - Disk serial (ATA/NVMe) nao spoofado desde v3.6.
     EMAC nao consulta esse vetor no fingerprint atual, e os
@@ -253,9 +250,7 @@ Profile:
     filtered por PID do RubinOT.exe - considerado pra
     Track B' se procmon pos-v4.0 mostrar necessidade.
 
-========================================================
-  PROTOCOLO EMAC / ANTI-CHEATS DE NIVEL AVANCADO
-========================================================
+## PROTOCOLO EMAC / ANTI-CHEATS DE NIVEL AVANCADO
 
   Resumo do reconhecimento feito sobre o protocolo EMAC (anti-cheat
   de kernel com telemetria server-side). Vale para qualquer produto
@@ -295,18 +290,14 @@ Profile:
         - Qualquer overlay de cheat / injector
       Overlay visivel na screenshot = ban manual quase certo.
 
-========================================================
-  REQUISITOS
-========================================================
+## REQUISITOS
 
   - Windows 10/11 x64
   - Conta de administrador
   - Secure Boot DESABILITADO na BIOS
   - ~10 GB livres (para VS Build Tools + WDK)
 
-========================================================
-  MUDANCAS EM v4.0.10 (ValidateSmbiosBlob scan window + Build-SmbiosBlob wrapper size)
-========================================================
+## MUDANCAS EM v4.0.10 (ValidateSmbiosBlob scan window + Build-SmbiosBlob wrapper size)
 
   v4.0.10 - Fix do ValidateSmbiosBlob no driver que rejeitava spuriamente
             TODO blob SMBIOS reconstruido pelo scripts\spoof-smbios.ps1
@@ -379,12 +370,15 @@ Profile:
     - Marker RstFltVersion bumpou pra RstFlt-v4.0.10-BUILD-MARKER.
 
   Como validar apos update:
-    .\02-compilar-driver.bat
-    .\03-instalar-driver.bat
-    # Reiniciar
-    .\scripts\spoof-smbios.ps1 -SmbiosOnly
-    # Reiniciar
-    .\scripts\check-consistency.ps1
+
+```powershell
+.\02-compilar-driver.bat
+.\03-instalar-driver.bat
+# Reiniciar
+.\scripts\spoof-smbios.ps1 -SmbiosOnly
+# Reiniciar
+.\scripts\check-consistency.ps1
+```
 
     Esperado apos o segundo reboot:
       LastReplayStatus=0x04000000  (tag 0x04 MSSMBIOS-OPEN-FAIL)
@@ -425,9 +419,7 @@ Profile:
   Referencia:
     docs/postmortem-v4-phase5/incident-v410-smbios-validator-scan-window.md
 
-========================================================
-  MUDANCAS EM v4.0.9 (Bug 4 fechado + build signing + evidencia ao vivo)
-========================================================
+## MUDANCAS EM v4.0.9 (Bug 4 fechado + build signing + evidencia ao vivo)
 
   v4.0.9 - Sessao end-to-end de validacao dos 5 bugs do postmortem v4.0.5
            na VM Hyper-V, com todas as provas ao vivo colhidas.
@@ -560,9 +552,7 @@ Profile:
       6. Apos boot: scripts\check-consistency.ps1 pra ver
          LastReplayStatus e confirmar estado.
 
-========================================================
-  MUDANCAS EM v4.0.6 (Bug 3+5 fechados, Bug 4 evidence)
-========================================================
+## MUDANCAS EM v4.0.6 (Bug 3+5 fechados, Bug 4 evidence)
 
   v4.0.6 - Triage dos 3 bugs abertos no postmortem v4.0.5,
            por workflow multi-agente + investigacao arquitetural.
@@ -700,9 +690,7 @@ Profile:
     6. Reboot. Se crash: capturar C:\rstflt-dump.sys, !analyze -v.
     7. Repetir com -CpuOnly para o segundo datum.
 
-========================================================
-  MUDANCAS EM v4.0.5 (VM validation session findings)
-========================================================
+## MUDANCAS EM v4.0.5 (VM validation session findings)
 
   v4.0.5 - Sessao de validacao end-to-end das Phases 2->6->7->8
            no Hyper-V dev VM (windev2407eval). Achou 5 bugs
@@ -790,9 +778,7 @@ Profile:
              RED:   Phase 6 disk/volume spoofers - risco brick,
                     manual restore point + WinPE stick recomendado.
 
-========================================================
-  MUDANCAS EM v4.0.4 (boot correctness patches)
-========================================================
+## MUDANCAS EM v4.0.4 (boot correctness patches)
 
   v4.0.4 - Segundo bug de boot: post-boot hang pre-Winlogon.
            Depois do fix v4.0.3 (StartType) eliminar o STOP 0x7B
@@ -845,9 +831,7 @@ Profile:
              - IPv4 restaurada
              - sc query RstFlt: STATE 4 RUNNING, StartType Boot
 
-========================================================
-  MUDANCAS EM v4.0.3 (boot correctness patches)
-========================================================
+## MUDANCAS EM v4.0.3 (boot correctness patches)
 
   v4.0.3 - STOP 0x7B INACCESSIBLE_BOOT_DEVICE eliminado.
 
@@ -896,9 +880,7 @@ Profile:
            refutados) e incident-v403-startype-boot-order.md
            pra proof de campo do fix.
 
-========================================================
-  MUDANCAS EM v4.0
-========================================================
+## MUDANCAS EM v4.0
 
   v4.0 - Fase 2 Track A: CPU registry replay via driver.
 
@@ -979,9 +961,7 @@ Profile:
          leitura de HKLM\SYSTEM\...\Control\CI\State pelo
          EMAC user-mode.
 
-========================================================
-  MUDANCAS EM v3.7
-========================================================
+## MUDANCAS EM v3.7
 
   v3.7 - Reconhecimento v2 aplicado. Ver docs/emac-recon-v2.md
          para findings empiricos completos (procmon 7min baseline
@@ -1032,9 +1012,7 @@ Profile:
          auditoria (Windows identity, disk registry, PCI HWID,
          volume GUID).
 
-========================================================
-  MUDANCAS EM v3.6
-========================================================
+## MUDANCAS EM v3.6
 
   v3.6 - Storage IOCTL intercept removido do driver. EMAC
          nao usa esse vetor, e paths tinham historico de
@@ -1053,9 +1031,8 @@ Profile:
            - SMBIOS replay: intacto (SmbiosBlob,
              EnableSmbiosReplay, OrigSmbiosData)
 
-========================================================
+## EXECUTAR SCRIPTS NO POWERSHELL
 
-
-
-EXECUTAR SCRIPTS NO POWERSHELL
+```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
