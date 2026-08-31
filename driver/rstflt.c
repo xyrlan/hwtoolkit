@@ -193,6 +193,24 @@
  *       Blob to PowerShell so a user can offline-check a firmware blob
  *       or the currently-cached SmbiosBlob before rebooting into the
  *       driver replay path. Modes: -Live, -Cached, -File, -Synthetic.
+ *       Second latent bug closed in the same ship: pre-v4.0.10
+ *       scripts/spoof-smbios.ps1 Step 10c cached CpuStrings but NEVER
+ *       set Parameters\EnableCpuReplay=1 in combined mode (no flags).
+ *       IsCpuReplayEnabled() therefore returned FALSE in DriverEntry
+ *       and the CpuReplay worker was never queued - CPU silently
+ *       leaked despite combined arm looking successful. Broken since
+ *       v4.0.6 switch introduction; nobody caught it because CPU
+ *       validation always went through -CpuOnly (which explicitly
+ *       sets the flag). Fix: Step 10c now writes EnableCpuReplay=1
+ *       alongside CpuStrings, mirroring the -CpuOnly pattern. The
+ *       -DisableKernelReplay cleanup also removes EnableCpuReplay
+ *       now (was implicit no-op pre-v4.0.10). No driver changes -
+ *       driver-side CpuReplay path itself was correct all along;
+ *       verification in Hyper-V VM confirmed all 8 logical processors
+ *       spoof to profile CPU AND Win32_Processor.Name reflects the
+ *       spoof (unlike SMBIOS Types 1/2/3 which serve WMI from
+ *       mssmbios in-kernel cache, Win32_Processor reads directly from
+ *       HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N registry).
  * v4.0.9 - HOTFIX: added Authenticode signing to build pipeline. The
  *       "Automatic Repair loop after v4.0.6 install" family of failures
  *       was NOT caused by any source-code regression — bisection through

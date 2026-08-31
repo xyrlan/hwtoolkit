@@ -361,6 +361,21 @@ Profile:
         -Synthetic  gera blob sintetico Hyper-V-like pra
                     validar que o proprio fix da v4.0.10
                     funciona sem instalar driver
+    - scripts/spoof-smbios.ps1 Step 10c: agora liga
+      Parameters\EnableCpuReplay=1 junto com CpuStrings quando o
+      combined arm (sem flags) e usado. Bug historico descoberto na
+      verificacao in-VM de v4.0.10: pre-fix, o combined arm cacheava
+      CpuStrings mas NUNCA setava EnableCpuReplay=1, entao o
+      IsCpuReplayEnabled() do driver retornava FALSE em DriverEntry
+      e o worker de CpuReplay nem era enfileirado. Resultado: usuario
+      "sente" que armou tudo, mas CPU vazava silenciosamente. Ver
+      secao "Second latent bug" no postmortem v4.0.10 para trace
+      completo.
+    - scripts/spoof-smbios.ps1 -DisableKernelReplay cleanup: agora
+      remove tambem EnableCpuReplay junto com CpuStrings. Antes de
+      v4.0.10 essa remocao era implicita (a flag nunca era setada,
+      entao nao precisava limpar). Agora que Step 10c liga a flag,
+      o cleanup precisa remover.
     - Marker RstFltVersion bumpou pra RstFlt-v4.0.10-BUILD-MARKER.
 
   Como validar apos update:
@@ -393,6 +408,19 @@ Profile:
     aberto. Ver docs/roadmap-v41-wmi-intercept.md para o
     proximo passo: IRP_MJ_SYSTEM_CONTROL intercept em
     \Driver\mssmbios ou UMDF WMI provider shadow.
+
+  Descoberta bonus da verificacao in-VM (CpuReplay E WMI-visivel):
+    Diferente do Win32_ComputerSystemProduct/BaseBoard/SystemEnclosure
+    (Bug 3 arquitetural, servidos do cache in-kernel do mssmbios),
+    Win32_Processor.Name le direto do registro
+    HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N\ProcessorNameString,
+    exatamente onde nosso driver reescreve. Prova concreta: apos
+    ligar EnableCpuReplay=1 manualmente + reboot, check-consistency
+    mostrou CPU[0..7] ProcessorNameString todos OK spoofados para
+    i5-10600K, E Win32_Processor.Name tambem. Isso significa que
+    v4.0.10 nao e so um bug-fix: e uma vitoria real de WMI-spoof
+    pra CPU, independente da limitacao arquitetural
+    SMBIOS-em-Hyper-V.
 
   Referencia:
     docs/postmortem-v4-phase5/incident-v410-smbios-validator-scan-window.md

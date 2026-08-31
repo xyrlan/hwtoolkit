@@ -210,6 +210,39 @@ Real WMI-visible spoof continues to require the v4.1 IRP interception; a `0x04` 
 - **`Set-StructureString` silent no-op when `Formatted[X] = 0`.** Some SMBIOS structures encode a "no string" sentinel by placing `0x00` in the string-index byte (e.g. `Formatted[7]=0` for Type 1 Manufacturer). `Set-StructureString` currently early-returns on `$StringIndex -le 0`, so if the profile asks us to spoof a field whose original struct has no string slot allocated, that spoof is silently dropped. Functional, not structural — the blob still validates. Would need `Set-StructureString` to (a) refuse to spoof structures with `Formatted[X]=0`, or (b) allocate a new string slot and rewrite the `Formatted[X]` byte. Deferred.
 - **Refuter 2 — hypothetical future Windows wrapper reshape.** `i=8` in the validator assumes an 8-byte wrapper. If a future Windows revision extends it to 12 or 16 bytes, `i=8` would land inside the still-wrapper region and re-hit a variant of the same false-match. Not fixed defensively (defensive fix would be to parse the wrapper's own version fields and derive the offset, which introduces its own drift risk); recorded as a source comment in `ValidateSmbiosBlob`.
 
+## Second latent bug: combined arm never lit EnableCpuReplay
+
+**Discovered:** 2026-08-31, in-VM verification of v4.0.10 combined arm (`.\scripts\spoof-smbios.ps1` with no flags).
+
+**Symptom:** After combined arm + reboot on the Hyper-V VM with v4.0.10 installed, `check-consistency.ps1` still reported `[GAP] CPU[N] ProcessorNameString vazamento` on all 8 logical processors — the driver's CPU replay path had not fired even though the CPU strings were correctly cached in `RstFlt\Parameters\CpuStrings`. `LastReplayStatus = 0x04000034` confirmed the SMBIOS gate passed (validator fix works), so this was CPU-specific and unrelated to the primary scan-window bug fixed above.
+
+**Registry state after combined arm + reboot (evidence):**
+
+| Value                | State                                                                        |
+|----------------------|------------------------------------------------------------------------------|
+| `EnableSmbiosReplay` | `1` (armed)                                                                  |
+| `SmbiosBlob`         | 959 bytes (cached)                                                           |
+| `LastReplayStatus`   | `0x04000034` (SMBIOS gate `MSSMBIOS-OPEN-FAIL`, expected on Hyper-V)         |
+| `EnableCpuReplay`    | **(absent)** — flag never set                                                |
+| `CpuStrings`         | 3 strings, correct values (`i5-10600K`, `Family 6 Model 165 Stepping 5`, `GenuineIntel`) |
+| `OrigCpuStrings`     | (absent) — never populated because `CpuReplay` never ran                     |
+
+**Root cause:** `scripts/spoof-smbios.ps1` Step 10c (lines ~625-651 pre-v4.0.10) cached `CpuStrings` into `RstFlt\Parameters` but never wrote `EnableCpuReplay=1`. The driver's `IsCpuReplayEnabled()` in `DriverEntry` therefore returned FALSE, skipping the entire CPU replay allocation + queue path. Only the `-CpuOnly` early-exit block (lines ~165-168) explicitly set the flag; combined mode (`spoof-smbios.ps1` with no flags) silently omitted it. This has been broken since the `-SmbiosOnly` / `-CpuOnly` switches were introduced in v4.0.6 (Bug 4 in [`incident-v405-vm-pipeline-validation.md`](incident-v405-vm-pipeline-validation.md)), whose postmortem itself flagged "nenhum script nunca escreveu EnableCpuReplay — operador ligava a mao SEM limpar EnableSmbiosReplay=1 do run anterior" — the fix was to add split-mode switches, but the combined mode's CPU arming was never plumbed.
+
+**Why it wasn't caught earlier:** every CPU-replay validation in the v4.0.5 postmortem was done via `-CpuOnly` (which does set the flag) or by the operator manually setting `EnableCpuReplay=1`. Nobody ran the combined mode end-to-end against `check-consistency.ps1` on a boot cycle. Combined mode looked fine on inspection (`CpuStrings` cached, blob cached, `EnableSmbiosReplay=1`) and the missing DWORD went unnoticed until a v4.0.10 verification pass explicitly re-audited the two enable flags side-by-side.
+
+**Verification of the driver's CpuReplay path with v4.0.10 (pre-fix):** the operator manually set `EnableCpuReplay=1` on top of the already-cached `CpuStrings` (from the previous combined arm), rebooted, and re-ran `check-consistency.ps1`. Result: all 8 `CPU[N]` entries reported OK for `ProcessorNameString`, and `Win32_Processor.Name` also reflected the spoof — proving the driver's `CpuReplay` path is intact under v4.0.10 and reaches WMI via the `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N` registry keys (which, unlike mssmbios's in-kernel cache, do serve WMI).
+
+**Fix:** in `scripts/spoof-smbios.ps1` Step 10c, immediately after `Set-ItemProperty ... "CpuStrings"`, add:
+
+```powershell
+Set-ItemProperty -Path $driverParams -Name "EnableCpuReplay" -Value 1 -Type DWord
+```
+
+The `-DisableKernelReplay` cleanup block was also updated to remove `EnableCpuReplay` alongside `CpuStrings` (previously an implicit no-op because the flag was never set — now required for symmetric cleanup). Both changes mirror the pattern already used by the `-CpuOnly` early-exit block. No driver changes needed.
+
+**Architectural asymmetry surfaced — CPU replay path IS WMI-visible on Hyper-V.** This test surfaced a distinction that matters for the v4.1 planning. `Win32_ComputerSystemProduct` / `Win32_BaseBoard` / `Win32_SystemEnclosure` serve from mssmbios's in-kernel firmware cache (Bug 3 in [`incident-v406-bug-triage.md`](incident-v406-bug-triage.md)), so SMBIOS spoof via `mssmbios\Data` write is not WMI-visible on this VM. **But `Win32_Processor` reads directly from `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\N` registry keys, which is exactly what the driver's CPU replay path rewrites** — so CPU spoof IS WMI-visible even on Hyper-V. This is a genuine v4.0.10 win independent of the strategic v4.1 pivot. To be captured in [`docs/roadmap-v41-wmi-intercept.md`](../roadmap-v41-wmi-intercept.md) as "CPU replay path is already WMI-visible; v4.1 focus is exclusively on SMBIOS via `IRP_MJ_SYSTEM_CONTROL` intercept or UMDF WMI provider shadow." Per CLAUDE.md's Gotchas, the mssmbios in-kernel cache constraint remains — this discovery narrows, but does not lift, the v4.1 scope.
+
 ## Why WMI-visible SMBIOS spoof is STILL unfixed even with v4.0.10
 
 v4.0.10 removes a false-positive rejection in the driver's *replay path*. It does not change the architectural fact — established in [`incident-v406-bug-triage.md`](incident-v406-bug-triage.md) Bug 3 — that WMI does not read from the registry mirror `mssmbios\Data\SMBiosData`. `WmipQueryRawSMBiosTables` in `Wmiperf.sys` reads the firmware SMBIOS entry-point directly (via the ACPI `RSMB` table on UEFI systems, F-segment scan on legacy), mapping the referenced physical pages through mssmbios's in-kernel cache. Registry writes into the mirror do not participate in that read path. See `docs/roadmap-v41-wmi-intercept.md` and CLAUDE.md's Gotchas section for the strategic conclusion:
