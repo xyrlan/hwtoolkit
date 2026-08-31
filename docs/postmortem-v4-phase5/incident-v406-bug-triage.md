@@ -104,7 +104,7 @@ Two candidate fixes were explicitly rejected — recording them here so they do 
 - `scripts/prep-crashdump.ps1` — NEW file. Sets CrashControl for complete dump + AutoReboot=0 + DedicatedDumpFile. Companion `-Restore` mode.
 - `docs/postmortem-v4-phase5/incident-v405-vm-pipeline-validation.md` — v4.0.6 status header at top; Bug 4 section prefixed with the true-independent repro protocol + heartbeat-off falsifier + refuted-hypothesis note (original write-up preserved below for continuity).
 - `docs/roadmap-v41-wmi-intercept.md` — NEW file. v4.1 SMBIOS interception plan: empirical mssmbios Start=1 verification, correct hook points, PatchGuard concerns, UMDF WMI provider as lower-risk alternative to test first, accepted Hyper-V limitation (VMBus/KVP cross-reference channels).
-- `LEIA-ME.txt` — new `MUDANCAS EM v4.0.6` section.
+- `README.md` — new `MUDANCAS EM v4.0.6` section.
 
 ## New driver artifact
 

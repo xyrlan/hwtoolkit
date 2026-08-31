@@ -188,7 +188,7 @@ Candidates for the "service that fires at 50s post-boot":
 - `scripts/spoof-mac.ps1` — added `-NoPause` switch parameter + `Wait-Enter` helper wrapping all three `Read-Host "Pressione Enter para fechar"` exits. Standalone use unchanged (no flag = old behavior).
 - `04-aplicar-hwid.bat` — pass `-NoPause` when invoking `spoof-mac.ps1`. Comment explains why.
 - `docs/postmortem-v4-phase5/incident-v405-vm-pipeline-validation.md` — this document.
-- `LEIA-ME.txt` — new `MUDANCAS EM v4.0.5` section covering all 5 findings.
+- `README.md` — new `MUDANCAS EM v4.0.5` section covering all 5 findings.
 
 ## Recommended posture for the next physical-hardware run
 
