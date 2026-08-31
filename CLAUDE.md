@@ -1,0 +1,66 @@
+# CLAUDE.md — hwtoolkit project notes
+
+Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (`driver/rstflt.c`, DiskDrive class UpperFilter) + PowerShell user-mode spoofers (`scripts/`) + sequential `NN-*.bat` pipeline in the repo root. Targets: Fase 5 anti-cheat detection surfaces (WMI, SMBIOS, CPU registry, MAC, EDID, disk serial, Windows machine identity). Primary threat model docs: `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`.
+
+**Language conventions in-repo**: user-facing prose in `LEIA-ME.txt`, `.bat`, script output, and PowerShell comments is Portuguese-BR. Driver code comments, postmortems, and technical rationale in English. Commit messages in English. Keep this split when adding content.
+
+## Toolchain — DO NOT deviate
+
+- Compiler: **Visual Studio 2026 Community "VS 18"** (`C:\Program Files\Microsoft Visual Studio\18\Community`), MSVC 14.51+. VS 2022 BuildTools alone works if the C++ workload is installed; without it, `02-compilar-driver.bat` falls through to VS 18.
+- WDK: 10.0.22621 at `C:\Program Files (x86)\Windows Kits\10\...\10.0.22621.0`. `signtool.exe` from the same SDK bin.
+- Build: `.\02-compilar-driver.bat` from the repo root; wraps `nmake /f driver\makefile.mak`.
+- **Signing is mandatory** — `makefile.mak` calls `signtool sign` after `link.exe` using self-signed cert `HWToolkit Test Cert 2026` (thumbprint `30310EE7644799431FFF099E1194817E813152B9`, valid until 2028-08-30, in host's `Cert:\CurrentUser\My`). If you remove or break the signing step, WDAC-enforced Win10 rejects the BOOT_START load and drops the box into an Automatic Repair loop with no bugcheck screen — see [`docs/postmortem-v4-phase5/incident-v407-driver-boot-regression.md`](docs/postmortem-v4-phase5/incident-v407-driver-boot-regression.md). If the cert expires, regenerate via `New-SelfSignedCertificate` and update `SIGN_SHA1` in `makefile.mak` and re-import public cert into target VM's `Cert:\LocalMachine\Root`.
+
+## Standard commands
+
+- Generate profile: `.\00-gerar-profile.bat` (writes `C:\ProgramData\.hwcfg\profile.json` v9+).
+- Build driver: `.\02-compilar-driver.bat` (produces signed `driver\rstflt.sys`).
+- Install driver: `.\03-instalar-driver.bat` (checks HVCI + testsigning, then `sc create` + UpperFilters + Parameters key). Requires reboot to activate.
+- Arm SMBIOS-only replay: `.\scripts\spoof-smbios.ps1 -SmbiosOnly` — clears CPU state first.
+- Arm CPU-only replay: `.\scripts\spoof-smbios.ps1 -CpuOnly` — clears SMBIOS state, sets `EnableCpuReplay=1`.
+- Prep for BSOD dump collection: `.\scripts\prep-crashdump.ps1` (sets `AutoReboot=0` + `DedicatedDumpFile=C:\rstflt-dump.sys`); `-Restore` to revert.
+- Audit consistency post-boot: `.\scripts\check-consistency.ps1` — decodes driver's `LastReplayStatus` breadcrumb, verifies driver version marker, cross-checks WMI/registry/SMBIOS/CPU/network.
+- Uninstall: `.\08-desinstalar-driver.bat --skip-fase16` — always the safe way to remove the driver (restores UpperFilters from backup key). Requires reboot to fully release.
+- Boot recovery from WinRE: `.\09-recuperar-boot.bat` (offline registry surgery to remove `RstFlt` from UpperFilters and delete the service).
+
+**Do NOT invoke** `sc stop RstFlt ; sc delete RstFlt ; Restart-Computer -Force` in one shot without first removing `RstFlt` from `HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e967-...}\UpperFilters` — this reproduces the STOP 0x7B failure mode documented in [`incident-v402-signature-plus-filter.md`](docs/postmortem-v4-phase5/incident-v402-signature-plus-filter.md) (UpperFilters walk points at deleted service → `CM_PROB_FAILED_ADD` → 0x7B). `08-desinstalar-driver.bat` does the correct order automatically.
+
+## Testing on the Hyper-V dev VM
+
+- Target VM: `Ambiente de desenvolvimento do Windows 10` (windev-image, Win10 Enterprise, Gen 2 UEFI, storvsc, 8 vCPU, WDAC enforced mode 2, testsigning ON, HVCI OFF, Secure Boot OFF).
+- **Before starting the VM for any arming test**, disable heartbeat + KVP integration services on the host:
+  ```powershell
+  Disable-VMIntegrationService -VMName 'Ambiente de desenvolvimento do Windows 10' `
+      -Name 'Pulsação','Troca do Par Chave-Valor'
+  ```
+  Otherwise the Hyper-V watchdog resets the guest at ~52-56s post-Winlogon when KVP encounters the modified registry state (Bug 4, closed as H2 host-side reset — see `incident-v405-vm-pipeline-validation.md` header). Names above are Windows PT-BR; EN names are `Heartbeat` and `Key-Value Pair Exchange`.
+- Restore config re-enables both services on VM checkpoint restore — always redisable after `Restore-VMCheckpoint`.
+- File transfer host → guest: `Copy-VMFile -Name '<vm>' -SourcePath <host> -DestinationPath <guest> -CreateFullPath -FileSource Host -Force`. Requires guest's `vmicguestinterface` service running (Manual startup, resets to Stopped on each reboot — the user starts it manually per session). Copy-VMFile **guest → host does not exist**; use base64-into-chat or SMB share for that direction.
+- Working checkpoints on the VM (as of PR #9):
+  - `clean-v409-installed` — driver v4.0.9 signed installed, no arming. **Best base for iterating arming tests.**
+  - `clean-no-driver` — no `RstFlt` registered anywhere. Base for install-from-scratch tests.
+  - `pre-v406-test` — the last v4.0.4 checkpoint kept around for the historical binary if needed.
+
+## Gotchas
+
+- **PowerShell `sc` is not `sc.exe`.** In PS 5.1, bare `sc` is an alias for `Set-Content`. When invoking the Service Control Manager from PS, always use `sc.exe` explicitly. From within `.bat` files, `sc` resolves to `sc.exe` correctly.
+- **PowerShell script files must be ASCII** (or UTF-8 with BOM). PS 5.1 default reads BOM-less UTF-8 as Windows-1252 and multi-byte chars (em-dash, accents) break the parser. Scripts in this repo are ASCII-only on purpose (see the comment header in `check-consistency.ps1`). If you edit, keep ASCII.
+- **PE `TimeDateStamp` + Authenticode signature timestamp make SHA256 change every relink** — do not use SHA to validate driver identity. Use `check-consistency.ps1 Read-DriverVersionMarker` (regex-matches the embedded `RstFlt-v<version>-BUILD-MARKER` string kept by `#pragma comment(linker, "/INCLUDE:RstFltVersion")` in `rstflt.c`) or `signtool verify /pa /v rstflt.sys`.
+- **`mssmbios.sys` is `Start=1` (SYSTEM_START) on stock Windows**, loading AFTER our BOOT_START `RstFlt` — `ZwOpenKey` on `\Registry\Machine\SYSTEM\CurrentControlSet\Services\mssmbios\Data` at DriverEntry time returns `STATUS_OBJECT_NAME_NOT_FOUND`. The driver's `WriteLastReplayStatus` breadcrumb records tag `0x04 MSSMBIOS-OPEN-FAIL` in `LastReplayStatus` when this fires — that is the expected steady state on this Hyper-V VM, not a bug.
+- **WMI (Win32_ComputerSystemProduct, Win32_BaseBoard, Win32_SystemEnclosure) serves from mssmbios's in-kernel firmware cache**, not from `HKLM\...\mssmbios\Data\SMBiosData`. Registry writes into that key have no effect on WMI queries — confirmed empirically 2026-08-31. Real spoof requires IRP-level interception on `\Driver\mssmbios` or a UMDF WMI provider shadow, both scheduled in [`docs/roadmap-v41-wmi-intercept.md`](docs/roadmap-v41-wmi-intercept.md). Do NOT re-attempt the registry-write strategy without reading Bug 3 in `incident-v406-bug-triage.md`.
+- **On a `03-instalar-driver.bat` failure with `CreateService FAILED 1072`** (service marked for deletion): a prior `sc delete` did not fully commit. Reboot once, run `03-instalar-driver.bat` again — it succeeds cleanly on a fresh SCM state.
+
+## Documentation map
+
+- `LEIA-ME.txt` — the main user-facing changelog and setup guide, Portuguese, ~55KB. Everything user-facing goes there.
+- `docs/postmortem-v4-phase5/` — incident writeups by version. Read the latest (`incident-v407-driver-boot-regression.md`) first for the current stable-driver context; the `incident-v405-vm-pipeline-validation.md` header shows the closure status of every open bug.
+- `docs/roadmap-v41-wmi-intercept.md` — the next architectural pivot for real WMI-visible spoofing. Explicit PatchGuard warnings against the naive `DriverObject` dispatch swap. UMDF WMI provider shadow to test first.
+- `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`, `docs/fase2-track-a-windows-test-kickoff.md` — anti-cheat threat model + phase planning.
+
+## Style
+
+- Every driver change requires a corresponding changelog block at the top of `driver/rstflt.c` (`v4.0.x - ...`) — do not merge without.
+- Every non-trivial toolkit-behavior discovery gets a new `docs/postmortem-v4-phase5/incident-v40X-*.md`. Reference the file from `LEIA-ME.txt` and from the corresponding `v4.0.x` changelog block in the driver.
+- Commit messages end with `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` when the assistant did substantial work.
+- PR bodies end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- Squash-merge is the convention (`gh pr merge <n> --squash --delete-branch`).
