@@ -10,9 +10,26 @@
 #      confirmou zero leituras EMAC).
 #    - EDID serial partial REMOVIDO: spoof-edid-full.ps1
 #      cobre isso com bloco 0xFF + descritores completos.
+#
+#  v4.0.5: -NoPause switch adicionado. Sem ele, os 3 Read-Host
+#  no fim de cada exit path travam o batch parent 04-aplicar-hwid.bat
+#  (quando invocado do PS shell) causando o batch abortar antes de
+#  rodar os proximos 7 spoofers. Descoberto em VM validation
+#  session 2026-08-30. O batch caller agora passa -NoPause; use
+#  standalone sem a flag pra ter o comportamento pre-v4.0.5.
 # ============================================================
 
+param(
+    [switch]$NoPause
+)
+
 $ErrorActionPreference = "Stop"
+
+function Wait-Enter {
+    if (-not $NoPause) {
+        Wait-Enter
+    }
+}
 
 $profilePath = "C:\ProgramData\.hwcfg\profile.json"
 
@@ -24,7 +41,7 @@ if (-not (Test-Path $profilePath)) {
     Write-Host "  [X] Profile nao encontrado!" -ForegroundColor Red
     Write-Host "  [X] Rode primeiro:  .\generate-profile.ps1 -Generate" -ForegroundColor Red
     Write-Host ""
-    Read-Host "Pressione Enter para fechar"
+    Wait-Enter
     exit 1
 }
 
@@ -45,7 +62,7 @@ if ($profVer -lt 6) {
 }
 if (-not $net) {
     Write-Host "  [X] Profile nao contem bloco 'network' - regenere o profile." -ForegroundColor Red
-    Read-Host "Pressione Enter para fechar"
+    Wait-Enter
     exit 1
 }
 Write-Host ""
@@ -117,4 +134,4 @@ Write-Host "  MAC addresses alterados a partir do profile."
 Write-Host "  Rodar novamente aplica os MESMOS valores (estavel)."
 Write-Host "  Reinicie os adaptadores (ou o PC) para efeito."
 Write-Host ""
-Read-Host "Pressione Enter para fechar"
+Wait-Enter

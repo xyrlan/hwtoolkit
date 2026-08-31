@@ -305,6 +305,96 @@ Profile:
   - ~10 GB livres (para VS Build Tools + WDK)
 
 ========================================================
+  MUDANCAS EM v4.0.5 (VM validation session findings)
+========================================================
+
+  v4.0.5 - Sessao de validacao end-to-end das Phases 2->6->7->8
+           no Hyper-V dev VM (windev2407eval). Achou 5 bugs
+           reais antes de tocar no hardware fisico. Detalhe
+           completo em docs/postmortem-v4-phase5/
+           incident-v405-vm-pipeline-validation.md.
+
+           WINS validados no VM:
+             - Phase 8 CPU registry replay: v4.0 crown feature
+               provado end-to-end. Todos 8 cores logicos spoofados
+               (i7-10700F real -> i5-10600K fake). OrigCpuStrings
+               backup preservado. Uninstall path funcional.
+             - Phase 6 registry HWIDs: windows-id (MachineGuid,
+               ComputerName, TCPIP Hostname), EDID full, EMAC UUID
+               todos aplicando corretamente.
+             - Phase 2 profile generation + WriteDriver seed OK.
+
+           FIXES aplicados neste commit:
+
+             1) scripts/spoof-smbios.ps1:127 - byte overflow em
+                [Math]::Min($len, $Blob.Length - $offset).
+                $len e byte (max 255), $Blob.Length-$offset e int
+                que passa de 255 em qualquer BIOS moderno (blob
+                >= 256 bytes). PS resolvia pro overload Min(byte,
+                byte) e falhava o cast. Fix: [int]$len explicit.
+                Latente desde spoof-smbios v2 (v3.x); nao pegava
+                antes porque Phase 7 nunca completou em campo.
+
+             2) scripts/spoof-mac.ps1 + 04-aplicar-hwid.bat -
+                bug do batch abortar apos spoof-mac. spoof-mac
+                tinha 3x Read-Host "Pressione Enter para fechar"
+                nos exit paths (linhas 27, 48, 120) que travavam
+                o batch quando invocado de PS shell parent, com
+                cmd.exe emitindo ". was unexpected at this time."
+                Fix: adicionado switch -NoPause, todas 3 chamadas
+                passam por Wait-Enter que respeita a flag. Batch
+                agora invoca com -NoPause. Standalone use (sem
+                flag) preserva comportamento pre-v4.0.5.
+
+           BUGS documentados (nao fixados, need WinDbg):
+
+             3) SMBIOS replay ineficaz - driver DriverEntry escreve
+                959 bytes fake em HKLM\...\mssmbios\Data mas apos
+                reboot o key mostra 1036 bytes originais. mssmbios.sys
+                aparentemente sobrepoe nossa write, OU nao lemos/
+                escrevemos a key certa. WMI queries continuam
+                retornando SMBIOS real Hyper-V. OrigSmbiosData
+                (backup) nunca eh escrito. A estrategia "beat
+                mssmbios by writing to registry from BOOT_START
+                driver" pode precisar rework - talvez como filter
+                driver em \\Device\\mssmbios ou como lower filter
+                driver do mssmbios.
+
+             4) First-boot-pos-arm crashes ~52-56s em AMBOS os
+                replays (SMBIOS e CPU testados isolados). Windows
+                registra Event ID 41 (Kernel-Power unexpected
+                shutdown) mas nao Event 1001 (BugCheck) e nao
+                escreve MEMORY.DMP. Cycle #2 (auto-reboot pos-
+                crash) estabiliza; CPU replay applied nesse
+                ponto. Padrao identico do timing (~52-56s) sugere
+                root cause comum - talvez algum servico ~50s pos-
+                boot que le CPU/SMBIOS registry, cracha uma vez
+                por inconsistencia, e o SCM marca como "skip this
+                boot". UX ruim mas nao data loss. Diagnose via
+                WinDbg attach (COM1 pipe ja configurado) +
+                !analyze -v.
+
+             5) scripts/spoof-smbios.ps1 trava em Restart-Service
+                winmgmt (Step 12, apos armar Parameters). WMI +
+                15 dependentes lento pra recuperar; queries pos-
+                restart falham com RPC_E_CALL_CANCELED. Ctrl+C
+                para o script - Parameters key ja esta armada
+                antes desse ponto, entao recuperacao eh trivial:
+                pular verificacao WMI, rebootar. Follow-up: rework
+                verify+arm pra ser resiliente a WMI travar.
+
+           POSTURA recomendada pro proximo run no hardware fisico:
+             GREEN: v4.0.4 correctness, Phase 2, Phase 6 (com MAC
+                    real matchando), Phase 8 CPU replay (aceite o
+                    crash de cycle #1 unico como quirk conhecido).
+             YELLOW: Phase 7 SMBIOS - NAO arme EnableSmbiosReplay
+                     ainda ate Bug 3+4 debugados com WinDbg. Deixe
+                     SmbiosBlob cachado no Parameters mas skip
+                     arm.
+             RED:   Phase 6 disk/volume spoofers - risco brick,
+                    manual restore point + WinPE stick recomendado.
+
+========================================================
   MUDANCAS EM v4.0.4 (boot correctness patches)
 ========================================================
 

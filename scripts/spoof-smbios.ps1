@@ -123,8 +123,16 @@ function Parse-SmbiosStructures {
         if ($len -lt 4) { break }
 
         # Extrair area formatada
+        # Nota: $len vem do byte array so vale 0-255. $Blob.Length - $offset
+        # e int e pode passar de 255 em blobs SMBIOS reais (>= 256 bytes,
+        # ou seja, praticamente qualquer BIOS moderno). Sem o cast [int],
+        # [Math]::Min resolve pro overload (byte, byte) e faz overflow
+        # tentando converter 1028 (ou o que for) pra byte. Descoberto
+        # rodando este spoofer pela primeira vez no VM (blob 1036 bytes,
+        # StartOffset 8 -> Length-offset = 1028 > 255). Bugado desde v3.x
+        # mas ninguem viu porque Phase 7 nunca completou em campo ate v4.0.4.
         $formatted = New-Object byte[] $len
-        [Array]::Copy($Blob, $offset, $formatted, 0, [Math]::Min($len, $Blob.Length - $offset))
+        [Array]::Copy($Blob, $offset, $formatted, 0, [Math]::Min([int]$len, $Blob.Length - $offset))
 
         # Ler string table
         $strOffset = $offset + $len

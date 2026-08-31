@@ -41,7 +41,10 @@ rem   Base: HWID changes (MACs somente aqui; MachineGuid + ComputerName +
 rem   TCP/IP Hostname foram restaurados em v3.7 no bloco Fase 1.6, abaixo.
 rem   SQM/ProductID confirmados NAO lidos por EMAC (recon v2) - nao spoofados.
 rem ========================================================
-powershell -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-mac.ps1"
+rem v4.0.5: -NoPause suprime os 3 Read-Host "Pressione Enter para fechar"
+rem do spoof-mac.ps1. Sem isso o batch trava e os proximos 7 spoofers
+rem nao rodam quando executamos 04-aplicar-hwid.bat de um PS shell.
+powershell -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-mac.ps1" -NoPause
 if %errorlevel% neq 0 (
     set "MAC_STATUS=FAIL(%errorlevel%)"
     echo.
