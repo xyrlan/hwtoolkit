@@ -2,6 +2,8 @@
 
 Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (`driver/rstflt.c`, DiskDrive class UpperFilter) + PowerShell user-mode spoofers (`scripts/`) + sequential `NN-*.bat` pipeline in the repo root. Targets: Fase 5 anti-cheat detection surfaces (WMI, SMBIOS, CPU registry, MAC, EDID, disk serial, Windows machine identity). Primary threat model docs: `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`.
 
+**As of Phase 1 (2026-08-31), Level A (EMAC-only userland spoof, no kernel driver) is the recommended default against EMAC-tier anti-cheats (RubinOT) per `docs/emac-recon-v3.md`.** Level C driver install (`03-instalar-driver.bat` + kernel replay) remains opt-in for future stronger anti-cheats that inspect SMBIOS/CPUID beyond what EMAC surfaces today.
+
 **Language conventions in-repo**: user-facing prose in `README.md`, `.bat`, script output, and PowerShell comments is Portuguese-BR. Driver code comments, postmortems, and technical rationale in English. Commit messages in English. Keep this split when adding content.
 
 ## Toolchain — DO NOT deviate
@@ -21,6 +23,8 @@ Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (
 - Prep for BSOD dump collection: `.\scripts\prep-crashdump.ps1` (sets `AutoReboot=0` + `DedicatedDumpFile=C:\rstflt-dump.sys`); `-Restore` to revert.
 - Audit consistency post-boot: `.\scripts\check-consistency.ps1` — decodes driver's `LastReplayStatus` breadcrumb, verifies driver version marker, cross-checks WMI/registry/SMBIOS/CPU/network.
 - Uninstall: `.\08-desinstalar-driver.bat --skip-fase16` — always the safe way to remove the driver (restores UpperFilters from backup key). Requires reboot to fully release.
+- Aplicar Level A (EMAC-only, sem driver kernel): `.\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid` - modo recomendado default contra EMAC-tier (RubinOT). Ver docs/emac-recon-v3.md.
+- Rollback Level A userland: `.\08b-rollback-userland.bat` - reverte MachineGuid/ComputerName/etc dos backups .hwcfg + unregistra HWToolkit\SpoofCPUUserland task. Nao toca driver.
 - Boot recovery from WinRE: `.\09-recuperar-boot.bat` (offline registry surgery to remove `RstFlt` from UpperFilters and delete the service).
 
 **Do NOT invoke** `sc stop RstFlt ; sc delete RstFlt ; Restart-Computer -Force` in one shot without first removing `RstFlt` from `HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e967-...}\UpperFilters` — this reproduces the STOP 0x7B failure mode documented in [`incident-v402-signature-plus-filter.md`](docs/postmortem-v4-phase5/incident-v402-signature-plus-filter.md) (UpperFilters walk points at deleted service → `CM_PROB_FAILED_ADD` → 0x7B). `08-desinstalar-driver.bat` does the correct order automatically.

@@ -18,6 +18,65 @@ RECONHECIMENTO (LEITURA OBRIGATORIA):
   acontecem. Base para decisoes de arquitetura v3.6 (driver
   minimal) e v3.7 (Fase 1.6 registry-only + hotfix MachineGuid).
 
+## MODO LEVEL A (EMAC-ONLY, SEM DRIVER KERNEL)
+
+Level A e o modo recomendado por padrao contra anti-cheats
+tier EMAC (RubinOT e similares que dependem de leituras
+userland - registry, WMI Win32_ComputerSystem/Processor,
+IPHelper GetAdaptersAddresses, EnumDisplayDevices EDID).
+
+Neste modo, o toolkit opera 100% em user-mode via os
+scripts PowerShell da pasta scripts/. NAO instala o driver
+kernel rstflt.sys, NAO registra servico BOOT_START, NAO
+faz replay de blob SMBIOS via mssmbios\Data. A superficie
+de deteccao fica limitada aos vetores que o EMAC realmente
+consulta - ver docs/emac-recon-v3.md para a base empirica
+(procmon cross-verified, supersede recon v2 nos pontos que
+o v3 corrige).
+
+Uso (defaults seguros para primeira execucao):
+
+```
+.\00-gerar-profile.bat
+.\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid
+.\06-verificar.bat
+```
+
+Os flags --skip-* pulam vetores de spoof que envolvem
+reescrita de Enum\ do PnP (disco, volume, USB, HID). Sao
+seguros de rodar mas ainda nao foram validados em bare-metal
+alem do smoke test em VM. Depois de validar em bare-metal,
+remova as flags para cobertura completa.
+
+Rollback: `.\08b-rollback-userland.bat`.
+
+Split vs Level C: Level C (03 + 04 + 05, driver kernel +
+SMBIOS blob replay + CPU registry replay) permanece opt-in
+para anti-cheats WMI-reading / firmware-reading (Vanguard,
+EAC, BE) que consultam Win32_ComputerSystemProduct e
+enumeram SMBIOS Types 1/2/3 via firmware. Nao ativar Level C
+sem necessidade - o custo em risco de boot loop e superficie
+de deteccao driver-kernel e alto. Ver
+docs/roadmap-v41-wmi-intercept.md para a proxima geracao
+de intercept (UMDF WMI provider shadow + IRP-level
+mssmbios hook).
+
+Validado em smoke test VM (2026-08-31):
+
+  - MachineGuid + ComputerName + TCP/IP Hostname reescritos,
+    persistem post-reboot.
+  - spoof-cpu-userland.ps1 -Apply registra task SYSTEM
+    AtLogOn, dispara 15s pos-boot, Win32_Processor.Name
+    reflete o profile.
+  - spoof-network-pnpid.ps1 enumera 14 adapters, safety
+    guards funcionam (skip VMBUS/SWD/ROOT).
+  - spoof-edid-full.ps1 aplica mas EDID reverte no boot em
+    VM Hyper-V (HyperVMonitor sintetico regenerado pelo
+    VMBus display driver). Known limitation - re-armar por
+    spoof-edid-full antes de lancar o jogo, ou testar em
+    bare-metal onde o driver de video real preserva a
+    escrita.
+
 ## ESTRUTURA
 
 ```
