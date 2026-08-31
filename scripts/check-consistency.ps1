@@ -60,6 +60,94 @@ if ($hasProfile) {
 }
 
 # ============================================================
+#  v4.0.6: Read-ReplayStatus — decodifica o breadcrumb que o driver
+#  RstFlt v4.0.6+ deixa em Parameters\LastReplayStatus a cada boot
+#  (ApplySmbiosBlobIfCached WriteLastReplayStatus). Formato:
+#    (tag << 24) | (NTSTATUS & 0x00FFFFFF)
+#  Tags:
+#    0x00 SUCCESS               0x01 GATE-OFF
+#    0x02 NO-BLOB               0x03 VALIDATION-FAIL
+#    0x04 MSSMBIOS-OPEN-FAIL    0x05 MSSMBIOS-WRITE-FAIL
+#  Silencioso se o driver e anterior a v4.0.6 (chave ausente).
+# ============================================================
+function Read-ReplayStatus {
+    $rstflt = 'HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters'
+    if (-not (Test-Path $rstflt)) { return }
+
+    $raw = (Get-ItemProperty -Path $rstflt -Name 'LastReplayStatus' `
+                              -ErrorAction SilentlyContinue).LastReplayStatus
+    if ($null -eq $raw) {
+        Write-Host "  [*]    RstFlt LastReplayStatus: ausente (driver < v4.0.6 ou nao rodou ainda)" -ForegroundColor DarkGray
+        return
+    }
+
+    $tag = ($raw -shr 24) -band 0xFF
+    $st  = $raw -band 0x00FFFFFF
+    $tagNames = @{
+        0x00 = 'SUCCESS'
+        0x01 = 'GATE-OFF'
+        0x02 = 'NO-BLOB'
+        0x03 = 'VALIDATION-FAIL'
+        0x04 = 'MSSMBIOS-OPEN-FAIL'
+        0x05 = 'MSSMBIOS-WRITE-FAIL'
+    }
+    $tagName = $tagNames[$tag]
+    if (-not $tagName) { $tagName = "UNKNOWN($tag)" }
+
+    $stHex = '0x{0:X6}' -f $st
+    $line  = "  [*]    RstFlt LastReplayStatus: $tagName (NTSTATUS=$stHex)"
+    switch ($tag) {
+        0x00 { Write-Host $line -ForegroundColor Green }
+        0x01 { Write-Host $line -ForegroundColor DarkGray }
+        0x02 { Write-Host $line -ForegroundColor DarkGray }
+        0x03 { Write-Host $line -ForegroundColor Yellow }
+        0x04 {
+            Write-Host $line -ForegroundColor Yellow
+            Write-Host "         Esperado em Hyper-V: mssmbios carrega depois de RstFlt," -ForegroundColor DarkGray
+            Write-Host "         path de escrita em registry nao consegue landar. WMI-visible" -ForegroundColor DarkGray
+            Write-Host "         spoof precisa de v4.1 IRP interception. Ver Bug 3." -ForegroundColor DarkGray
+        }
+        0x05 { Write-Host $line -ForegroundColor Yellow }
+        default { Write-Host $line -ForegroundColor Yellow }
+    }
+}
+
+Read-ReplayStatus
+
+# ============================================================
+#  v4.0.6: verificar se o rstflt.sys em disco (nao o carregado)
+#  contem o marker "RstFlt-v4.0.6-BUILD-MARKER". PE TimeDateStamp
+#  muda a cada relink e defeats SHA-based identity, entao este
+#  marker (const char[] mantido por #pragma /INCLUDE) e a forma
+#  confiavel de confirmar que voce esta usando a build v4.0.6+.
+# ============================================================
+function Read-DriverVersionMarker {
+    $sysPath = 'C:\Windows\System32\drivers\rstflt.sys'
+    if (-not (Test-Path $sysPath)) {
+        Write-Host "  [*]    rstflt.sys nao instalado em System32\drivers (driver nao registrado)" -ForegroundColor DarkGray
+        return
+    }
+    try {
+        $b = [System.IO.File]::ReadAllBytes($sysPath)
+        $s = [System.Text.Encoding]::ASCII.GetString($b)
+        # v4.0.9+: match any RstFlt-v* marker (previously hardcoded to v4.0.6, false-negatived v4.0.9 builds)
+        $markerMatch = [regex]::Match($s, 'RstFlt-v(\d+\.\d+\.\d+)-BUILD-MARKER')
+        if ($markerMatch.Success) {
+            Write-Host "  [OK]   rstflt.sys instalado: v$($markerMatch.Groups[1].Value) (marker encontrado)" -ForegroundColor Green
+        } elseif ($s.Contains('RstFlt')) {
+            Write-Host "  [!]    rstflt.sys instalado eh anterior a v4.0.6 (marker ausente)" -ForegroundColor Yellow
+            Write-Host "         Reinstale via 03-instalar-driver.bat para pegar Bug 3 breadcrumb + Bug 5 fixes." -ForegroundColor Yellow
+        } else {
+            Write-Host "  [!]    rstflt.sys em System32 nao parece ser o RstFlt (marker ausente)" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [!]    Falha lendo rstflt.sys: $_" -ForegroundColor Yellow
+    }
+}
+
+Read-DriverVersionMarker
+
+# ============================================================
 #  1. BIOS MIRROR AUDIT
 #
 #  HARDWARE hive nao persiste em disco - e reconstruida a cada boot

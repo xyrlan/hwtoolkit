@@ -1,5 +1,5 @@
 /*
- * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.1)
+ * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.9)
  *
  * SYSTEM_START upper filter of the DiskDrive class. Its jobs are to
  * replay a userspace-cached SMBIOS blob into mssmbios\Data during
@@ -153,6 +153,88 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v4.0.9 - HOTFIX: added Authenticode signing to build pipeline. The
+ *       "Automatic Repair loop after v4.0.6 install" family of failures
+ *       was NOT caused by any source-code regression — bisection through
+ *       v4.0.6/7/8 (removing WriteLastReplayStatus body, removing
+ *       RstFltVersion marker, even rebuilding pure v4.0.4 source) all
+ *       reproduced identically. Root cause: the toolkit stopped signing
+ *       rstflt.sys at some point. WDAC-enforced Win10 winload REJECTS
+ *       an unsigned BOOT_START driver during PnP UpperFilters walk,
+ *       CM_PROB_FAILED_ADD fires, storage stack cannot come up, boot
+ *       manager retries three times then hands off to WinRE Automatic
+ *       Repair — no bugcheck screen because no kernel ever finished
+ *       booting. Fix: signtool sign step added to driver/makefile.mak
+ *       linking rule, using the self-signed HWToolkit Test Cert 2026
+ *       (thumbprint 30310EE7644799431FFF099E1194817E813152B9) already
+ *       provisioned in Cert:\CurrentUser\My on the host and Cert:\
+ *       LocalMachine\Root on the target VM (see v4.0.2 postmortem).
+ *       WriteLastReplayStatus body RESTORED to active ZwSetValueKey.
+ *       RstFltVersion marker + /INCLUDE pragma RESTORED — the H2/H1
+ *       "reverts" of v4.0.7/8 were red herrings.
+ *       Documented in docs/postmortem-v4-phase5/incident-v407-driver-
+ *       boot-regression.md.
+ * v4.0.8 - REJECTED (H1 revert bisection attempt; source discarded).
+ * v4.0.7 - REJECTED (H2 revert bisection attempt; source discarded).
+ * v4.0.6 - Bug 3 findings originally shipped here (RstFltVersion marker
+ *       + WriteLastReplayStatus breadcrumb + corrected DriverEntry
+ *       comment about mssmbios boot ordering). All that source is
+ *       RESTORED in v4.0.9; only the missing signtool step was the
+ *       actual regression. See v4.0.6 changelog block below.
+ * v4.0.6-original - was v4.0.6 comment placeholder — replaced by v4.0.9 above.
+ * v4.0.9-old-hotfix-note - HOTFIX: v4.0.6 introduced a WriteLastReplayStatus helper
+ *       that called ZwSetValueKey on our own Services\RstFlt\
+ *       Parameters key from inside DriverEntry at BOOT_START. That
+ *       write reproducibly triggered Automatic Repair (STOP 0x7B
+ *       family, no visible bugcheck screen) on Win10 Enterprise dev
+ *       VM even in the gate-off no-op path (EnableSmbiosReplay=0).
+ *       Multi-agent triage confirmed the ZwSetValueKey as the sole
+ *       runtime differential vs v4.0.4 on the empirical gate=0 boot
+ *       path. Neutered the helper body to UNREFERENCED_PARAMETER
+ *       so every call site becomes a no-op without touching the
+ *       10 sites in ApplySmbiosBlobIfCached individually. Version
+ *       marker + comment blocks + DBG banner all kept from v4.0.6.
+ *       See docs/postmortem-v4-phase5/incident-v407-driver-boot-
+ *       regression.md. Follow-up (v4.1): defer breadcrumb to a
+ *       DelayedWorkQueue work item at PASSIVE post-boot.
+ * v4.0.6 - Bug 3 findings (v4.0.5 postmortem, VM validation):
+ *     - CORRECTED the false claim under v4.0 that "mssmbios has already
+ *       booted BOOT_START before us". Empirically verified 2026-08-30
+ *       on Win10 Pro dev host: mssmbios is Start=1 (SYSTEM_START) with
+ *       no group ordering, while RstFlt is Start=0 (BOOT_START). RstFlt
+ *       therefore runs BEFORE mssmbios, and ApplySmbiosBlobIfCached's
+ *       ZwOpenKey on \Registry\Machine\...\mssmbios\Data typically
+ *       returns STATUS_OBJECT_NAME_NOT_FOUND at BOOT_START init because
+ *       the Data subkey is (re)created by mssmbios itself during its
+ *       own SYSTEM_START init (likely REG_OPTION_VOLATILE). This is
+ *       exactly why Parameters\OrigSmbiosData stayed 0 bytes in the
+ *       v4.0.5 postmortem — we bail at the mssmbios-open step, before
+ *       the backup path is reachable.
+ *     - Even if the ZwOpenKey succeeded, the whole "write mssmbios\Data
+ *       from a driver" strategy is architecturally ineffective: WMI
+ *       (Win32_ComputerSystemProduct, Win32_BaseBoard, Win32_System-
+ *       Enclosure, MSSmBios_RawSMBiosTables) queries route through the
+ *       kernel WMI infrastructure (WmipQueryRawSMBiosTables → Wmip-
+ *       GetRawSMBiosTableData) which reads SMBIOS DIRECTLY FROM FIRMWARE
+ *       (physical memory scan for legacy or ACPI RSMB entry-point for
+ *       UEFI). The registry value is a write-back artifact for external
+ *       readers, not the source-of-truth mssmbios itself consults.
+ *       Real WMI-visible SMBIOS spoofing requires IRP_MJ_SYSTEM_CONTROL
+ *       dispatch interception on \Driver\mssmbios; that pivot is
+ *       scheduled for v4.1 (see docs/roadmap-v41-wmi-intercept.md).
+ *     - ApplySmbiosBlobIfCached is RETAINED as a best-effort no-op with
+ *       diagnostic breadcrumb. New helper WriteLastReplayStatus records
+ *       the exit tag+NTSTATUS at every bail path into
+ *       Parameters\LastReplayStatus (REG_DWORD, encoding (tag<<24)|
+ *       (status&0x00FFFFFF)), so future postmortems have evidence-in-
+ *       hive without WinDbg attach. Tags:
+ *           0x00 SUCCESS               0x01 GATE-OFF
+ *           0x02 NO-BLOB               0x03 VALIDATION-FAIL
+ *           0x04 MSSMBIOS-OPEN-FAIL    0x05 MSSMBIOS-WRITE-FAIL
+ *       scripts/check-consistency.ps1 decodes and prints this.
+ *     - Kept for the physical-hardware case where SMBIOS registry
+ *       behavior may differ from Hyper-V; on Hyper-V, expect
+ *       LastReplayStatus tag=0x04 (MSSMBIOS-OPEN-FAIL) every boot.
  * v4.0.1 - HOTFIX: v4.0 froze physical hardware at boot even with
  *       EnableCpuReplay=0 (no BSOD, no dump, no bugcheck 1001,
  *       Verifier /standard armed and clean). Root cause: DriverEntry
@@ -184,6 +266,17 @@
  *  Constants
  * ================================================================ */
 #define POOL_TAG    'tRsF'
+
+/* v4.0.9: version marker RESTORED. The v4.0.8 removal-as-bisection was
+ * a red herring — Authenticode signing being missing was the real cause
+ * of the boot regression, not this const array. The /INCLUDE linker
+ * directive forces link.exe to keep the symbol under aggressive dead-
+ * code elimination so `scripts/check-consistency.ps1 Read-DriverVersion-
+ * Marker` can validate the installed driver came from v4.0.9+ source
+ * without depending on the PE TimeDateStamp (which changes on relink). */
+#pragma comment(linker, "/INCLUDE:RstFltVersion")
+const char RstFltVersion[] = "RstFlt-v4.0.9-BUILD-MARKER";
+
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
  * Downstream WMI / session-mgr consumers commonly use fixed 260-char
@@ -250,6 +343,49 @@ static BOOLEAN ValidateSmbiosBlob(const UCHAR *Blob, ULONG Length);
 static VOID    ReplayCpuRegistry(PUNICODE_STRING RegPath);
 static VOID    CpuReplayWorker(PVOID Context);
 static BOOLEAN IsCpuReplayEnabled(PUNICODE_STRING RegPath);
+static VOID    WriteLastReplayStatus(HANDLE hParams, UCHAR tag, NTSTATUS st);
+
+/* ================================================================
+ *  WriteLastReplayStatus - v4.0.6 diagnostic breadcrumb.
+ *
+ *  Records the exit tag and NTSTATUS from ApplySmbiosBlobIfCached
+ *  into <RegPath>\Parameters\LastReplayStatus (REG_DWORD, encoding
+ *      code = (tag << 24) | (status & 0x00FFFFFF)
+ *  ) so scripts/check-consistency.ps1 can decode and print WHERE
+ *  the replay bailed on the previous boot — without a WinDbg attach.
+ *
+ *  Tag values (see v4.0.6 changelog):
+ *      0x00 SUCCESS
+ *      0x01 GATE-OFF               (EnableSmbiosReplay=0 or absent)
+ *      0x02 NO-BLOB                (Parameters\SmbiosBlob missing/tiny)
+ *      0x03 VALIDATION-FAIL        (ValidateSmbiosBlob rejected cached blob)
+ *      0x04 MSSMBIOS-OPEN-FAIL     (ZwOpenKey on mssmbios\Data failed —
+ *                                   expected on stock Windows because
+ *                                   mssmbios is SYSTEM_START; see v4.0.6
+ *                                   comment block)
+ *      0x05 MSSMBIOS-WRITE-FAIL    (ZwSetValueKey on SMBiosData failed)
+ *
+ *  Best-effort: failure of the status write is ignored. Called ONLY
+ *  when hParams is non-NULL (guarded at call sites) so we always have
+ *  a KEY_SET_VALUE handle to the Parameters key.
+ * ================================================================ */
+static VOID WriteLastReplayStatus(HANDLE hParams, UCHAR tag, NTSTATUS st)
+{
+    /* v4.0.9: body RESTORED. Previous "revert" hypothesis (v4.0.7)
+       thought BOOT_START ZwSetValueKey was the boot-breaker; bisection
+       proved that wrong — the actual regression was the missing
+       Authenticode signature. With signtool re-added to the build,
+       this write is safe. See v4.0.9 changelog block above. */
+    UNICODE_STRING valName;
+    ULONG code;
+
+    if (hParams == NULL) return;
+
+    code = ((ULONG)tag << 24) | ((ULONG)st & 0x00FFFFFFUL);
+    RtlInitUnicodeString(&valName, L"LastReplayStatus");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &code, sizeof(code));
+}
 
 /* ================================================================
  *  ValidateSmbiosBlob - sanity-check a cached SMBIOS blob before
@@ -436,6 +572,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 #if DBG
         DbgPrint("[RstFlt] SMBIOS replay: opt-in flag absent, skipping\n");
 #endif
+        WriteLastReplayStatus(hParams, 0x01, st);   /* GATE-OFF (absent) */
         goto out;
     }
     RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
@@ -443,6 +580,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 #if DBG
         DbgPrint("[RstFlt] SMBIOS replay: opt-in flag = 0, skipping\n");
 #endif
+        WriteLastReplayStatus(hParams, 0x01, STATUS_SUCCESS);  /* GATE-OFF (=0) */
         goto out;
     }
 
@@ -451,20 +589,27 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
                          NULL, 0, &needSize);
     if (st != STATUS_BUFFER_TOO_SMALL &&
-        st != STATUS_BUFFER_OVERFLOW)
+        st != STATUS_BUFFER_OVERFLOW) {
+        WriteLastReplayStatus(hParams, 0x02, st);   /* NO-BLOB */
         goto out;                        /* no cached blob → nothing to do */
-    if (needSize < (ULONG)(FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 32))
+    }
+    if (needSize < (ULONG)(FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data) + 32)) {
+        WriteLastReplayStatus(hParams, 0x02, STATUS_BUFFER_TOO_SMALL);
         goto out;                        /* smaller than any real SMBIOS */
+    }
 
     allocSize = needSize;
     info = (PKEY_VALUE_PARTIAL_INFORMATION)
            ExAllocatePoolWithTag(NonPagedPool, allocSize, POOL_TAG);
-    if (info == NULL) goto out;
+    if (info == NULL) {
+        WriteLastReplayStatus(hParams, 0x02, STATUS_INSUFFICIENT_RESOURCES);
+        goto out;
+    }
 
     st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
                          info, allocSize, &needSize);
-    if (!NT_SUCCESS(st))          goto out;
-    if (info->Type != REG_BINARY) goto out;
+    if (!NT_SUCCESS(st))          { WriteLastReplayStatus(hParams, 0x02, st); goto out; }
+    if (info->Type != REG_BINARY) { WriteLastReplayStatus(hParams, 0x02, STATUS_OBJECT_TYPE_MISMATCH); goto out; }
 
     /* v3.4: validate before ever touching mssmbios */
     if (!ValidateSmbiosBlob(info->Data, info->DataLength)) {
@@ -472,6 +617,7 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
         DbgPrint("[RstFlt] SMBIOS replay: cached blob failed validation "
                  "(%lu bytes) — ignored\n", info->DataLength);
 #endif
+        WriteLastReplayStatus(hParams, 0x03, STATUS_DATA_ERROR);  /* VALIDATION-FAIL */
         goto out;
     }
 
@@ -487,6 +633,10 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
 #if DBG
         DbgPrint("[RstFlt] SMBIOS replay: open mssmbios failed 0x%08X\n", st);
 #endif
+        /* v4.0.6: EXPECTED on stock Windows — mssmbios is SYSTEM_START,
+           loads AFTER us; Data subkey doesn't exist yet. See v4.0.6
+           changelog comment block. */
+        WriteLastReplayStatus(hParams, 0x04, st);   /* MSSMBIOS-OPEN-FAIL */
         goto out;
     }
 
@@ -544,6 +694,15 @@ static VOID ApplySmbiosBlobIfCached(PUNICODE_STRING RegPath)
     DbgPrint("[RstFlt] SMBIOS replay: wrote %lu bytes, status=0x%08X\n",
              info->DataLength, st);
 #endif
+    /* v4.0.6: breadcrumb — 0x00 SUCCESS if write landed, 0x05 otherwise.
+       Reminder: per Bug 3 postmortem, "SUCCESS" here means only that
+       the registry write went through, NOT that WMI sees the spoof —
+       WMI serves from mssmbios's in-kernel firmware cache which we
+       cannot reach from this driver. Real WMI spoof lives in v4.1. */
+    if (NT_SUCCESS(st))
+        WriteLastReplayStatus(hParams, 0x00, STATUS_SUCCESS);   /* SUCCESS */
+    else
+        WriteLastReplayStatus(hParams, 0x05, st);               /* MSSMBIOS-WRITE-FAIL */
 
 out:
     if (info)      ExFreePoolWithTag(info, POOL_TAG);
@@ -1604,17 +1763,32 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
  * ================================================================ */
 
 /* ================================================================
- *  DriverEntry - queue CPU-registry replay worker, replay SMBIOS
- *  blob synchronously, register dispatch routines.
+ *  DriverEntry - queue CPU-registry replay worker, run SMBIOS blob
+ *  best-effort no-op, register dispatch routines.
  *
- *  v4.0 ordering rationale: CPU replay is race-sensitive against
- *  HAL's per-core value population and needs a long tick budget,
- *  so it goes off-thread via ExQueueWorkItem FIRST — no boot
- *  slowdown, and it starts scheduling before we sit on any hive
- *  I/O. ApplySmbiosBlobIfCached stays inline: its target hive is
- *  on-disk and mssmbios itself has already booted at BOOT_START
- *  before us, so the timing pressure is on future readers/reloads,
- *  not the current-boot mssmbios instance.
+ *  v4.0 ordering: CPU replay is race-sensitive against HAL's per-core
+ *  value population and needs a long tick budget, so it goes off-
+ *  thread via ExQueueWorkItem FIRST — no boot slowdown, and it starts
+ *  scheduling before we sit on any hive I/O.
+ *
+ *  v4.0.6 correction (previous comment here was factually wrong):
+ *  ApplySmbiosBlobIfCached is CURRENTLY a best-effort no-op on stock
+ *  Windows. mssmbios.sys is SYSTEM_START (Start=1, verified 2026-08-30
+ *  on Win10 Pro dev host) and loads AFTER RstFlt (BOOT_START, Start=0).
+ *  ZwOpenKey on \\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services
+ *  \\mssmbios\\Data typically returns STATUS_OBJECT_NAME_NOT_FOUND at
+ *  BOOT_START init because the Data subkey is (re)created by mssmbios
+ *  itself during its own SYSTEM_START init (likely REG_OPTION_VOLATILE).
+ *  Even if we somehow raced and won, WMI (Win32_ComputerSystemProduct
+ *  etc.) still returns firmware values because mssmbios reads them
+ *  directly from ACPI RSMB / firmware physical memory via WmipGetRaw-
+ *  SMBiosTableData, not from the registry mirror. Real WMI-visible
+ *  spoof requires IRP_MJ_SYSTEM_CONTROL interception on \\Driver\\
+ *  mssmbios — deferred to v4.1 (see docs/roadmap-v41-wmi-intercept.md).
+ *  Function retained ONLY to (a) leave a Parameters\\LastReplayStatus
+ *  breadcrumb for postmortem visibility (WriteLastReplayStatus) and
+ *  (b) preserve the code path for the physical-hardware case where
+ *  registry behavior may differ.
  *
  *  Both replays are best-effort and never propagate failure.
  * ================================================================ */
@@ -1624,6 +1798,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     PCPU_REPLAY_CTX ctx = NULL;
     ULONG           ctxSize;
     USHORT          copyLen;
+
 
     /* v4.0.1 hotfix — EARLY GATE CHECK before allocating ctx or
        queuing any worker. Prior versions queued the worker
@@ -1701,7 +1876,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v4.0.4, SMBIOS + gated CPU replay + paging-path handler)\n");
+    DbgPrint("[RstFlt] DriverEntry OK (v4.0.9, SMBIOS no-op+breadcrumb + gated CPU replay + paging-path handler + Authenticode signed)\n");
 #endif
     return STATUS_SUCCESS;
 }

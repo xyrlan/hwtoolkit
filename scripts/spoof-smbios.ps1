@@ -17,8 +17,23 @@ param(
     # v3.4: por padrao setamos EnableSmbiosReplay=1 no driver DEPOIS de
     # verificar via WMI. -DisableKernelReplay pula esse passo (util para
     # depurar boot loop suspeito de vir do replay em kernel).
-    [switch]$DisableKernelReplay
+    [switch]$DisableKernelReplay,
+    # v4.0.6: switches mutuamente exclusivos para isolar Bug 4 (crash em
+    # ~52-56s post-arm). Sem eles, um teste "so CPU" arma EnableCpuReplay
+    # a mao SEM limpar EnableSmbiosReplay=1 do run anterior, contaminando
+    # a evidencia. Com estes switches o operador consegue medir SMBIOS-only
+    # ou CPU-only de verdade.
+    #   -SmbiosOnly: limpa CpuStrings/EnableCpuReplay antes; pula Step 10c.
+    #   -CpuOnly:    limpa SmbiosBlob/EnableSmbiosReplay/OrigSmbiosData
+    #                antes; pula Steps 4-10b; arma EnableCpuReplay=1 no fim.
+    [switch]$SmbiosOnly,
+    [switch]$CpuOnly
 )
+
+if ($SmbiosOnly -and $CpuOnly) {
+    Write-Host "[!] -SmbiosOnly e -CpuOnly sao mutuamente exclusivos." -ForegroundColor Red
+    exit 1
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -106,6 +121,66 @@ $smb = $prof.smbios
 
 Write-OK "Profile carregado (v$($prof.version))"
 Write-Info "Target: $($smb.board_manufacturer) / $($smb.board_product)"
+
+# ============================================================
+#  v4.0.6 (Bug 4 postmortem):
+#  Se o operador pediu -SmbiosOnly ou -CpuOnly, limpar a chave da
+#  OUTRA replay para nao contaminar a evidencia. O bug 4 (crash em
+#  52-56s post-arm) foi observado com "mesmo timing para SMBIOS e
+#  CPU independentes", mas na verdade nenhum script nunca escreveu
+#  EnableCpuReplay — operador ligava a mao SEM limpar EnableSmbios-
+#  Replay=1 do run anterior, entao "CPU-only" era SMBIOS+CPU. Estes
+#  switches dao isolamento REAL entre as duas replays.
+# ============================================================
+$driverParams   = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
+$driverInstalled = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt"
+
+if ($SmbiosOnly -and $driverInstalled -and (Test-Path $driverParams)) {
+    Write-Info "-SmbiosOnly: limpando CpuStrings + EnableCpuReplay do driver..."
+    Remove-ItemProperty -Path $driverParams -Name "CpuStrings"      -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $driverParams -Name "EnableCpuReplay" -ErrorAction SilentlyContinue
+    Write-OK "CPU replay path limpo (arma SMBIOS apenas)"
+}
+
+if ($CpuOnly) {
+    Write-Info "-CpuOnly: pulando SMBIOS inteiro, limpando estado SMBIOS do driver..."
+    if ($driverInstalled -and (Test-Path $driverParams)) {
+        Remove-ItemProperty -Path $driverParams -Name "SmbiosBlob"         -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $driverParams -Name "OrigSmbiosData"     -ErrorAction SilentlyContinue
+        Write-OK "SMBIOS replay path limpo"
+    }
+    if (-not $driverInstalled) {
+        Write-Err "Driver RstFlt nao instalado — -CpuOnly precisa do driver."
+        exit 1
+    }
+    if (-not ($prof.PSObject.Properties.Name -contains "cpu" -and $prof.cpu)) {
+        Write-Err "Profile v< 9 (sem bloco cpu) — -CpuOnly requer profile v9+."
+        exit 1
+    }
+    if (-not (Test-Path $driverParams)) { New-Item -Path $driverParams -Force | Out-Null }
+    $cpuNameStr = [string]$prof.cpu.name_string
+    $cpuIdent   = [string]$prof.cpu.identifier
+    $cpuVendor  = [string]$prof.cpu.vendor_identifier
+    Set-ItemProperty -Path $driverParams -Name "CpuStrings" `
+        -Value @($cpuNameStr, $cpuIdent, $cpuVendor) -Type MultiString
+    Set-ItemProperty -Path $driverParams -Name "EnableCpuReplay" -Value 1 -Type DWord
+    Write-OK "CpuStrings + EnableCpuReplay=1 armados"
+    Write-Info "  name_string:       $cpuNameStr"
+    Write-Info "  identifier:        $cpuIdent"
+    Write-Info "  vendor_identifier: $cpuVendor"
+    Write-Host ""
+    Write-Host "  === Estado final Parameters ===" -ForegroundColor White
+    Get-ItemProperty -Path $driverParams -ErrorAction SilentlyContinue |
+        Select-Object EnableSmbiosReplay, EnableCpuReplay, `
+                      @{n='SmbiosBlob';    e={if ($_.SmbiosBlob){"$($_.SmbiosBlob.Length) bytes"} else {'(absent)'}}}, `
+                      @{n='CpuStrings';    e={if ($_.CpuStrings){"$($_.CpuStrings.Count) strings"} else {'(absent)'}}}, `
+                      @{n='OrigSmbiosData';e={if ($_.OrigSmbiosData){"$($_.OrigSmbiosData.Length) bytes"} else {'(absent)'}}} |
+        Format-List
+    Write-Host ""
+    Write-Host "  Reboot para o driver aplicar CpuStrings no proximo boot." -ForegroundColor Green
+    exit 0
+}
 
 # ============================================================
 #  SMBIOS Parsing Functions
@@ -468,17 +543,20 @@ try {
 # ============================================================
 #  Step 10b: Cachear blob para o driver replay em kernel
 #
-#  Fluxo v3.4:
+#  Fluxo v4.0.6 (Bug 3+5 postmortem):
 #   - Cache do blob e feito AGORA (para o driver ter em maos).
-#   - Opt-in flag (EnableSmbiosReplay=1) e setado APENAS DEPOIS
-#     da verificacao WMI abaixo (Step 12) confirmar que o blob
-#     nao quebrou consultas basicas. Isso evita repetir o BSOD
-#     onde um blob quebrado ficava cacheado e era reaplicado a
-#     cada boot pelo driver, brickando o Windows.
+#   - Opt-in flag (EnableSmbiosReplay=1) e setado APENAS SE o
+#     SmbiosBlob for cacheado com sucesso ($cachedBlob=true).
+#     Validacao real ocorre no proximo boot, dentro do driver
+#     (ValidateSmbiosBlob rejeita blob malformado sem tocar
+#     mssmbios\Data; OrigSmbiosData ficou de backup).
+#   - Removido gate WMI que existia em v3.4-v4.0.5: WMI serve do
+#     cache in-kernel do mssmbios (populado do firmware ACPI/RSMB),
+#     nao do registry, entao a query nunca observou o blob que
+#     escrevemos. Ver Bug 3 no postmortem v4.0.5.
 #   - -DisableKernelReplay pula tudo isso.
 # ============================================================
-$driverParams   = "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters"
-$driverInstalled = Test-Path "HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt"
+# $driverParams / $driverInstalled ja definidos no topo (v4.0.6 switch handling).
 $cachedBlob     = $false
 
 if ($DisableKernelReplay) {
@@ -520,8 +598,9 @@ if ($DisableKernelReplay) {
 #    - -DisableKernelReplay nao esta setado (mesma logica dos
 #      passos anteriores: se o usuario desligou replay para
 #      depurar, tambem nao queremos empilhar spoof de CPU)
+#    - -SmbiosOnly nao esta setado (v4.0.6 isolamento Bug 4)
 # ============================================================
-if ($driverInstalled -and -not $DisableKernelReplay) {
+if ($driverInstalled -and -not $DisableKernelReplay -and -not $SmbiosOnly) {
     if ($prof.PSObject.Properties.Name -contains "cpu" -and $prof.cpu) {
         $cpuNameStr = [string]$prof.cpu.name_string
         $cpuIdent   = [string]$prof.cpu.identifier
@@ -553,71 +632,64 @@ if ($driverInstalled -and -not $DisableKernelReplay) {
 }
 
 # ============================================================
-#  Step 11: Reiniciar WMI
-# ============================================================
-Write-Info "Reiniciando WMI para aplicar..."
-Restart-Service winmgmt -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-# ============================================================
-#  Step 12: Verificar
+#  Step 11: Snapshot WMI (informacional; NAO valida spoof)
+#
+#  v4.0.6 (postmortem v4.0.5 Bug 5+3):
+#    - REMOVIDO Restart-Service winmgmt -Force: bloqueia 60+s pela
+#      cascata SCM de 15+ dependentes (Winrm, ProfSvc, Themes,
+#      wuauserv, wscsvc, Schedule, ...) e ao voltar deixa canais
+#      RPC ainda em recovery, gerando RPC_E_CALL_CANCELED nas
+#      Get-CimInstance seguintes.
+#    - REMOVIDO gate $wmiOk: por Bug 3 (mssmbios serve WMI a partir
+#      de um cache in-kernel populado do firmware ACPI/RSMB, NAO do
+#      registro), essa query nunca observou o blob que acabamos de
+#      gravar. O "gate" era placebo — sempre passava.
+#    - Query mantida como INFORMACIONAL, com -OperationTimeoutSec
+#      para nao ter chance de travar. Validacao REAL do blob acontece
+#      no proximo boot, dentro do driver (ValidateSmbiosBlob).
+#    - Ver: docs/postmortem-v4-phase5/incident-v405-vm-pipeline-validation.md
 # ============================================================
 Write-Host ""
-Write-Host "  === VERIFICACAO ===" -ForegroundColor White
+Write-Host "  === WMI atual (cache in-kernel do mssmbios; NAO valida spoof) ===" -ForegroundColor White
 
-$uuid      = (Get-CimInstance Win32_ComputerSystemProduct).UUID
-$boardMfr  = (Get-CimInstance Win32_BaseBoard).Manufacturer
-$boardProd = (Get-CimInstance Win32_BaseBoard).Product
-$boardSer  = (Get-CimInstance Win32_BaseBoard).SerialNumber
-$chassisMfr = (Get-CimInstance Win32_SystemEnclosure).Manufacturer
-$sysMfr    = (Get-CimInstance Win32_ComputerSystem).Manufacturer
-
-Write-Info "UUID WMI:        $uuid"
-Write-Info "System Mfr:      $sysMfr"
-Write-Info "Board Mfr:       $boardMfr"
-Write-Info "Board Product:   $boardProd"
-Write-Info "Board Serial:    $boardSer"
-Write-Info "Chassis Mfr:     $chassisMfr"
-
-# Checagem de consistencia
-$allMatch = ($boardMfr -eq $chassisMfr)
-if ($allMatch) {
-    Write-OK "Fabricantes CONSISTENTES entre Board e Chassis!"
-} else {
-    Write-Warn "Fabricantes inconsistentes - pode precisar de reboot"
+$wmiOpts = @{ OperationTimeoutSec = 5; ErrorAction = 'SilentlyContinue' }
+try {
+    Write-Info "UUID:          $((Get-CimInstance Win32_ComputerSystemProduct @wmiOpts).UUID)"
+    Write-Info "System Mfr:    $((Get-CimInstance Win32_ComputerSystem       @wmiOpts).Manufacturer)"
+    Write-Info "Board Mfr:     $((Get-CimInstance Win32_BaseBoard            @wmiOpts).Manufacturer)"
+    Write-Info "Board Prod:    $((Get-CimInstance Win32_BaseBoard            @wmiOpts).Product)"
+    Write-Info "Chassis Mfr:   $((Get-CimInstance Win32_SystemEnclosure      @wmiOpts).Manufacturer)"
+} catch {
+    Write-Warn "Query WMI falhou (nao bloqueia arming): $_"
 }
-
-if ($uuid -ne "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF" -and $uuid.Length -gt 10) {
-    Write-OK "UUID aplicado"
-} else {
-    Write-Warn "UUID pode precisar de reboot para refletir"
-}
+Write-Warn "Valores acima refletem o cache in-kernel do mssmbios (populado do"
+Write-Warn "firmware no boot), NAO o blob que acabamos de escrever. Validacao"
+Write-Warn "real do blob acontece no proximo boot, dentro do driver."
 
 # ============================================================
-#  Step 12b: Armar opt-in do replay em kernel (v3.4)
+#  Step 12: Armar opt-in do replay em kernel (v4.0.6)
 #
-#  So chegamos aqui se todas as queries WMI acima retornaram sem
-#  travar/lancar. Isso e o sinal mais forte que temos, ainda em
-#  runtime, de que o blob que acabamos de gravar em mssmbios\Data
-#  nao vai brickar o parser em boots subsequentes. Agora sim
-#  ligamos o flag que autoriza o driver a re-aplicar no boot.
+#  Sem gate de WMI (Bug 3): se o blob esta cacheado com sucesso
+#  em Parameters ($cachedBlob=true) e o driver esta instalado,
+#  autorizamos o replay no proximo boot. Validacao FINAL do blob
+#  e ValidateSmbiosBlob() no driver, que rejeita blob malformado
+#  sem tocar mssmbios\Data, com backup em OrigSmbiosData.
+#  -DisableKernelReplay honrado explicitamente.
 # ============================================================
-if ($cachedBlob) {
-    $wmiOk = ($null -ne $uuid -and $uuid.Length -gt 10 -and
-              $null -ne $boardMfr -and $boardMfr.Length -gt 0 -and
-              $null -ne $sysMfr   -and $sysMfr.Length   -gt 0)
-
-    if ($wmiOk) {
-        try {
-            Set-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -Value 1 -Type DWord
-            Write-OK "Replay em kernel ARMADO (EnableSmbiosReplay=1)"
-            Write-Info "Driver aplicara o blob a cada boot antes de winmgmt"
-        } catch {
-            Write-Warn "Falha ao armar opt-in: $_"
-        }
-    } else {
-        Write-Warn "WMI nao respondeu limpo — replay em kernel NAO armado"
-        Write-Warn "Blob fica cacheado mas o driver ignora sem EnableSmbiosReplay=1"
+if ($DisableKernelReplay) {
+    Write-Info "-DisableKernelReplay: NAO armando EnableSmbiosReplay"
+} elseif ($cachedBlob) {
+    try {
+        Set-ItemProperty -Path $driverParams -Name "EnableSmbiosReplay" -Value 1 -Type DWord
+        Write-OK  "Replay em kernel ARMADO (EnableSmbiosReplay=1)"
+        Write-Warn "NOTA v4.0.6: em Hyper-V esta cadeia esta comprovadamente"
+        Write-Warn "INEFICAZ contra WMI Win32_ComputerSystemProduct/BaseBoard/etc"
+        Write-Warn "-- mssmbios serve do cache in-kernel populado do firmware,"
+        Write-Warn "nao do registro. Bare-metal pode ter comportamento diferente."
+        Write-Warn "Ver docs/postmortem-v4-phase5/incident-v405-vm-pipeline-validation.md"
+        Write-Warn "e docs/roadmap-v41-wmi-intercept.md."
+    } catch {
+        Write-Warn "Falha ao armar opt-in: $_"
     }
 }
 

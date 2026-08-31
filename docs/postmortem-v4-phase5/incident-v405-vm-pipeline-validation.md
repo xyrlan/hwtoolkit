@@ -1,5 +1,13 @@
 # INCIDENT — v4.0.5 VM pipeline validation: 5 findings before touching physical hardware
 
+> **Status after v4.0.6 triage (2026-08-31):**
+> - Bug 1 (spoof-smbios byte overflow): closed in v4.0.5.
+> - Bug 2 (batch aborts after spoof-mac Read-Host): closed in v4.0.5.
+> - **Bug 3** (SMBIOS registry replay ineffective): **root cause identified** — mssmbios.sys serves WMI from an in-kernel firmware cache, and mssmbios itself is `Start=1` (SYSTEM_START) so it loads *after* our BOOT_START driver, making `ZwOpenKey` on `\Registry\Machine\...\mssmbios\Data` fail at DriverEntry. **Mitigated in v4.0.6**: script arming honesty warning added, WMI verify gate removed, driver breadcrumb `LastReplayStatus` added for evidence-in-hive. Actual WMI-visible spoof pivots to v4.1 IRP interception — see `docs/roadmap-v41-wmi-intercept.md`.
+> - **Bug 4** (52-56s crash, no bugcheck): **evidence-collection pipeline shipped in v4.0.6** — `scripts/prep-crashdump.ps1` sets `AutoReboot=0` + dedicated dump file + complete kernel dump. Repro contamination fixed by new `-SmbiosOnly` / `-CpuOnly` switches in `spoof-smbios.ps1`. Actual fix awaits `!analyze -v` on next repro. See updated Bug 4 section below.
+> - **Bug 5** (winmgmt restart hang): **closed in v4.0.6** — `Restart-Service winmgmt` deleted; the "verify via WMI in-session before arming" gate was a placebo per Bug 3 (WMI never observed our writes), so removing it lost no real safety. Arming now unconditional on `$cachedBlob=true`.
+> - See `docs/postmortem-v4-phase5/incident-v406-bug-triage.md` for v4.0.6 fix details.
+
 **Date:** 2026-08-30 (continuation of v4.0.4 boot correctness closure, same day)
 **Session type:** Windows Hyper-V VM validation of spoofing pipeline Phases 2 → 6 → 7 → 8
 **Test VM:** windev2407eval (Win10 Enterprise dev), Gen 2 UEFI, storvsc synthetic SCSI, 8 vCPU, 4 GB RAM, SecureBoot Off, HVCI Off, testsigning On, WDAC enforced (mode 2)
@@ -106,6 +114,33 @@ Affects **any** BIOS with SMBIOS blob >= 256 bytes, which is essentially every m
 **Follow-up:** attach WinDbg via COM1 named pipe (already configured on this VM), reboot with debugger armed, breakpoint on `RstFlt!ApplySmbiosBlobIfCached`, step through and observe the write happening vs. `mssmbios!SMBiosServiceMain` (or similar) running after us. May need to rework SMBIOS replay as an IRP filter on `\Device\mssmbios` or as a mssmbios lower filter driver instead of a registry write from a boot-storage-stack driver.
 
 ### Bug 4 — First-boot-after-arm crashes at ~52-56s (no bugcheck code captured)
+
+> **Update 2026-08-31 (v4.0.6 triage workflow):** the "same 52-56s timing for two independent replays" evidence used in the original write-up below is **contaminated**. Grep of the repo confirmed that **no script ever writes `EnableCpuReplay`** — `scripts/spoof-smbios.ps1` only ever writes `EnableSmbiosReplay`. The "CPU-only" repro was actually armed by hand (per `docs/fase2-track-a-windows-test-kickoff.md:210`) and the operator did NOT clear `EnableSmbiosReplay=1` left over from the prior arming run, so what was labelled "CPU-only" was actually **SMBIOS+CPU**. Two independent-looking repros → not really independent.
+>
+> A separate speculative hypothesis I wrote for a first draft (that a fault fired but the dump was blocked because RstFlt is a DiskDrive UpperFilter holding the storage stack) is **architecturally wrong**. Windows crash dumps go through a completely separate stack — `crashdmp.sys` plus `dump_*`-prefixed miniport drivers (`dump_storport`, `dump_vmbus`, `dump_vhdmp`) loaded from `HKLM\SYSTEM\CurrentControlSet\Control\CrashControl` — that binds directly to the storage port/miniport, bypassing **all** class-level upper and lower filters. RstFlt as a DiskDrive class filter is architecturally invisible to `KeBugCheck2`'s dump writer, so it cannot block the dump path.
+>
+> **True-independent repro protocol** (use before drawing any conclusions):
+>
+> 1. Run `scripts/prep-crashdump.ps1` once inside the guest — sets `CrashDumpEnabled=1` (complete), `AutoReboot=0`, `AlwaysKeepMemoryDump=1`, `IgnorePagefileSize=1`, `DedicatedDumpFile=C:\rstflt-dump.sys`, `DumpFileSize=8192`. Prevents System event log rollover. **Big warning:** with `AutoReboot=0`, BSOD freezes on the STOP screen and needs a manual reset via the Hyper-V console.
+> 2. Clean slate the driver Parameters: `Remove-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters SmbiosBlob,EnableSmbiosReplay,OrigSmbiosData,CpuStrings,EnableCpuReplay -EA SilentlyContinue`.
+> 3. Arm ONE gate at a time via the new switches: `.\spoof-smbios.ps1 -SmbiosOnly` OR `.\spoof-smbios.ps1 -CpuOnly` (mutually exclusive; each clears the other side before arming). Both switches print final Parameters state before exit so the operator can confirm what was armed.
+> 4. Reboot the guest. Wait 90-120s past Winlogon watching the Hyper-V console.
+>
+> **Heartbeat-off falsifier** (parallel line of evidence, run in the same session):
+>
+> From the Hyper-V host, before the guest boots:
+>
+> ```powershell
+> Disable-VMIntegrationService -VMName <name> -Name Heartbeat,'Key-Value Pair Exchange'
+> ```
+>
+> - If the reset **still** fires at 52-56s → H2 (host-side watchdog reset) is **falsified**; focus shifts to an in-guest consumer service faulting on the modified registry state.
+> - If the reset **does not** fire → H2 confirmed; next work is on the KVP/heartbeat guest-agent path, **not** a driver rebuild.
+> - If reset fires but no dump → dump-path itself is broken; verify `CrashControl` values landed correctly via `Get-ItemProperty ...\Control\CrashControl`.
+>
+> Expected suspects if a real bugcheck is captured (`!analyze -v`, in priority order): `sppsvc.exe` (Software Protection Platform / Windows Activation — known consumer of `Win32_ComputerSystemProduct` + `Win32_Processor`), `ClipSVC` (Client License Service), `CompatTelRunner.exe`. Whichever service is implicated names the actual consumer, and the real Bug 4 fix targets that specific interaction — **not** a blanket 90s CPU-replay delay in the driver (rejected in the triage as premature: would just move the crash window and mask evidence).
+>
+> Original write-up preserved below for continuity.
 
 **Observation:** exactly the same crash pattern for **both** replays (SMBIOS AND CPU, tested independently):
 
