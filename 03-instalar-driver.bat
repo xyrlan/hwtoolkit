@@ -116,16 +116,29 @@ if %errorlevel% neq 0 (
     goto :eof
 )
 
-rem --- Criar servico (SYSTEM_START) ---
-rem  v3.4: baixado de boot para system. Se DriverEntry/AddDevice
-rem  quebrar, o Windows ainda sobe (o driver simplesmente nao carrega
-rem  nesta sessao) em vez de brickar o boot como aconteceu em v3.3.
-rem  Filtragem de IOCTLs de userland (WMI, ferramentas de disco,
-rem  anti-cheat rodando pos-boot) segue funcionando com system-start.
-rem  Suba para start= boot APENAS depois do driver estar comprovadamente
-rem  estavel em uma serie de reboots.
-echo [*] Criando servico RstFlt (system start)...
-sc create RstFlt type= kernel start= system error= normal binPath= "%SystemRoot%\System32\drivers\rstflt.sys" DisplayName= "Intel(R) RST Storage Filter"
+rem --- Criar servico (BOOT_START) ---
+rem  v4.0.3 fix: DiskDrive class UpperFilters sao walked durante o
+rem  BOOT_START phase (storvsc/disk.sys). O v3.4->v4.0.2 usavam
+rem  start=system que carrega DEPOIS de disk.sys enumerar o boot PDO
+rem  -> UpperFilters walk nao acha o servico -> CM_PROB_FAILED_ADD ->
+rem  STOP 0x7B INACCESSIBLE_BOOT_DEVICE em todo boot que tem RstFlt
+rem  registrado como upper filter da classe. O v3.4 downgrade foi
+rem  uma tentativa de safety (evitar brick) mas na verdade CAUSAVA o
+rem  brick assim que UpperFilters era populado; escapou porque testes
+rem  de campo nao chegaram a essa combinacao ate v4.0 na VM.
+rem
+rem  A safety real e ErrorControl=Normal (=1): se DriverEntry/AddDevice
+rem  falhar, o kernel loga o erro e continua o boot (driver so nao
+rem  carrega nesta sessao). Isso da o mesmo "nao brica" que o
+rem  system-start pretendia, sem o efeito colateral do 0x7B.
+rem
+rem  Canonical: WDK diskperf INF ships StartType=0 + Group="PnP Filter"
+rem  + ErrorControl=Normal. Ver docs/postmortem-v4-phase5/
+rem  incident-v402-signature-plus-filter.md para o research completo
+rem  (3 verifiers adversariais unanimes; MSDN "Troubleshooting a
+rem  Stop 0x7B" documenta explicitamente essa failure mode).
+echo [*] Criando servico RstFlt (boot start, PnP Filter group)...
+sc create RstFlt type= kernel start= boot error= normal binPath= "%SystemRoot%\System32\drivers\rstflt.sys" DisplayName= "Intel(R) RST Storage Filter"
 if %errorlevel% neq 0 (
     echo [!] ERRO ao criar servico!
     pause
@@ -138,7 +151,11 @@ rem     off. spoof-smbios.ps1 seta este flag em 1 depois de validar via WMI.
 reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters" /v EnableSmbiosReplay /t REG_DWORD /d 0 /f >nul 2>&1
 
 rem --- Definir grupo de carga ---
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt" /v Group /t REG_SZ /d "Filter" /f >nul
+rem  v4.0.3: "PnP Filter" e o grupo canonico para upper filters de
+rem  classes PnP-enumerated (bate com diskperf WDK sample). Coloca
+rem  RstFlt no phase BOOT_START junto com storvsc/disk.sys/partmgr,
+rem  antes do UpperFilters walk resolver o servico.
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\RstFlt" /v Group /t REG_SZ /d "PnP Filter" /f >nul
 
 rem --- Adicionar ao UpperFilters (preservando os existentes) ---
 echo [*] Registrando como upper filter da classe DiskDrive...

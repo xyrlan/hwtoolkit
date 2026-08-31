@@ -202,6 +202,9 @@
 /* ================================================================
  *  Device extension - attached to each filtered disk device.
  *  v3.6: no per-device state beyond what PnP correctness requires.
+ *  v4.0.4: paging-path bookkeeping added — see DispatchPnp
+ *  IRP_MN_DEVICE_USAGE_NOTIFICATION handler and AddDevice's
+ *  DO_POWER_PAGABLE propagation for the rationale.
  * ================================================================ */
 typedef struct _DEVICE_EXTENSION {
     PDEVICE_OBJECT  LowerDevice;
@@ -209,6 +212,13 @@ typedef struct _DEVICE_EXTENSION {
     IO_REMOVE_LOCK  RemoveLock;
     BOOLEAN         Started;
     BOOLEAN         Removed;
+    /* v4.0.4: PagingPathCount counts the number of paging-type usages
+     * currently active on this filter DO (paging, hibernation, dump
+     * files). DO_POWER_PAGABLE on our DO is CLEARED while >0 and
+     * RESTORED when it returns to 0. Guarded by PagingPathMutex to
+     * serialize concurrent DEVICE_USAGE_NOTIFICATION IRPs. */
+    LONG            PagingPathCount;
+    FAST_MUTEX      PagingPathMutex;
 } DEVICE_EXTENSION, *PDEVICE_EXTENSION;
 
 /* ================================================================
@@ -1355,6 +1365,69 @@ NTSTATUS DispatchPnp(PDEVICE_OBJECT DevObj, PIRP Irp)
         IoReleaseRemoveLock(&dx->RemoveLock, Irp);
         return st;
 
+    /* ---- DEVICE_USAGE_NOTIFICATION (v4.0.4 — paging path bookkeeping) --
+     * Kernel sends this when a device joins/leaves the paging (or
+     * hibernation or dump) I/O path. For a class UpperFilter above
+     * the boot disk, we MUST toggle DO_POWER_PAGABLE on our filter
+     * DO in sync with the lower device's flag, or paging IRPs (which
+     * can arrive at DISPATCH_LEVEL) fault against our pageable code
+     * path. Boot volume == paging volume so this fires during early
+     * boot and its mishandling produces a post-loader, pre-Winlogon
+     * hang on Gen 2 UEFI + storvsc. Modeled on the diskperf WDK
+     * sample. */
+    case IRP_MN_DEVICE_USAGE_NOTIFICATION:
+        {
+            BOOLEAN setPagableIo = FALSE;
+            BOOLEAN inPath = sp->Parameters.UsageNotification.InPath;
+
+            ExAcquireFastMutex(&dx->PagingPathMutex);
+            if (inPath && dx->PagingPathCount == 0) {
+                /* First paging joiner: clear DO_POWER_PAGABLE BEFORE
+                 * forwarding, so the flag is correct by the time
+                 * lower drivers see the notification propagate. */
+                if (DevObj->Flags & DO_POWER_PAGABLE) {
+                    DevObj->Flags &= ~DO_POWER_PAGABLE;
+                    setPagableIo = TRUE;
+                }
+            }
+            ExReleaseFastMutex(&dx->PagingPathMutex);
+
+            /* Forward and wait for completion so we can update our
+             * counter based on the lower stack's success/failure. */
+            KeInitializeEvent(&evt, NotificationEvent, FALSE);
+            IoCopyCurrentIrpStackLocationToNext(Irp);
+            IoSetCompletionRoutine(Irp, PnpStartCompletion, &evt,
+                                   TRUE, TRUE, TRUE);
+            st = IoCallDriver(dx->LowerDevice, Irp);
+            if (st == STATUS_PENDING) {
+                KeWaitForSingleObject(&evt, Executive,
+                                      KernelMode, FALSE, NULL);
+                st = Irp->IoStatus.Status;
+            }
+
+            ExAcquireFastMutex(&dx->PagingPathMutex);
+            if (NT_SUCCESS(st)) {
+                if (inPath) {
+                    dx->PagingPathCount++;
+                } else {
+                    if (--dx->PagingPathCount == 0) {
+                        /* Last paging leaver: restore pageable so we
+                         * go back to normal power management. */
+                        DevObj->Flags |= DO_POWER_PAGABLE;
+                    }
+                }
+            } else if (setPagableIo) {
+                /* Lower stack rejected the notification; roll back
+                 * the flag change so state stays consistent. */
+                DevObj->Flags |= DO_POWER_PAGABLE;
+            }
+            ExReleaseFastMutex(&dx->PagingPathMutex);
+
+            IoCompleteRequest(Irp, IO_NO_INCREMENT);
+            IoReleaseRemoveLock(&dx->RemoveLock, Irp);
+            return st;
+        }
+
     /* ---- Everything else: just forward ---- */
     default:
         IoSkipCurrentIrpStackLocation(Irp);
@@ -1473,12 +1546,42 @@ NTSTATUS AddDevice(PDRIVER_OBJECT DrvObj, PDEVICE_OBJECT Pdo)
         return STATUS_NO_SUCH_DEVICE;
     }
 
-    /* Copy relevant flags from lower device */
-    flt->Flags |= dx->LowerDevice->Flags &
-                  (DO_BUFFERED_IO | DO_DIRECT_IO | DO_POWER_PAGABLE);
-    flt->DeviceType      = dx->LowerDevice->DeviceType;
-    flt->Characteristics = dx->LowerDevice->Characteristics;
-    flt->Flags          &= ~DO_DEVICE_INITIALIZING;
+    /* Copy I/O method flags from lower device. Bitwise OR preserves
+     * anything IoCreateDevice may have set by default. */
+    flt->Flags |= dx->LowerDevice->Flags & (DO_BUFFERED_IO | DO_DIRECT_IO);
+
+    /* v4.0.4: DO_POWER_PAGABLE must match the lower device EXACTLY at
+     * AddDevice time. IoCreateDevice defaults DO_POWER_PAGABLE=1 on
+     * our filter DO. Using bitwise OR to propagate (prior v4.0.x code)
+     * kept our filter pageable even when lower disk.sys FDO had the
+     * flag cleared for the paging path — which happens whenever the
+     * disk participates in paging, i.e. always on the boot volume.
+     * A pageable filter above a non-pageable stack violates the paging
+     * IRP IRQL contract and causes an intermittent post-loader, pre-
+     * Winlogon boot hang on Gen 2 UEFI + storvsc. We must explicitly
+     * assign here at AddDevice and then dynamically flip via
+     * IRP_MN_DEVICE_USAGE_NOTIFICATION as the paging path is joined
+     * or left. Modeled on the diskperf WDK sample. */
+    if (dx->LowerDevice->Flags & DO_POWER_PAGABLE) {
+        flt->Flags |= DO_POWER_PAGABLE;
+    } else {
+        flt->Flags &= ~DO_POWER_PAGABLE;
+    }
+
+    flt->DeviceType           = dx->LowerDevice->DeviceType;
+    flt->Characteristics      = dx->LowerDevice->Characteristics;
+    /* v4.0.2 hotfix: propagate AlignmentRequirement from lower.
+     * Redundant post-v4.0.4 investigation (IoAttachDeviceToDeviceStack
+     * already inherits this field) but harmless — kept as documented
+     * hygiene per WDK "Initializing a Device Object". */
+    flt->AlignmentRequirement = dx->LowerDevice->AlignmentRequirement;
+
+    /* v4.0.4: initialize the paging-path serializer BEFORE clearing
+     * DO_DEVICE_INITIALIZING (once cleared, IRPs may arrive). */
+    ExInitializeFastMutex(&dx->PagingPathMutex);
+    dx->PagingPathCount = 0;
+
+    flt->Flags               &= ~DO_DEVICE_INITIALIZING;
 
 #if DBG
     DbgPrint("[RstFlt] Attached to PDO %p (lower=%p)\n",
@@ -1598,7 +1701,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v4.0.1, SMBIOS + gated CPU replay)\n");
+    DbgPrint("[RstFlt] DriverEntry OK (v4.0.4, SMBIOS + gated CPU replay + paging-path handler)\n");
 #endif
     return STATUS_SUCCESS;
 }
