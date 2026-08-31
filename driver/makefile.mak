@@ -15,6 +15,21 @@
 WDK_INC = C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0
 WDK_LIB = C:\Program Files (x86)\Windows Kits\10\Lib\10.0.22621.0
 
+# --- Signtool (v4.0.7+ requirement) ---
+# BOOT_START drivers on WDAC-enforced Windows are rejected by winload
+# if the PE has no Authenticode signature — surfaces as Automatic Repair
+# with no visible bugcheck. See docs/postmortem-v4-phase5/incident-v407-
+# driver-boot-regression.md for the full root-cause writeup.
+#
+# The self-signed test cert lives in the host user's Cert:\CurrentUser\My
+# store; the VM has the matching public cert in Cert:\LocalMachine\Root.
+# Both were provisioned by v4.0.2 (see incident-v402-signature-plus-
+# filter.md). Recreate via New-SelfSignedCertificate if the cert expired.
+SIGNTOOL     = C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe
+SIGN_SHA1    = 30310EE7644799431FFF099E1194817E813152B9
+SIGN_STORE   = MY
+TSA_URL      = http://timestamp.digicert.com
+
 # --- Compiler & Linker ---
 CC   = cl.exe
 LINK = link.exe
@@ -42,6 +57,8 @@ rstflt.obj: rstflt.c
 
 rstflt.sys: rstflt.obj
 	$(LINK) $(LFLAGS_COMMON) $(RSTFLT_LIBS) rstflt.obj /OUT:rstflt.sys
+	@echo [*] Signing rstflt.sys with test cert $(SIGN_SHA1)
+	"$(SIGNTOOL)" sign /fd SHA256 /s $(SIGN_STORE) /sha1 $(SIGN_SHA1) /tr $(TSA_URL) /td SHA256 rstflt.sys
 
 clean:
 	-del /q rstflt.obj rstflt.sys 2>nul

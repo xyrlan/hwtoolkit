@@ -305,6 +305,281 @@ Profile:
   - ~10 GB livres (para VS Build Tools + WDK)
 
 ========================================================
+  MUDANCAS EM v4.0.9 (Bug 4 fechado + build signing + evidencia ao vivo)
+========================================================
+
+  v4.0.9 - Sessao end-to-end de validacao dos 5 bugs do postmortem v4.0.5
+           na VM Hyper-V, com todas as provas ao vivo colhidas.
+           Doc principal: docs/postmortem-v4-phase5/incident-v407-driver-boot-regression.md
+
+  HOTFIX de assinatura no build (v4.0.7 regression):
+    Ao rebuildar v4.0.6 pela primeira vez nesta sessao, a VM entrou em
+    loop de Automatic Repair sem bugcheck visivel. Bisecao completa
+    (v4.0.7 removeu WriteLastReplayStatus body, v4.0.8 removeu
+    RstFltVersion marker+pragma, ate v4.0.4 source PURO do git) todas
+    reproduziram identicamente o crash. Root cause identificado
+    extraindo o rstflt.sys funcional (21912 bytes, do checkpoint
+    pre-v406-test) do guest para o host e comparando: o binario
+    funcional tinha um bloco Authenticode PKCS#7 com cert
+    "HWToolkit Test Cert 2026" no fim; nossos rebuilds nao tinham.
+
+    Fix: adicionado signtool sign no makefile.mak como ultimo passo
+    da regra rstflt.sys. Cert usado: self-signed
+    30310EE7644799431FFF099E1194817E813152B9 (HWToolkit Test Cert 2026,
+    valido ate 2028-08-30, ja em Cert:\CurrentUser\My do host e
+    Cert:\LocalMachine\Root da VM desde v4.0.2 — ver
+    incident-v402-signature-plus-filter.md). Timestamped via
+    http://timestamp.digicert.com para sobreviver a expiracao do cert.
+
+    NOTA: nunca modifique o makefile.mak sem confirmar que o
+    signtool sign step continua depois do link. Sem signature,
+    WDAC enforced rejeita BOOT_START driver -> Automatic Repair.
+
+  Bug 4 (crash 52-56s post-arm) - FECHADO como H2 (Hyper-V watchdog):
+    Com Pulsacao (Heartbeat) + KVP integration services desabilitados
+    NO HOST antes de iniciar a VM, o driver v4.0.9 armado com
+    EnableSmbiosReplay=1 booted sem crash algum. Isso confirma por
+    eliminacao a hipotese H2: o crash era o host resetando o guest
+    via VmHeartbeat watchdog quando o KVP exchange encontrava estado
+    inconsistente pos-registry-write. Fix real e do lado guest-agent
+    (KVP exchange handling); em bare metal esse mecanismo nao existe
+    entao Bug 4 nao se aplica.
+
+    Comando pra reproduzir o fix no host Hyper-V (antes de iniciar a VM):
+      Disable-VMIntegrationService -VMName '<nome>' -Name 'Pulsação','Troca do Par Chave-Valor'
+
+    Comando pra reverter (voltar ao behavior brikador):
+      Enable-VMIntegrationService  -VMName '<nome>' -Name 'Pulsação','Troca do Par Chave-Valor'
+
+    (Nomes em PT-BR — em EN sao 'Heartbeat' e 'Key-Value Pair Exchange'.)
+
+  Bug 3 (SMBIOS ineficaz) - CONFIRMADO ARQUITETURALMENTE AO VIVO:
+    Apos spoof-smbios.ps1 -SmbiosOnly armar EnableSmbiosReplay=1 +
+    SmbiosBlob (959 bytes MSI Z490 spoofed) escrito ate no registry
+    mssmbios\Data, a query WMI IMEDIATAMENTE depois retornou:
+      Win32_ComputerSystemProduct.UUID    = 5B33111A-... (real Hyper-V)
+      Win32_ComputerSystem.Manufacturer   = Microsoft Corporation
+      Win32_BaseBoard.Manufacturer        = Microsoft Corporation
+      Win32_BaseBoard.Product             = Virtual Machine
+    Ou seja, WMI SERVIU DO CACHE IN-KERNEL DO MSSMBIOS
+    (populado do firmware no boot), IGNORANDO nossa escrita no
+    registry. Confirma o Bug 3 arquitetural ao vivo — a estrategia
+    inteira de "escrever mssmbios\Data para spoofar WMI" e um
+    dead end. Fix real (IRP interception em \Driver\mssmbios ou
+    UMDF provider shadow) fica em docs/roadmap-v41-wmi-intercept.md.
+
+  Bug 5 (winmgmt hang) - FECHADO NO RUNTIME:
+    spoof-smbios.ps1 completou em <30s (antes travava 60s+). Bug 5
+    ficha oficial de fechamento.
+
+  Breadcrumb LastReplayStatus - EVIDENCE-IN-HIVE FUNCIONANDO:
+    Primeiro boot com v4.0.9 armado gravou 0x0300003E em
+    HKLM\...\RstFlt\Parameters\LastReplayStatus. Decodifica:
+      tag=0x03 VALIDATION-FAIL
+      NTSTATUS=0x00003E (truncado de STATUS_DATA_ERROR 0xC000003E)
+    Ou seja: o ValidateSmbiosBlob() no driver REJEITOU o blob 959-byte
+    gerado por spoof-smbios.ps1, antes de tocar mssmbios. Safety net
+    do driver funcionando perfeitamente.
+
+    IMPLICACAO: ha um bug latente em spoof-smbios.ps1 Build-SmbiosBlob
+    que gera blob que nao passa validacao. Nao critico em Hyper-V
+    (Bug 3 arquitetura mata o efeito de qualquer forma), mas
+    precisa ser fixado antes de rodar em bare metal onde mssmbios
+    pode se comportar diferente. Task de follow-up criada pra v4.1.
+
+  Fix menor:
+    scripts/check-consistency.ps1 Read-DriverVersionMarker fazia
+    match literal por "RstFlt-v4.0.6-BUILD-MARKER"; agora usa regex
+    RstFlt-v(\d+\.\d+\.\d+)-BUILD-MARKER e imprime a versao
+    encontrada. Antes reportava falso negativo em v4.0.9+.
+
+  Padronizacao do toolchain (documentado):
+    - Visual Studio 2026 Community "VS 18"
+      (C:\Program Files\Microsoft Visual Studio\18\Community).
+      MSVC 14.51.36231 confirmado bom pra kernel driver builds
+      (bisecao provou source-vs-checkpoint byte-equivalente).
+    - WDK 10.0.22621
+      (C:\Program Files (x86)\Windows Kits\10\...\10.0.22621.0).
+      signtool.exe usado em ...\bin\10.0.22621.0\x64.
+    - VS 2022 BuildTools se instalado sem workload C++ NAO conta —
+      02-compilar-driver.bat prefere VS 18 automaticamente.
+    - NAO investigar compiler/linker flag drift como causa de
+      boot failures ate ter certeza que signature esta presente
+      no rstflt.sys (signtool verify /pa /v).
+
+  Guardrail sugerido pra futuro (opcional em v4.1):
+    03-instalar-driver.bat poderia checar signtool verify no .sys
+    ANTES de copiar pra System32 — rejeitando com mensagem clara
+    se driver nao esta assinado. Isso evita o loop de Automatic
+    Repair sem bugcheck que consumiu horas neste ciclo.
+
+  Novo binario:
+    driver/rstflt.sys - v4.0.9, 28432 bytes, Authenticode signed,
+    SHA256 6E067A2EB1C950A8062D3B79F836FBA92748C68D5FB60E7EF40663AFF134E866
+    Compilado com VS 2026 (VS 18) Community + WDK 10.0.22621 + signtool
+    (timestamped via digicert.com), /W4 /WX, zero warnings.
+    (NOTA: PE tem timestamp embarcado no linker + signature; rebuilds
+     do mesmo source geram SHA diferente. Valide via check-consistency.ps1
+     -> "[OK] rstflt.sys instalado: v4.0.9" pelo marker embarcado, ou
+     signtool verify /pa /v rstflt.sys.)
+
+  Recomendacao para proximo repro na VM (fluxo aprovado):
+    Antes:
+      Host: Disable-VMIntegrationService -VMName '<nome>' `
+            -Name 'Pulsação','Troca do Par Chave-Valor'
+    Guest:
+      1. 03-instalar-driver.bat  (instala v4.0.9 signed)
+      2. scripts\prep-crashdump.ps1  (opcional; so precisa se
+         quiser dump em BSOD real futuro. AutoReboot=0 congela em STOP.)
+      3. Remove-ItemProperty ...\RstFlt\Parameters
+         SmbiosBlob,EnableSmbiosReplay,OrigSmbiosData,CpuStrings,
+         EnableCpuReplay,LastReplayStatus -EA SilentlyContinue
+      4. scripts\spoof-smbios.ps1 -SmbiosOnly (ou -CpuOnly)
+      5. Restart-Computer -Force
+      6. Apos boot: scripts\check-consistency.ps1 pra ver
+         LastReplayStatus e confirmar estado.
+
+========================================================
+  MUDANCAS EM v4.0.6 (Bug 3+5 fechados, Bug 4 evidence)
+========================================================
+
+  v4.0.6 - Triage dos 3 bugs abertos no postmortem v4.0.5,
+           por workflow multi-agente + investigacao arquitetural.
+           Doc principal: docs/postmortem-v4-phase5/incident-v406-bug-triage.md
+
+  Bug 3 (SMBIOS registry replay ineficaz) - ROOT CAUSE ACHADO:
+    Dois defeitos empilhados, ambos pela mesma modelo mental errado.
+
+    (a) Arquitetural: mssmbios.sys NAO le HKLM\SYSTEM\...\mssmbios\
+        Data\SMBiosData para servir WMI. WMI (Win32_ComputerSystem-
+        Product, BaseBoard, SystemEnclosure, MSSmBios_RawSMBiosTables)
+        e servida por WmipQueryRawSMBiosTables -> WmipGetRawSMBiosTable-
+        Data que le SMBIOS DIRETO do firmware (physical memory scan
+        para legacy, ACPI RSMB para UEFI). O registro e cache write-
+        back, nao source-of-truth. MSDN diz explicitamente: "consumers
+        should continue to use WMI or the GetSystemFirmwareTable() API".
+        Ver ReactOS ntoskrnl/wmi/smbios.c.
+
+    (b) Ordem de boot: mssmbios e Start=1 (SYSTEM_START), verificado
+        empiricamente 2026-08-30. Nosso RstFlt e Start=0 (BOOT_START).
+        RstFlt roda ANTES de mssmbios, entao ZwOpenKey em
+        \Registry\Machine\...\mssmbios\Data retorna STATUS_OBJECT_
+        NAME_NOT_FOUND — subkey Data e criada pelo proprio mssmbios
+        na init dele (provavel REG_OPTION_VOLATILE). Bailamos em
+        rstflt.c:490 ANTES do backup path, explicando por que
+        Parameters\OrigSmbiosData ficou 0 bytes no postmortem v4.0.5.
+        Comentario v4.0 em rstflt.c:1615-1617 afirmava o oposto;
+        corrigido.
+
+    Mitigacoes v4.0.6:
+    - driver: comentario DriverEntry corrigido para dizer a verdade
+      empirica (mssmbios e SYSTEM_START, carrega DEPOIS de nos).
+    - driver: novo WriteLastReplayStatus grava breadcrumb REG_DWORD
+      em Parameters\LastReplayStatus a cada bail path de
+      ApplySmbiosBlobIfCached. Codificacao: (tag<<24)|(NTSTATUS).
+      Tags: 0x00 SUCCESS / 0x01 GATE-OFF / 0x02 NO-BLOB /
+      0x03 VALIDATION-FAIL / 0x04 MSSMBIOS-OPEN-FAIL /
+      0x05 MSSMBIOS-WRITE-FAIL. Em Hyper-V voce vai ver 0x04
+      todo boot — isso e o diagnostico esperado, nao um bug.
+    - scripts/check-consistency.ps1: nova funcao Read-ReplayStatus
+      decodifica e imprime o breadcrumb. Turns evidence-in-hive.
+    - scripts/spoof-smbios.ps1: removido gate WMI ($wmiOk) que
+      guardava o arming — era placebo (WMI nunca observou nosso
+      write). Arming agora e "if $cachedBlob then arm + warn".
+    - warning honesta na saida: "em Hyper-V esta cadeia esta
+      comprovadamente INEFICAZ contra WMI... bare-metal pode diferir".
+
+    Fix REAL (WMI-visible spoof) pivotado para v4.1 — ver
+    docs/roadmap-v41-wmi-intercept.md. Opcoes: (A) UMDF WMI
+    provider shadow (baixo risco, testar primeiro), (B) minifilter
+    em mssmbios namespace, (C) IRP_MJ_SYSTEM_CONTROL patch via
+    PsSetLoadImageNotifyRoutine (alto risco: PatchGuard bugcheck
+    0x109). Prototipo bloqueado ate Bug 4 fechar.
+
+  Bug 4 (crash 52-56s post-arm, no bugcheck) - EVIDENCE PIPELINE:
+    Nao foi root-caused nesse triage; dump nunca foi capturado.
+    Contaminacao de evidencia identificada + corrigida:
+
+    - Grep provou que NENHUM script escreve EnableCpuReplay
+      (spoof-smbios so escreve EnableSmbiosReplay). O teste
+      "CPU-only" do postmortem v4.0.5 foi armado a mao SEM
+      limpar EnableSmbiosReplay=1 do run anterior, entao "CPU-
+      only" era na verdade SMBIOS+CPU. Evidencia "mesmo timing
+      para dois replays independentes -> causa comum" fica invalida.
+    - Hipotese "RstFlt como DiskDrive UpperFilter bloqueia dump
+      path" REFUTADA: crash-dump usa stack separada (crashdmp.sys
+      + dump_* miniports) que ataca direto no storage port,
+      bypassa TODOS os filtros de classe. RstFlt e arquiteturalmente
+      invisivel ao KeBugCheck2 dump writer. Removida do postmortem.
+
+    Mitigacoes v4.0.6:
+    - NOVO scripts/prep-crashdump.ps1: configura CrashDumpEnabled=1
+      (complete), AutoReboot=0, AlwaysKeepMemoryDump=1, IgnorePage-
+      fileSize=1, DedicatedDumpFile=C:\rstflt-dump.sys, DumpFile-
+      Size=8192 MB. Companion -Restore reverte para default.
+      wevtutil sl System /rt:true /ms:262144000 previne rollover
+      do System log durante investigacao.
+      AVISO: AutoReboot=0 congela na tela STOP; reset manual
+      pelo console Hyper-V.
+    - scripts/spoof-smbios.ps1: novos switches -SmbiosOnly / -CpuOnly
+      mutuamente exclusivos. Cada um LIMPA a chave da outra replay
+      antes de armar a propria — garante isolamento REAL entre
+      as duas paths. -CpuOnly e early-exit path (nao roda SMBIOS
+      nem a query WMI final). Ambos imprimem estado final de
+      Parameters antes de sair.
+
+    Fix real espera !analyze -v no proximo repro. Branches esperadas:
+    - Se crash desaparece com heartbeat-off no host -> H2 (Hyper-V
+      watchdog reset) confirmado, fix e do lado guest-agent, sem
+      driver rebuild.
+    - Se BSOD congela e dump finaliza -> !analyze -v aponta
+      consumer (esperado: sppsvc.exe / Win Activation; ClipSVC;
+      CompatTelRunner) -> fix targeted no consumer, nao delay
+      cego de 90s no CPU replay (rejeitado como especulativo).
+    - Se reset sem dump -> dump-path quebrado, investigacao aparte.
+
+  Bug 5 (Restart-Service winmgmt trava) - FECHADO:
+    Cascata SCM de 15+ dependentes bloqueava 60s+. Como Bug 3
+    mostrou que a query WMI in-session era placebo (WMI serve
+    do cache in-kernel do mssmbios, nao do registry), removi:
+      - Restart-Service winmgmt (linha 559)
+      - Start-Sleep 2 (linha 560)
+      - gate $wmiOk (linhas 606-621)
+      - print "Fabricantes CONSISTENTES" (era comparacao inutil)
+    Step 12 fica informacional so com -OperationTimeoutSec 5.
+    Arming: "if -DisableKernelReplay skip; elseif $cachedBlob
+    then Set EnableSmbiosReplay=1 + warn Hyper-V ineffective".
+    Safety nets reais nao mudaram: ValidateSmbiosBlob no driver
+    rejeita blob malformado; OrigSmbiosData backup preservado.
+
+  Novo binario:
+    driver/rstflt.sys - v4.0.6, 20992 bytes,
+    SHA256 132CE579A5D56F5F57600CDF0677A49BFD69C82A0E7437871927221EE95F484A
+    Compilado com VS 2026 (VS 18) Community + WDK 10.0.22621, /W4 /WX, zero warnings.
+    (NOTA: PE tem timestamp embarcado no linker, entao rebuilds do
+     mesmo source geram SHA diferente com byte-length identico.
+     Valide via check-consistency.ps1 (nova funcao Read-DriverVersionMarker
+     imprime "[OK] rstflt.sys instalado: v4.0.6+") ou grep manual pelo marker
+     "RstFlt-v4.0.6-BUILD-MARKER" que fica no binario release por
+     #pragma comment(linker, "/INCLUDE:RstFltVersion").)
+
+  02-compilar-driver.bat: adicionado suporte para Visual Studio
+    18 (2026 Community) alem de VS 2022 — layout mudou de
+    "\2022\<edition>\" para "\18\<edition>\".
+
+  Recomendacao para proximo repro na VM:
+    1. Reinstalar driver v4.0.6 via 03-instalar-driver.bat.
+    2. .\scripts\prep-crashdump.ps1 (uma vez, no guest).
+    3. Do host: Disable-VMIntegrationService -VMName <name>
+       -Name Heartbeat,'Key-Value Pair Exchange'.
+    4. No guest: Remove-ItemProperty ...\RstFlt\Parameters
+       SmbiosBlob,EnableSmbiosReplay,OrigSmbiosData,CpuStrings,
+       EnableCpuReplay -EA SilentlyContinue (clean slate).
+    5. .\scripts\spoof-smbios.ps1 -SmbiosOnly (uma tentativa).
+    6. Reboot. Se crash: capturar C:\rstflt-dump.sys, !analyze -v.
+    7. Repetir com -CpuOnly para o segundo datum.
+
+========================================================
   MUDANCAS EM v4.0.5 (VM validation session findings)
 ========================================================
 
