@@ -305,6 +305,112 @@ Profile:
   - ~10 GB livres (para VS Build Tools + WDK)
 
 ========================================================
+  MUDANCAS EM v4.0.4 (boot correctness patches)
+========================================================
+
+  v4.0.4 - Segundo bug de boot: post-boot hang pre-Winlogon.
+           Depois do fix v4.0.3 (StartType) eliminar o STOP 0x7B
+           primario, o driver carregou mas o guest travou pre-
+           Winlogon. Assinatura: uptime crescendo pelo host mas
+           HB LostCommunication, CPU 0%, KVP so 7 keys (versus
+           21 esperado num boot completo), IP some depois de
+           surgir brevemente.
+
+           Root cause: dois defeitos WDM no driver que so
+           importam quando o filter roda no boot storage stack
+           (o teste VM finalmente exercitou esse path):
+
+             1) DO_POWER_PAGABLE herdado com bitwise OR (linha
+                1477 pre-patch): IoCreateDevice defaulta esse
+                flag pra 1 (pageable); nossa OR-in nunca CLEAR
+                o flag mesmo quando o lower disk.sys FDO tem
+                ele zerado pra participar do paging path.
+                Filter pageable acima de stack non-pageable
+                viola o contrato IRQL de paging IRPs, que
+                podem chegar em DISPATCH_LEVEL.
+
+             2) IRP_MN_DEVICE_USAGE_NOTIFICATION nao tratado
+                (caia no default pass-through). O kernel manda
+                esse IRP quando um device entra/sai do paging
+                path (boot volume == paging volume). Sem
+                handler proprio, DO_POWER_PAGABLE nunca era
+                flippado dinamicamente conforme o disk.sys
+                fazia refcount de paging users.
+
+           Fix v4.0.4 em driver/rstflt.c:
+             - AddDevice: DO_POWER_PAGABLE agora e assinatura
+               EXATA do lower (assign, nao OR). Se lower tem
+               cleared, nosso filter tambem tem.
+             - DEVICE_EXTENSION ganhou PagingPathCount + FAST_MUTEX
+               PagingPathMutex pra serializar as notifications.
+             - DispatchPnp trata IRP_MN_DEVICE_USAGE_NOTIFICATION
+               explicitamente: forward-and-wait, atualiza
+               PagingPathCount sob mutex, flip DO_POWER_PAGABLE
+               na transicao 0<->1 (primeiro joiner clear, ultimo
+               leaver restore), roll-back se lower retornar erro.
+             - Modelado no WDK diskperf sample. Ver
+               docs/postmortem-v4-phase5/incident-v404-paging-path.md.
+
+           Combinado com o fix v4.0.3, boot completa clean no
+           dev VM (windev2407eval Gen 2 UEFI + storvsc):
+             - Uptime cresce monotonico pos-reboot (1 reset)
+             - CPU pico 35% (userland real)
+             - KVP alcanca 21 keys (full guest agent up)
+             - IPv4 restaurada
+             - sc query RstFlt: STATE 4 RUNNING, StartType Boot
+
+========================================================
+  MUDANCAS EM v4.0.3 (boot correctness patches)
+========================================================
+
+  v4.0.3 - STOP 0x7B INACCESSIBLE_BOOT_DEVICE eliminado.
+
+           Historico ate aqui:
+             - v4.0 em hardware real: boot freeze silencioso
+               (sem BSOD nem dump). Root cause: CPU replay
+               worker queued em DriverEntry sem gate check.
+             - v4.0.1 hotfix: gate check antes de queue.
+               Boot freeze do hardware fixado.
+             - v4.0.1 em Hyper-V Gen 2 dev VM: STOP 0x7B em
+               todo boot. Bug latente que o freeze de v4.0
+               mascarava.
+             - v4.0.2 tentou fixar via AlignmentRequirement
+               copy no AddDevice (WDM hygiene canonical). Nao
+               resolveu o 0x7B (correto mas irrelevante ao
+               fluxo defeito).
+
+           Root cause verdadeiro do 0x7B (3-lens adversarial
+           research, MSDN "Troubleshooting a Stop 0x7B", WDK
+           diskperf INF): servico registrado com StartType=
+           SYSTEM_START (1) mas o UpperFilters entry no
+           DiskDrive class e walked durante fase BOOT_START.
+           PnP tenta instanciar o filter no boot PDO, servico
+           nao esta loaded (system-start > boot-start), devnode
+           entra em CM_PROB_FAILED_ADD, mount do boot volume
+           falha, ntoskrnl bugcheck 0x7B.
+
+           v3.4 tinha explicitamente baixado StartType de boot
+           pra system como "safety" contra brick. Foi safety
+           incorreta: em vez de proteger, causou o brick assim
+           que UpperFilters foi populado. A safety real e
+           ErrorControl=Normal (=1): se DriverEntry/AddDevice
+           falhar, o kernel loga e continua boot sem carregar
+           o driver naquela sessao.
+
+           Fix v4.0.3 em 03-instalar-driver.bat:
+             - sc create: start= boot (nao system)
+             - Group="PnP Filter" (nao "Filter") - grupo
+               canonico de upper filters PnP-enumerated,
+               matches WDK diskperf sample INF.
+             - error= normal continua (safety contra brick).
+
+           Ver docs/postmortem-v4-phase5/
+           incident-v402-signature-plus-filter.md pra research
+           completo (3 verifiers adversariais unanimes, 0
+           refutados) e incident-v403-startype-boot-order.md
+           pra proof de campo do fix.
+
+========================================================
   MUDANCAS EM v4.0
 ========================================================
 
