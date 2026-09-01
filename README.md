@@ -38,15 +38,46 @@ Uso (defaults seguros para primeira execucao):
 
 ```
 .\00-gerar-profile.bat
-.\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid
+.\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid --skip-persistence
 .\06-verificar.bat
 ```
 
-Os flags --skip-* pulam vetores de spoof que envolvem
-reescrita de Enum\ do PnP (disco, volume, USB, HID). Sao
-seguros de rodar mas ainda nao foram validados em bare-metal
-alem do smoke test em VM. Depois de validar em bare-metal,
-remova as flags para cobertura completa.
+A receita ACIMA e ASSIMETRICA de proposito:
+
+  - INCLUI --skip-disk / --skip-volume / --skip-usb / --skip-hid
+    porque esses spoofers reescrevem chaves Enum\ do PnP. Sao seguros
+    de rodar mas ainda nao foram validados alem do smoke test em VM.
+    Depois de validar em bare-metal, remova esses flags para cobertura
+    completa.
+  - INCLUI --skip-persistence porque a task agendada eh um COMMITMENT
+    de lifecycle (adiciona SYSTEM sched task em \HWToolkit\, aparece
+    em schtasks-enumeration, exige rodar 08b pra remover), nao uma
+    questao de PnP re-enum. Remova conscientemente apenas em bare-metal
+    onde o re-arm de EDID nao eh inerte (Hyper-V VMs ignoram porque o
+    driver sintetico re-le do host).
+  - OMITE --skip-nls de proposito - additive-only, nao quebra APIs,
+    baixo risco.
+
+Flags novas (v4.1 hardening):
+
+  --skip-nls          pula spoof-nls-locale.ps1 (NLS ExtendedLocale/
+                      CustomLocale). Additive-only: NUNCA modifica
+                      entradas existentes, so ADICIONA 1 valor novo
+                      com prefixo "hw-" derivado do profile seed.
+                      Safe by default (nao dispara PnP re-enum, nao
+                      quebra NLS APIs).
+  --skip-persistence  pula spoof-persistence-task.ps1. Quando NAO
+                      pulado, o 04b registra task SYSTEM
+                      \HWToolkit\SpoofPersistence com triggers
+                      AtStartup + AtLogOn (delay 1min hardcoded via
+                      -LogonDelay) que re-arma spoof-pci-hardwareid +
+                      spoof-edid-full apos cada boot. Para variantes
+                      do trigger (sem delay, delay diferente), invoque
+                      .\scripts\spoof-persistence-task.ps1 -Apply
+                      diretamente com --skip-persistence no 04b.
+                      EDID re-arm eh INERTE em VM Hyper-V (driver
+                      sintetico re-le do host) - bare-metal only para
+                      esse vetor; PCI persiste em ambos.
 
 Rollback: `.\08b-rollback-userland.bat`.
 
@@ -102,6 +133,8 @@ HWToolkit/
     spoof-smbios.ps1         <- SMBIOS blob modifier (Types 1/2/3/4/11) [antes: spoof-uuid.ps1]
     spoof-audio-guids.ps1    <- Rotate MMDevices audio endpoint GUIDs (GAP #3a)
     spoof-edid-full.ps1      <- Full EDID spoof: PNP ID + product + serial + week/year + descriptor blocks
+    spoof-nls-locale.ps1     <- Additive NLS ExtendedLocale/CustomLocale spoof (Apply/Restore/Show; nunca modifica existentes)
+    spoof-persistence-task.ps1 <- SYSTEM sched task re-arma PCI+EDID @ boot (Apply/Show/RunNow/Uninstall)
     manage-emac-uuid.ps1     <- Persist fake emac-uuid file com ACL lock (GAP #6)
     check-consistency.ps1    <- Auditoria read-only: BIOS mirror + cross-check [antes: consistency-check.ps1]
     restore-smbios.ps1       <- Restaura SMBIOS do firmware (limpa spoof) [antes: restore-firmware-smbios.ps1]
@@ -237,6 +270,12 @@ Profile:
   EDID mfr PNP ID           spoof-edid-full.ps1      EDID bytes 8-9 (EISA 3-letter code)
   EDID product/week/year    spoof-edid-full.ps1      EDID bytes 10-11, 16-17
   emac-uuid persistence     manage-emac-uuid.ps1     C:\Users\<user>\emac-uuid + ACL lock
+  NLS ExtendedLocale/       spoof-nls-locale.ps1     HKLM\...\Control\Nls\{ExtendedLocale,
+    CustomLocale                                     CustomLocale} - ADDITIVE (prefix "hw-",
+                                                     nunca modifica existentes)
+  PCI+EDID re-arm persist   spoof-persistence-task.ps1 SYSTEM sched task AtStartup+AtLogOn
+    entre reboots                                    (re-arma spoofers apos PnP/display revert;
+                                                     EDID INERT em VM Hyper-V, bare-metal only)
   GameConfigStore           limpar-traces            Registry delete
   Event Logs                (removido em v3.5.1)     wevtutil cl gera Event 1102 - contraproducente
   BAM/DAM                   limpar-traces            Registry values

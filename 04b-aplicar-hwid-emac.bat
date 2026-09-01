@@ -16,12 +16,14 @@ rem  (Vanguard, EAC-kernel, BE-kernel), use o pipeline completo:
 rem    03-instalar-driver.bat  ->  04-aplicar-hwid.bat  ->  05-aplicar-smbios.bat
 rem
 rem  FLAGS:
-rem    --skip-disk      pula spoof-disk-registry.ps1 (Enum\SCSI\Disk)
-rem    --skip-volume    pula spoof-volume-guid.ps1 (GUIDs de volume secundarios)
-rem    --skip-hid       pula spoof-hid-ids.ps1
-rem    --skip-usb       pula spoof-usb-ids.ps1
-rem    --skip-network   pula spoof-network-pnpid.ps1
-rem    --skip-cpu       pula spoof-cpu-userland.ps1 (task agendada)
+rem    --skip-disk         pula spoof-disk-registry.ps1 (Enum\SCSI\Disk)
+rem    --skip-volume       pula spoof-volume-guid.ps1 (GUIDs de volume secundarios)
+rem    --skip-hid          pula spoof-hid-ids.ps1
+rem    --skip-usb          pula spoof-usb-ids.ps1
+rem    --skip-network      pula spoof-network-pnpid.ps1
+rem    --skip-cpu          pula spoof-cpu-userland.ps1 (task agendada)
+rem    --skip-nls          pula spoof-nls-locale.ps1 (Nls ExtendedLocale/CustomLocale, additive-only)
+rem    --skip-persistence  pula spoof-persistence-task.ps1 (re-arm PCI+EDID @ boot via task agendada)
 rem ========================================================
 echo ========================================================
 echo   PASSO 4b - Aplicar HWID (Level A, EMAC-only) v1.0
@@ -68,19 +70,25 @@ set "SKIP_HID=0"
 set "SKIP_USB=0"
 set "SKIP_NETWORK=0"
 set "SKIP_CPU=0"
+set "SKIP_NLS=0"
+set "SKIP_PERSISTENCE=0"
 for %%A in (%*) do (
-    if /I "%%~A"=="--skip-disk"    set "SKIP_DISK=1"
-    if /I "%%~A"=="/skip-disk"     set "SKIP_DISK=1"
-    if /I "%%~A"=="--skip-volume"  set "SKIP_VOLUME=1"
-    if /I "%%~A"=="/skip-volume"   set "SKIP_VOLUME=1"
-    if /I "%%~A"=="--skip-hid"     set "SKIP_HID=1"
-    if /I "%%~A"=="/skip-hid"      set "SKIP_HID=1"
-    if /I "%%~A"=="--skip-usb"     set "SKIP_USB=1"
-    if /I "%%~A"=="/skip-usb"      set "SKIP_USB=1"
-    if /I "%%~A"=="--skip-network" set "SKIP_NETWORK=1"
-    if /I "%%~A"=="/skip-network"  set "SKIP_NETWORK=1"
-    if /I "%%~A"=="--skip-cpu"     set "SKIP_CPU=1"
-    if /I "%%~A"=="/skip-cpu"      set "SKIP_CPU=1"
+    if /I "%%~A"=="--skip-disk"         set "SKIP_DISK=1"
+    if /I "%%~A"=="/skip-disk"          set "SKIP_DISK=1"
+    if /I "%%~A"=="--skip-volume"       set "SKIP_VOLUME=1"
+    if /I "%%~A"=="/skip-volume"        set "SKIP_VOLUME=1"
+    if /I "%%~A"=="--skip-hid"          set "SKIP_HID=1"
+    if /I "%%~A"=="/skip-hid"           set "SKIP_HID=1"
+    if /I "%%~A"=="--skip-usb"          set "SKIP_USB=1"
+    if /I "%%~A"=="/skip-usb"           set "SKIP_USB=1"
+    if /I "%%~A"=="--skip-network"      set "SKIP_NETWORK=1"
+    if /I "%%~A"=="/skip-network"       set "SKIP_NETWORK=1"
+    if /I "%%~A"=="--skip-cpu"          set "SKIP_CPU=1"
+    if /I "%%~A"=="/skip-cpu"           set "SKIP_CPU=1"
+    if /I "%%~A"=="--skip-nls"          set "SKIP_NLS=1"
+    if /I "%%~A"=="/skip-nls"           set "SKIP_NLS=1"
+    if /I "%%~A"=="--skip-persistence"  set "SKIP_PERSISTENCE=1"
+    if /I "%%~A"=="/skip-persistence"   set "SKIP_PERSISTENCE=1"
 )
 
 set "MAC_STATUS=OK"
@@ -95,6 +103,8 @@ set "USB_STATUS=OK"
 set "NETWORK_STATUS=OK"
 set "VOL_STATUS=OK"
 set "CPU_STATUS=OK"
+set "NLS_STATUS=OK"
+set "PERSISTENCE_STATUS=OK"
 
 rem ========================================================
 rem   ETAPA 1 - MAC address (via profile, OUI real)
@@ -333,11 +343,69 @@ if %errorlevel% neq 0 (
 )
 :cpu_done
 
+rem ========================================================
+rem   ETAPA 13 - NLS locale (additive spoof)
+rem   Safe: nunca modifica valores existentes, so ADICIONA
+rem   1 entrada nova por chave (prefix "hw-"). Nao dispara
+rem   PnP re-enum, nao quebra Explorer/Office/date formatters.
+rem ========================================================
+echo.
+echo ========================================================
+echo   ETAPA 13 - Spoof NLS locale (spoof-nls-locale.ps1)
+echo ========================================================
+if "%SKIP_NLS%"=="1" (
+    set "NLS_STATUS=SKIPPED"
+    echo [i] Flag --skip-nls detectada. Etapa pulada.
+    goto :nls_done
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-nls-locale.ps1" -Apply
+if %errorlevel% neq 0 (
+    set "NLS_STATUS=FAIL[%errorlevel%]"
+    echo [!] AVISO: spoof-nls-locale.ps1 falhou [%errorlevel%] - continuando.
+)
+:nls_done
+
+rem ========================================================
+rem   ETAPA 14 - Persistencia PCI + EDID (task agendada)
+rem   Registra SYSTEM sched task \HWToolkit\SpoofPersistence
+rem   com triggers AtStartup + AtLogOn (com -LogonDelay PT1M).
+rem   Re-arma spoof-pci-hardwareid + spoof-edid-full pos-boot,
+rem   cobrindo o revert do PnP (PCI enum) e do display miniport
+rem   (EDID re-lido via DDC/I2C ao attach do monitor).
+rem
+rem   NOTA: EDID persistence e INERTE em VMs Hyper-V (driver
+rem         sintetico re-le do host). Bare-metal only.
+rem   NOTA: Race window - AtStartup dispara ANTES da init PnP
+rem         terminar; AtLogOn (pos-winlogon) e o trigger
+rem         confiavel. -LogonDelay adiciona 1min pos-logon.
+rem ========================================================
+echo.
+echo ========================================================
+echo   ETAPA 14 - Persistencia PCI+EDID (spoof-persistence-task.ps1)
+echo ========================================================
+if "%SKIP_PERSISTENCE%"=="1" (
+    set "PERSISTENCE_STATUS=SKIPPED"
+    echo [i] Flag --skip-persistence detectada. Etapa pulada.
+    goto :persistence_done
+)
+rem -RepoPath "%~dp0." e critico: o default do script eh
+rem C:\Users\xyrlan\hwtoolkit (a home do author). Sem essa
+rem flag o helper on-disk em C:\ProgramData\.hwcfg\SpoofPersistence-Task.ps1
+rem grava o path errado, Test-Path falha em qualquer clone que
+rem nao seja o do author, e o task fica silent no-op no boot.
+rem %~dp0 ja termina em \, e o script faz TrimEnd('\','/') no path.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\spoof-persistence-task.ps1" -Apply -LogonDelay -RepoPath "%~dp0."
+if %errorlevel% neq 0 (
+    set "PERSISTENCE_STATUS=FAIL[%errorlevel%]"
+    echo [!] AVISO: spoof-persistence-task.ps1 falhou [%errorlevel%] - continuando.
+)
+:persistence_done
+
 echo.
 echo ========================================================
 echo   PASSO 4b concluido.
 echo ========================================================
-echo Level A status: mac=!MAC_STATUS! audio=!AUDIO_STATUS! edid=!EDID_STATUS! emac=!EMAC_STATUS! winid=!WINID_STATUS! disk=!DISK_STATUS! pci=!PCI_STATUS! hid=!HID_STATUS! usb=!USB_STATUS! network=!NETWORK_STATUS! vol=!VOL_STATUS! cpu=!CPU_STATUS!
+echo Level A status: mac=!MAC_STATUS! audio=!AUDIO_STATUS! edid=!EDID_STATUS! emac=!EMAC_STATUS! winid=!WINID_STATUS! disk=!DISK_STATUS! pci=!PCI_STATUS! hid=!HID_STATUS! usb=!USB_STATUS! network=!NETWORK_STATUS! vol=!VOL_STATUS! cpu=!CPU_STATUS! nls=!NLS_STATUS! persistence=!PERSISTENCE_STATUS!
 echo ========================================================
 echo.
 echo IMPORTANTE:
