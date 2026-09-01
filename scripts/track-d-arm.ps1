@@ -17,14 +17,30 @@
 
     Valores em HKLM\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters
     manipulados por este script:
-      EnableRegCallback     REG_DWORD  master gate (0=off default, 1=on)
-      RegCallbackSeed       REG_SZ     32-hex FNV seed (do profile)
-      LastCallbackStatus    REG_DWORD  breadcrumb hot path (leitura)
-      LastArmStatus         REG_DWORD  breadcrumb arm-time (leitura)
-      CallbackHitCount      REG_DWORD  rewrites que landaram (leitura)
-      CallbackInvokeCount   REG_DWORD  vezes que callback entrou (leitura)
-      CallbackNameMissCount REG_DWORD  invokes rejeitados pelo name gate
-      LastMissImageName     REG_SZ     ultimo image name que falhou o gate
+      EnableRegCallback          REG_DWORD  master gate (0=off default, 1=on)
+      RegCallbackSeed            REG_SZ     32-hex FNV seed (do profile)
+      LastCallbackStatus         REG_DWORD  breadcrumb hot path (leitura)
+      LastArmStatus              REG_DWORD  breadcrumb arm-time (leitura)
+      CallbackHitCount           REG_DWORD  rewrites que landaram (leitura)
+      CallbackInvokeCount        REG_DWORD  vezes que callback entrou (leitura)
+      CallbackNameMissCount      REG_DWORD  invokes rejeitados pelo name gate
+      LastMissImageName          REG_SZ     ultimo image name que falhou o gate
+
+    v5.0.5 Phase 0 additions (todos leitura):
+      CallbackHit_SCSI           REG_DWORD  per-type breakdown de CallbackHitCount
+      CallbackHit_PCI            REG_DWORD  idem
+      CallbackHit_USB            REG_DWORD  idem
+      CallbackHit_HID            REG_DWORD  idem
+      CallbackHit_AudioR         REG_DWORD  idem
+      CallbackHit_AudioC         REG_DWORD  idem
+      CallbackHit_BTH            REG_DWORD  reservado; Phase 1 wire-up
+      CallbackHit_Storage        REG_DWORD  reservado; Phase 1 wire-up
+      CallbackNonRubiParentMatch REG_DWORD  invokes onde parent classificou como
+                                            um dos targets MAS image name nao
+                                            bateu com "rubinot" - triage para
+                                            "quem toca nossos parents fora do gate"
+      CallbackHitRingIndex       REG_DWORD  proximo slot a ser escrito (%16)
+      HitRingBuffer              REG_BINARY 16 * 96 bytes; ver decoder em -Diagnose
 
     v5.0.4: RubinOtPid + -SetPid removidos. O gate agora e image-name
     inline (PsGetProcessImageFileName + _strnicmp "rubinot") em vez de
@@ -183,6 +199,20 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Val 'CallbackNameMissCount' '(0 ou nenhum invoke rejeitado)'
         Show-Val 'LastMissImageName'     '(nenhum miss registrado)'
 
+        # v5.0.5 Phase 0: per-path-type breakdown
+        Write-Host ''
+        Write-Host '  --- Per-path-type hit counters (v5.0.5) ---' -ForegroundColor DarkGray
+        Show-Val 'CallbackHit_SCSI'            '(nenhum SCSI rewrite)'
+        Show-Val 'CallbackHit_PCI'             '(nenhum PCI rewrite)'
+        Show-Val 'CallbackHit_USB'             '(nenhum USB rewrite)'
+        Show-Val 'CallbackHit_HID'             '(nenhum HID rewrite)'
+        Show-Val 'CallbackHit_AudioR'          '(nenhum Audio Render rewrite)'
+        Show-Val 'CallbackHit_AudioC'          '(nenhum Audio Capture rewrite)'
+        Show-Val 'CallbackHit_BTH'             '(reservado Phase 1)'
+        Show-Val 'CallbackHit_Storage'         '(reservado Phase 1)'
+        Show-Val 'CallbackNonRubiParentMatch'  '(nenhum non-rubi processo tocou nossos parents)'
+        Show-Val 'CallbackHitRingIndex'        '(ring buffer nunca escrito)'
+
         # LastCallbackStatus decoded (hot path breadcrumb)
         $last = $null
         if ($vals -and $vals.PSObject.Properties.Name -contains 'LastCallbackStatus') {
@@ -205,18 +235,71 @@ switch ($PSCmdlet.ParameterSetName) {
             Write-Host ('  {0,-22}: {1}' -f 'LastArmStatus', (Format-Status -Value $arm)) -ForegroundColor Cyan
         }
 
+        # v5.0.5 Phase 0: ring buffer decode
+        $ring = $null
+        if ($vals -and $vals.PSObject.Properties.Name -contains 'HitRingBuffer') {
+            $ring = $vals.HitRingBuffer
+        }
+        if ($null -ne $ring -and $ring.Length -ge 96) {
+            $recSize = 96      # sizeof(TRACKD_HIT_RECORD) w/ MSVC x64 alignment
+            $slotCount = [Math]::Min(16, [int]($ring.Length / $recSize))
+            $pathNames = @{
+                0 = 'NONE   '; 1 = 'SCSI   '; 2 = 'PCI    ';
+                3 = 'USB    '; 4 = 'HID    '; 5 = 'AudioR '; 6 = 'AudioC ';
+                7 = 'BTH    '; 8 = 'Storage'   # reserved Phase 1
+            }
+            # Windows-1252 preserves bytes >= 0x80 as printable characters
+            # (matching how EPROCESS.ImageFileName renders in Windows tooling);
+            # ASCII would substitute '?' for those bytes, defeating triage of
+            # anomalous image names - exactly Phase 0's job.
+            $ansiEnc = [Text.Encoding]::GetEncoding(1252)
+            Write-Host ''
+            Write-Host '  --- Ring buffer (last 16 hits, physical slot order) ---' -ForegroundColor DarkGray
+            Write-Host '  slot  timestamp                    image             type     gated  hash    child' -ForegroundColor DarkGray
+            $anyValid = $false
+            for ($i = 0; $i -lt $slotCount; $i++) {
+                $off = $i * $recSize
+                $ts  = [System.BitConverter]::ToInt64($ring, $off)
+                if ($ts -eq 0) { continue }   # empty slot OR mid-write invalid
+                $anyValid = $true
+                # UTC + full date so records spanning midnight or from prior
+                # sessions are unambiguous. Matches kernel-side KeQuerySystemTime
+                # which returns UTC FILETIME ticks.
+                $tsStr = try { [DateTime]::FromFileTimeUtc($ts).ToString('yyyy-MM-dd HH:mm:ss.fff') } catch { '(invalid)             ' }
+                $img = $ansiEnc.GetString($ring, $off + 8, 16).TrimEnd([char]0)
+                $pt  = [int]$ring[$off + 24]
+                $wg  = [int]$ring[$off + 25]
+                $hash = [System.BitConverter]::ToUInt16($ring, $off + 26)
+                $child = [Text.Encoding]::Unicode.GetString($ring, $off + 28, 64).TrimEnd([char]0)
+                $ptStr = $pathNames[$pt]
+                if (-not $ptStr) { $ptStr = ('   ' + $pt + '   ') }
+                $gStr = if ($wg -eq 1) { ' YES ' } else { '  no ' }
+                Write-Host ('   {0,2}  {1}   {2,-16}  {3}  {4}  0x{5:X4}  {6}' -f $i, $tsStr, $img, $ptStr, $gStr, $hash, $child) -ForegroundColor Cyan
+            }
+            if (-not $anyValid) {
+                Write-Host '   (todos os 16 slots vazios - nenhum hit ate agora)' -ForegroundColor DarkGray
+            }
+        } elseif ($null -ne $ring) {
+            Write-Host ('  HitRingBuffer com tamanho inesperado ({0} bytes; esperava 1536)' -f $ring.Length) -ForegroundColor Yellow
+        }
+
         Write-Section 'Tag legend'
         foreach ($k in ($tagTable.Keys | Sort-Object)) {
             Write-Host ('  0x{0:X2}  {1}' -f $k, $tagTable[$k]) -ForegroundColor DarkGray
         }
 
-        Write-Section 'Interpretation (v5.0.4)'
+        Write-Section 'Interpretation (v5.0.4 + v5.0.5 Phase 0)'
         Write-Host '  InvokeCount=0                                       -> callback nao armado; inspecionar LastArmStatus' -ForegroundColor DarkGray
         Write-Host '  InvokeCount>0 & HitCount=0 & NameMissCount>0        -> callback fires mas name gate rejeita todos' -ForegroundColor DarkGray
         Write-Host '                                                         (LastMissImageName mostra quem dominou os misses)' -ForegroundColor DarkGray
         Write-Host '  InvokeCount>0 & HitCount>0                          -> callback opera; cruzar com check-consistency.ps1' -ForegroundColor DarkGray
         Write-Host '  LastMissImageName ~= rubinot* & NameMissCount>0     -> rubinot bateu no gate mas foi rejeitado pelo' -ForegroundColor DarkGray
         Write-Host '                                                         next-char guard (verificar leaf name real)' -ForegroundColor DarkGray
+        Write-Host '  v5.0.5 Phase 0 diagnostics:' -ForegroundColor DarkGray
+        Write-Host '    NonRubiParentMatch=0                              -> nenhum processo nao-rubi tocou nossos parents (gate OK)' -ForegroundColor DarkGray
+        Write-Host '    NonRubiParentMatch>0 & ring mostra imgs nao-rubi  -> algum helper/service enumera HW; gate precisa broaden' -ForegroundColor DarkGray
+        Write-Host '    Todos CallbackHit_XXX=0 & InvokeCount alto        -> EMAC usa RegOpenKey+RegQueryValueEx (nao RegEnumKeyEx);' -ForegroundColor DarkGray
+        Write-Host '                                                         Phase 2 value handler resolve. Padrao esperado v5.0.5.' -ForegroundColor DarkGray
     }
 }
 

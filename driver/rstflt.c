@@ -153,6 +153,92 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v5.0.5 - Phase 0 instrumentation preflight (Track D v5.0.5 kickoff).
+ *     Motivation: v5.0.4 bare-metal RubinOT test banned #4 despite
+ *     byte-exact SCSI/PCI/USB/HID/Audio name rewrite + probe-validated
+ *     gate mechanics. Post-Q2/Q4 procmon triage (2 CSVs cross-checked)
+ *     identified the real cause: EMAC uses RegOpenKey(exact-name via
+ *     SetupDi/CM_*) + RegQueryValueEx(HardwareID), NOT RegEnumKeyEx.
+ *     Our RegNtPostEnumerateKey handler categorically never fires for
+ *     that access pattern (recon-v3:32 verbatim: "100% user-mode via
+ *     RegQueryValueEx"). Phase 2 will add the value-read handler that
+ *     is the arithmetically dominant fix (~14 patterns covering ~93%
+ *     of the ~16,317 RegQueryValue events/re-register burst per
+ *     recon-v3 §3.2). Phase 0 lands the counters needed to (a) validate
+ *     Phase 2 handler dispatch per path type in real sessions, (b)
+ *     provide fine-grained post-mortem if Phase 2 also bans, (c) catch
+ *     any non-`rubinot*` process enumerating our target parents (would
+ *     invalidate the "gate is ok" v5.0.5 premise; escalate to gate
+ *     broadening in v5.0.6).
+ *     - Split g_TrackDHitCount (global sum, kept for backward compat)
+ *       into 8 per-path-type counters (6 wired now + 2 reserved for
+ *       Phase 1 to avoid a second persistence/decoder edit pass):
+ *         g_TrackDHitCount_SCSI    -> Parameters\CallbackHit_SCSI    (wired)
+ *         g_TrackDHitCount_PCI     -> Parameters\CallbackHit_PCI     (wired)
+ *         g_TrackDHitCount_USB     -> Parameters\CallbackHit_USB     (wired)
+ *         g_TrackDHitCount_HID     -> Parameters\CallbackHit_HID     (wired)
+ *         g_TrackDHitCount_AudioR  -> Parameters\CallbackHit_AudioR  (wired)
+ *         g_TrackDHitCount_AudioC  -> Parameters\CallbackHit_AudioC  (wired)
+ *         g_TrackDHitCount_BTH     -> Parameters\CallbackHit_BTH     (reserved)
+ *         g_TrackDHitCount_Storage -> Parameters\CallbackHit_Storage (reserved)
+ *       Wired counters incremented alongside the existing global in
+ *       TrackDHandlePostEnumerate rewrite-landed path, gated by
+ *       TRACKD_PATH_TYPE. Reserved counters stay at 0 until Phase 1
+ *       adds the BTH + STORAGE\Volume rewriters.
+ *     - New g_TrackDNonRubiParentMatchCount counter: bumped when parent
+ *       classifies as one of our 6 target types AND caller image name
+ *       does NOT pass the "rubinot" gate. Non-zero here means the
+ *       image-name gate is deaf to some process (helper/service/
+ *       injected worker) touching HW-fingerprint parents. Cost: one
+ *       extra CmCallbackGetKeyObjectID per name-miss (~200/sec at
+ *       v5.0.4 baseline; negligible).
+ *     - New ring buffer g_TrackDRingBuffer[16] of TRACKD_HIT_RECORD
+ *       (timestamp, image name, path type, was-gated flag, parent
+ *       path FNV16, first 31 wchars of leaf name). Lockless append
+ *       via InterlockedIncrement + power-of-two modulo mask.
+ *       Persisted as REG_BINARY Parameters\HitRingBuffer (1536 bytes).
+ *       Populated on both rewrite-landed (WasGated=1) and non-rubi-
+ *       parent-match (WasGated=0) events; NOT on plain name-misses
+ *       (would drown the buffer in noise).
+ *     - TrackDFlushWorker extended to persist all 7 new DWORDs +
+ *       ring buffer; drift-recheck loop extended so on-disk breadcrumbs
+ *       never permanently lag hot path.
+ *     - Companion userland changes:
+ *         scripts/track-d-arm.ps1 -Diagnose: prints per-path counters
+ *             + NonRubiParentMatch + last-N ring buffer records
+ *             decoded as [timestamp | image | type | gated | leaf].
+ *         scripts/check-consistency.ps1 Track D block extended with
+ *             same per-path / non-rubi / ring buffer surface.
+ *     - Non-changes:
+ *         Existing g_TrackDHitCount preserved (backward-compat).
+ *         Existing InvokeCount/NameMissCount/LastMissImageName/
+ *             LastCallbackStatus/LastArmStatus all preserved verbatim.
+ *         No new notify classes (Phase 2 territory; kickoff §5).
+ *         No image-name gate change (Q2 confirmed gate covers both
+ *             rubinot processes; premature to broaden).
+ *     - Adversarial review fixups (4-lens workflow pre-commit):
+ *         Timestamp-LAST commit barrier in TrackDRecordHit -
+ *             InterlockedExchange64 zeroes Timestamp at slot allocation,
+ *             all other fields written, then KeQuerySystemTime published
+ *             as the final atomic 64-bit store. Decoder invariant
+ *             `Timestamp != 0` now guarantees fully-written record;
+ *             fixes torn-record display that would misattribute hits
+ *             during exactly the triage Phase 0 exists for. MEDIUM.
+ *         Ring index arithmetic switched to unsigned before subtract
+ *             (`((ULONG)InterlockedIncrement(...) - 1u) & MASK`) to
+ *             avoid signed-overflow UB after LONG_MAX wrap.
+ *         TrackDRecordHit NULL-clamp: `if (childReal == NULL)
+ *             childWchars = 0;` at top of copy loop - defense against
+ *             a future call site pattern-copying with only the pointer
+ *             nulled (would BSOD on NULL-deref inside CM callback).
+ *         C_ASSERT(sizeof(TRACKD_HIT_RECORD) == 96) - compile-time
+ *             trip wire in case a future struct edit shifts the layout
+ *             and silently drifts the userland decoder.
+ *         PS decoder ANSI -> Windows-1252 codepage for ImageName; ASCII
+ *             substituted '?' for bytes >= 0x80 (obscures anomalous
+ *             image names). DateTime formatted `yyyy-MM-dd HH:mm:ss.fff`
+ *             UTC to match kernel-side KeQuerySystemTime and disambiguate
+ *             records spanning midnight or across sessions.
  * v5.0.4 - Simplify PID matching to per-callback image-name check
  *       (Kickoff sec 3.3 Option A). Remove PsSetCreateProcessNotifyRoutineEx
  *       + g_TrackDTrackedPids[] + KSPIN_LOCK + g_TrackDOverridePid +
@@ -680,7 +766,7 @@ NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
  * Marker` can validate the installed driver came from v4.0.9+ source
  * without depending on the PE TimeDateStamp (which changes on relink). */
 #pragma comment(linker, "/INCLUDE:RstFltVersion")
-const char RstFltVersion[] = "RstFlt-v5.0.4-BUILD-MARKER";
+const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
 
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
@@ -779,6 +865,12 @@ const char RstFltVersion[] = "RstFlt-v5.0.4-BUILD-MARKER";
  * porter must follow to reproduce this kernel's output byte-for-byte. */
 #define TRACKD_FNV_OFFSET_BASIS  0xCBF29CE484222325ULL
 #define TRACKD_FNV_PRIME         0x00000100000001B3ULL
+
+/* v5.0.5 Phase 0 - ring buffer of last-N hits. Power-of-two so slot
+ * allocation is a masked increment. Sized to comfortably fit inside
+ * one on-disk REG_BINARY value without needing sparse writes. */
+#define TRACKD_RING_SIZE          16u
+#define TRACKD_RING_MASK          (TRACKD_RING_SIZE - 1u)
 
 /* Breadcrumb tags for LastCallbackStatus, encoded (tag<<24)|status.
  * Shape mirrors LastReplayStatus so scripts/check-consistency.ps1
@@ -882,6 +974,72 @@ static volatile LONG   g_TrackDHitCount    = 0;
 static WORK_QUEUE_ITEM g_TrackDFlushWorkItem;
 static volatile LONG   g_TrackDFlushQueued = 0;
 
+/* v5.0.5 Phase 0 - per-path-type hit counters. g_TrackDHitCount above
+ * remains the global sum (preserved for backward-compat with pre-v5.0.5
+ * decoders). These fine-grained counters answer "which path type is
+ * actually getting rewritten" - critical diagnostic post-Q2/Q4 triage
+ * that identified EMAC uses RegOpenKey+RegQueryValueEx not RegEnumKeyEx.
+ * Non-zero on any type => the path IS enumerated by a gated process;
+ * zero across all types with high InvokeCount => EMAC is on a notify
+ * class we don't yet handle (Phase 2 territory). */
+static volatile LONG   g_TrackDHitCount_SCSI    = 0;
+static volatile LONG   g_TrackDHitCount_PCI     = 0;
+static volatile LONG   g_TrackDHitCount_USB     = 0;
+static volatile LONG   g_TrackDHitCount_HID     = 0;
+static volatile LONG   g_TrackDHitCount_AudioR  = 0;
+static volatile LONG   g_TrackDHitCount_AudioC  = 0;
+/* Phase 1 will wire the increment sites; declared here so persistence
+ * + userland decoders don't need a second edit pass when Phase 1 lands.
+ * Zero-valued until then. Spec §3.1's 8-slot vision. */
+static volatile LONG   g_TrackDHitCount_BTH     = 0;
+static volatile LONG   g_TrackDHitCount_Storage = 0;
+
+/* v5.0.5 Phase 0 - callback invocations where parent path classifies
+ * as one of our 6 target types (SCSI/PCI/USB/HID/AudioR/AudioC) but
+ * caller's image name did NOT pass the "rubinot" prefix + delimiter
+ * gate. Non-zero identifies OTHER processes enumerating HW-fingerprint
+ * parents - useful to spot injected helpers or launcher-adjacent
+ * services. Distinct from g_TrackDNameMissCount which counts ALL
+ * gate-rejected invocations regardless of parent path. Cost: one
+ * extra CmCallbackGetKeyObjectID per name-miss - bounded by the miss
+ * rate (~200/sec at v5.0.4 baseline), negligible. */
+static volatile LONG   g_TrackDNonRubiParentMatchCount = 0;
+
+/* v5.0.5 Phase 0 - one record per rewrite event (or non-rubi parent
+ * match). Fixed-size fields, no dynamic allocation, no pointers -
+ * safe to memcpy verbatim into the on-disk REG_BINARY. Field layout
+ * chosen for stable byte-for-byte serialization; userland decoder
+ * must match: 8 (I64) + 16 (image) + 1 + 1 + 2 (hash) + 64 (wchar[32])
+ * = 92 bytes, aligned by the compiler to 96 with 4 bytes trailing
+ * pad. Ring buffer total: 16 * 96 = 1536 bytes. */
+typedef struct _TRACKD_HIT_RECORD {
+    LARGE_INTEGER   Timestamp;         /* KeQuerySystemTime, 100ns ticks;
+                                        * written LAST as a commit barrier
+                                        * (0 = slot invalid / mid-write)  */
+    CHAR            ImageName[16];     /* first 15 bytes of EPROCESS
+                                        * ImageFileName + NUL             */
+    UCHAR           PathType;          /* TRACKD_PATH_TYPE enum value     */
+    UCHAR           WasGated;          /* 1 = rewrite landed;
+                                        * 0 = non-rubi parent match       */
+    USHORT          ParentPathHash;    /* FNV64 folded to 16 bits         */
+    WCHAR           ChildName[32];     /* first 31 wchars of leaf + NUL   */
+} TRACKD_HIT_RECORD;
+
+/* Struct-layout trip wire: userland decoder in scripts/track-d-arm.ps1
+ * assumes recSize == 96 (payload 92 + 4 trailing pad for LARGE_INTEGER
+ * 8-byte alignment). If a future edit changes the struct in a way that
+ * shifts the size, this fires at compile time instead of surfacing as
+ * silent decoder drift in operator diagnostics. */
+C_ASSERT(sizeof(TRACKD_HIT_RECORD) == 96);
+
+/* Lockless ring buffer. Slot allocation is atomic (InterlockedIncrement
+ * then masked); concurrent appends on different CPUs may interleave the
+ * FIELD writes of ONE slot but not slot allocation itself. Loss is
+ * bounded to that one slot's fields; ring semantics preserved.
+ * Acceptable for a diagnostic breadcrumb. */
+static TRACKD_HIT_RECORD g_TrackDRingBuffer[TRACKD_RING_SIZE] = {0};
+static volatile LONG     g_TrackDRingIndex = 0;
+
 /* Full NT path to our Parameters key, cached at DriverEntry for the
  * flusher's ZwOpenKey. g_TrackDParamsBuf backs the UNICODE_STRING. */
 static UNICODE_STRING  g_TrackDParamsFullPath;
@@ -970,6 +1128,10 @@ static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent);
 static BOOLEAN  TrackDCurrentCallerNameMatches(VOID);
 static VOID     TrackDRecordNameMiss(VOID);
 static VOID     WriteLastArmStatus(UCHAR tag, NTSTATUS st);
+/* v5.0.5 Phase 0: ring buffer append + per-path counter helper. */
+static VOID     TrackDRecordHit(UCHAR pathType, UCHAR wasGated,
+                                PCUNICODE_STRING parent,
+                                const WCHAR *childReal, ULONG childWchars);
 static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2);
 static VOID     TrackDHandlePreSetValue(PVOID Argument2);
 static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
@@ -2672,6 +2834,103 @@ static VOID TrackDRecordNameMiss(VOID)
     RtlCopyMemory(g_TrackDLastMissName, local, sizeof(g_TrackDLastMissName));
 }
 
+/* v5.0.5 Phase 0 - append one hit to the ring buffer. Called from
+ * TrackDHandlePostEnumerate at two sites:
+ *   (a) rewrite-landed path (wasGated=1) - after in-place mutation,
+ *       childReal is the pre-rewrite leaf (more useful for triage
+ *       than the post-rewrite synthetic name).
+ *   (b) non-rubi parent-match path (wasGated=0) - in the name-miss
+ *       branch when the parent classifier returned a non-NONE type;
+ *       childReal in this case is the leaf name that WOULD have been
+ *       rewritten had the gate passed.
+ * IRQL: PASSIVE (same as caller). No Zw*, no allocations, no locks.
+ * Slot allocation via InterlockedIncrement is atomic; concurrent
+ * appends on different CPUs may interleave the field writes of ONE
+ * slot but not slot allocation. Loss bounded to that one slot's
+ * fields; ring semantics preserved. */
+static VOID TrackDRecordHit(UCHAR pathType, UCHAR wasGated,
+                            PCUNICODE_STRING parent,
+                            const WCHAR *childReal, ULONG childWchars)
+{
+    ULONG slot;
+    TRACKD_HIT_RECORD *rec;
+    PEPROCESS proc;
+    PCHAR name;
+    ULONG i, copyChars;
+    ULONGLONG h;
+    LARGE_INTEGER ts;
+
+    /* Unsigned arithmetic on slot: casting the InterlockedIncrement
+     * result to ULONG BEFORE subtracting 1 avoids signed-overflow UB
+     * once g_TrackDRingIndex wraps LONG_MAX (~2^31 hits; ~24 days at
+     * 1000 hits/sec). The mask keeps the result in [0, TRACKD_RING_SIZE). */
+    slot = ((ULONG)InterlockedIncrement(&g_TrackDRingIndex) - 1u) & TRACKD_RING_MASK;
+    rec = &g_TrackDRingBuffer[slot];
+
+    /* Timestamp-LAST commit barrier. Decoders use `Timestamp != 0` as
+     * the valid-slot predicate. If we wrote the new Timestamp FIRST and
+     * a concurrent flusher snapshot fell between it and the field
+     * writes, the snapshot would surface a fresh-looking Timestamp with
+     * the PRIOR occupant's ImageName/PathType/ChildName - a torn record
+     * that misattributes hits to the wrong process during exactly the
+     * triage Phase 0 exists for. Invalidate the slot first, populate
+     * every other field, then publish the new Timestamp last as an
+     * atomic 64-bit store. On x64 the plain 8-byte aligned store is
+     * atomic; InterlockedExchange64 makes it explicit AND emits a full
+     * memory barrier so no field write floats past the commit. */
+    InterlockedExchange64((LONG64 *)&rec->Timestamp.QuadPart, 0);
+
+    rec->PathType = pathType;
+    rec->WasGated = wasGated;
+
+    /* Image name (first 15 bytes + NUL). Defensive - upstream gate
+     * already dereferenced PsGetCurrentProcess successfully. */
+    proc = PsGetCurrentProcess();
+    if (proc != NULL) {
+        name = PsGetProcessImageFileName(proc);
+        if (name != NULL) {
+            for (i = 0; i < 15; i++) {
+                CHAR c = name[i];
+                rec->ImageName[i] = c;
+                if (c == '\0') break;
+            }
+            for (; i < 15; i++) rec->ImageName[i] = '\0';
+            rec->ImageName[15] = '\0';
+        } else {
+            RtlZeroMemory(rec->ImageName, sizeof(rec->ImageName));
+        }
+    } else {
+        RtlZeroMemory(rec->ImageName, sizeof(rec->ImageName));
+    }
+
+    /* Parent-path hash - FNV64 folded to 16 bits. keyName from
+     * CmCallbackGetKeyObjectID is valid for the callback lifetime;
+     * safe to hash inline. */
+    if (parent != NULL && parent->Buffer != NULL && parent->Length > 0) {
+        h = TrackDFnvHash64((const UCHAR *)parent->Buffer,
+                            (ULONG)parent->Length);
+        rec->ParentPathHash = (USHORT)((h ^ (h >> 32) ^ (h >> 16)) & 0xFFFFu);
+    } else {
+        rec->ParentPathHash = 0;
+    }
+
+    /* Child name (first 31 wchars + NUL). NULL-clamp so future call
+     * sites that pass (NULL, N>0) by mistake don't NULL-deref inside
+     * the CM callback (BSOD). Current call sites pair NULL with 0
+     * correctly; this is defense in depth matching the parent-guard
+     * style above. */
+    if (childReal == NULL) childWchars = 0;
+    copyChars = childWchars < 31 ? childWchars : 31;
+    for (i = 0; i < copyChars; i++) rec->ChildName[i] = childReal[i];
+    for (; i < 32; i++) rec->ChildName[i] = L'\0';
+
+    /* Commit: publish new Timestamp as the final atomic 64-bit store.
+     * All prior field writes are visible to any snapshot that sees
+     * this Timestamp != 0. */
+    KeQuerySystemTime(&ts);
+    InterlockedExchange64((LONG64 *)&rec->Timestamp.QuadPart, ts.QuadPart);
+}
+
 /* RegNtPostEnumerateKey body: classify parent path, dispatch to the
  * matching child-name gate + synthesizer, rewrite the enumerated
  * subkey name in place. Same wchar count guaranteed by all
@@ -2704,9 +2963,29 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
     /* v5.0.4: image-name gate BEFORE the more expensive Cm callback-
      * get-key-object-id call. Rejected callers bump the name-miss
      * counter and stash their leaf into g_TrackDLastMissName for
-     * userland diagnostics - see TrackDRecordNameMiss. */
+     * userland diagnostics - see TrackDRecordNameMiss.
+     * v5.0.5 Phase 0: on miss, ALSO classify the parent - if it matches
+     * one of our 6 target types, bump g_TrackDNonRubiParentMatchCount and
+     * ring-buffer the event with WasGated=0. Non-zero counter identifies
+     * OTHER processes (helpers/injected workers) touching HW-fingerprint
+     * parents - would invalidate the "gate covers everything relevant"
+     * premise and escalate to gate-broadening work in v5.0.6. Cost:
+     * one extra CmCallbackGetKeyObjectID per name-miss (~200/sec at
+     * v5.0.4 baseline; negligible). */
     if (!TrackDCurrentCallerNameMatches()) {
         TrackDRecordNameMiss();
+        pre = (PREG_ENUMERATE_KEY_INFORMATION)post->PreInformation;
+        if (pre != NULL) {
+            keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object,
+                                               &keyId, &keyName);
+            if (NT_SUCCESS(keyIdSt) && keyName != NULL) {
+                pathType = TrackDClassifyParent(keyName);
+                if (pathType != TRACKD_PATH_NONE) {
+                    InterlockedIncrement(&g_TrackDNonRubiParentMatchCount);
+                    TrackDRecordHit((UCHAR)pathType, 0, keyName, NULL, 0);
+                }
+            }
+        }
         return STATUS_SUCCESS;
     }
 
@@ -2826,6 +3105,22 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
     }
 
     InterlockedIncrement(&g_TrackDHitCount);
+    /* v5.0.5 Phase 0: per-path-type breakdown + ring buffer append
+     * for the just-landed rewrite. Uses pathType classified above +
+     * `real` snapshot of the pre-rewrite leaf (more useful for triage
+     * than the synthetic post-rewrite name). keyName from CmCallback-
+     * GetKeyObjectID is still valid at this point (Cm docs guarantee
+     * for callback lifetime). */
+    switch (pathType) {
+    case TRACKD_PATH_SCSI:          InterlockedIncrement(&g_TrackDHitCount_SCSI);   break;
+    case TRACKD_PATH_PCI:           InterlockedIncrement(&g_TrackDHitCount_PCI);    break;
+    case TRACKD_PATH_USB_INSTANCE:  InterlockedIncrement(&g_TrackDHitCount_USB);    break;
+    case TRACKD_PATH_HID_INSTANCE:  InterlockedIncrement(&g_TrackDHitCount_HID);    break;
+    case TRACKD_PATH_AUDIO_RENDER:  InterlockedIncrement(&g_TrackDHitCount_AudioR); break;
+    case TRACKD_PATH_AUDIO_CAPTURE: InterlockedIncrement(&g_TrackDHitCount_AudioC); break;
+    default: break;
+    }
+    TrackDRecordHit((UCHAR)pathType, 1, keyName, real, realWchars);
     WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
@@ -2956,20 +3251,50 @@ static VOID TrackDFlushWorker(PVOID unused)
     CHAR  postMissSnap[16];
     WCHAR missWide[16];
     ULONG i, wlen;
+    /* v5.0.5 Phase 0 snapshots (initialized so drift-check paths after
+     * `out:` see defined values on the early-goto path). BTH + Storage
+     * counters are pre-declared here so Phase 1 only wires the increment
+     * sites when it lands the BTH/STORAGE\Volume rewriters. */
+    ULONG hitScsi = 0, hitPci = 0, hitUsb = 0, hitHid = 0;
+    ULONG hitAudioR = 0, hitAudioC = 0, hitBth = 0, hitStorage = 0;
+    ULONG nonRubi = 0, ringIdx = 0;
+    ULONG postHitScsi, postHitPci, postHitUsb, postHitHid;
+    ULONG postHitAudioR, postHitAudioC, postHitBth, postHitStorage;
+    ULONG postNonRubi, postRingIdx;
+    /* Ring snapshot initialized in-declaration so the `goto out` early
+     * path leaves `ringSnap` deterministic. Compiler emits a single
+     * zeroing pass; equivalent to an RtlZeroMemory call but idiomatic. */
+    TRACKD_HIT_RECORD ringSnap[TRACKD_RING_SIZE] = {0};
 
     UNREFERENCED_PARAMETER(unused);
     PAGED_CODE();
 
     if (g_TrackDParamsFullPath.Length == 0) goto out;
 
-    /* Snapshot all five hot-path publishers before opening the key.
-     * Order matters only for the drift-recheck symmetry below. */
+    /* Snapshot all hot-path publishers before opening the key. Order
+     * matters only for the drift-recheck symmetry below. */
     statusValue   = (ULONG)InterlockedCompareExchange(&g_TrackDLastStatus,     0, 0);
     hitValue      = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount,       0, 0);
     invokeValue   = (ULONG)InterlockedCompareExchange(&g_TrackDInvokeCount,    0, 0);
     nameMissValue = (ULONG)InterlockedCompareExchange(&g_TrackDNameMissCount,  0, 0);
     RtlCopyMemory(missSnap, g_TrackDLastMissName, sizeof(missSnap));
     missSnap[15] = '\0'; /* defensive re-termination */
+
+    /* v5.0.5 Phase 0 snapshots. Per-path counters share the same
+     * "InterlockedCompareExchange(x, 0, 0)" read pattern as v5.0.4.
+     * Ring buffer is memcpy'd verbatim - races on individual field
+     * writes are accepted per the struct's comment. */
+    hitScsi    = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_SCSI,      0, 0);
+    hitPci     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_PCI,       0, 0);
+    hitUsb     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_USB,       0, 0);
+    hitHid     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_HID,       0, 0);
+    hitAudioR  = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_AudioR,    0, 0);
+    hitAudioC  = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_AudioC,    0, 0);
+    hitBth     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_BTH,       0, 0);
+    hitStorage = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_Storage,   0, 0);
+    nonRubi    = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiParentMatchCount, 0, 0);
+    ringIdx    = (ULONG)InterlockedCompareExchange(&g_TrackDRingIndex,          0, 0);
+    RtlCopyMemory(ringSnap, g_TrackDRingBuffer, sizeof(ringSnap));
 
     InitializeObjectAttributes(&oa, &g_TrackDParamsFullPath,
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
@@ -3008,6 +3333,42 @@ static VOID TrackDFlushWorker(PVOID unused)
     (void)ZwSetValueKey(hParams, &valName, 0, REG_SZ,
                         missWide, (wlen + 1) * sizeof(WCHAR));
 
+    /* v5.0.5 Phase 0 additions: per-path breakdown, non-rubi parent
+     * match count, and the ring buffer as one REG_BINARY blob. */
+    RtlInitUnicodeString(&valName, L"CallbackHit_SCSI");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitScsi, sizeof(hitScsi));
+    RtlInitUnicodeString(&valName, L"CallbackHit_PCI");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitPci, sizeof(hitPci));
+    RtlInitUnicodeString(&valName, L"CallbackHit_USB");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitUsb, sizeof(hitUsb));
+    RtlInitUnicodeString(&valName, L"CallbackHit_HID");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitHid, sizeof(hitHid));
+    RtlInitUnicodeString(&valName, L"CallbackHit_AudioR");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitAudioR, sizeof(hitAudioR));
+    RtlInitUnicodeString(&valName, L"CallbackHit_AudioC");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitAudioC, sizeof(hitAudioC));
+    RtlInitUnicodeString(&valName, L"CallbackHit_BTH");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitBth, sizeof(hitBth));
+    RtlInitUnicodeString(&valName, L"CallbackHit_Storage");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitStorage, sizeof(hitStorage));
+    RtlInitUnicodeString(&valName, L"CallbackNonRubiParentMatch");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &nonRubi, sizeof(nonRubi));
+    RtlInitUnicodeString(&valName, L"CallbackHitRingIndex");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &ringIdx, sizeof(ringIdx));
+    RtlInitUnicodeString(&valName, L"HitRingBuffer");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_BINARY,
+                        ringSnap, sizeof(ringSnap));
+
 out:
     if (hParams) ZwClose(hParams);
     /* Release the guard so a concurrent update can re-queue. */
@@ -3016,16 +3377,39 @@ out:
      * inside the persist window, its value never reached the registry -
      * re-queue ourselves to flush it. Reads are cheap Interlocked reads;
      * guarded re-queue prevents thrash. LastMissImageName drift is
-     * detected byte-wise; matches the snapshot semantics. */
-    postStatus   = (ULONG)InterlockedCompareExchange(&g_TrackDLastStatus,     0, 0);
-    postHit      = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount,       0, 0);
-    postInvoke   = (ULONG)InterlockedCompareExchange(&g_TrackDInvokeCount,    0, 0);
-    postNameMiss = (ULONG)InterlockedCompareExchange(&g_TrackDNameMissCount,  0, 0);
+     * detected byte-wise; matches the snapshot semantics. Ring buffer
+     * drift detected via g_TrackDRingIndex movement - full content
+     * comparison would double the stack usage and add no diagnostic
+     * value beyond "did any new record land". */
+    postStatus     = (ULONG)InterlockedCompareExchange(&g_TrackDLastStatus,     0, 0);
+    postHit        = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount,       0, 0);
+    postInvoke     = (ULONG)InterlockedCompareExchange(&g_TrackDInvokeCount,    0, 0);
+    postNameMiss   = (ULONG)InterlockedCompareExchange(&g_TrackDNameMissCount,  0, 0);
+    postHitScsi    = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_SCSI,      0, 0);
+    postHitPci     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_PCI,       0, 0);
+    postHitUsb     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_USB,       0, 0);
+    postHitHid     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_HID,       0, 0);
+    postHitAudioR  = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_AudioR,    0, 0);
+    postHitAudioC  = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_AudioC,    0, 0);
+    postHitBth     = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_BTH,       0, 0);
+    postHitStorage = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_Storage,   0, 0);
+    postNonRubi    = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiParentMatchCount, 0, 0);
+    postRingIdx    = (ULONG)InterlockedCompareExchange(&g_TrackDRingIndex,          0, 0);
     RtlCopyMemory(postMissSnap, g_TrackDLastMissName, sizeof(postMissSnap));
-    if (postStatus   != statusValue   ||
-        postHit      != hitValue      ||
-        postInvoke   != invokeValue   ||
-        postNameMiss != nameMissValue ||
+    if (postStatus     != statusValue   ||
+        postHit        != hitValue      ||
+        postInvoke     != invokeValue   ||
+        postNameMiss   != nameMissValue ||
+        postHitScsi    != hitScsi       ||
+        postHitPci     != hitPci        ||
+        postHitUsb     != hitUsb        ||
+        postHitHid     != hitHid        ||
+        postHitAudioR  != hitAudioR     ||
+        postHitAudioC  != hitAudioC     ||
+        postHitBth     != hitBth        ||
+        postHitStorage != hitStorage    ||
+        postNonRubi    != nonRubi       ||
+        postRingIdx    != ringIdx       ||
         RtlCompareMemory(postMissSnap, missSnap, sizeof(missSnap)) != sizeof(missSnap))
     {
         if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
