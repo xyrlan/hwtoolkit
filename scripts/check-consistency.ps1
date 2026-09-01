@@ -115,6 +115,142 @@ function Read-ReplayStatus {
 Read-ReplayStatus
 
 # ============================================================
+#  v5.0.0: Read-CallbackStatus decodifica o breadcrumb Track D
+#  em Parameters\LastCallbackStatus. Formato identico:
+#    (tag << 24) | (NTSTATUS & 0x00FFFFFF)
+#  Tags Track D (v5.0.4):
+#    0x00 OK               (rewrite landed OU arm-time sucesso)
+#    0x01 NAME-MISS        (v5.0.4: image name do caller nao bateu com
+#                           TRACKD_IMAGE_MATCH_PREFIX "rubinot" no gate
+#                           inline. Antes de v5.0.4 esse slot era
+#                           NO-PID e representava "PID array vazio".)
+#    0x02 RESERVED         (era PID-STALE pre-v5.0.4; slot mantido
+#                           por compat com decodificadores antigos)
+#    0x03 PATH-GET-FAIL    (CmCallbackGetKeyObjectID falhou)
+#    0x04 BUFFER-BAD       (KEY_INFORMATION malformada)
+#    0x05 ALLOC-FAIL       (arm-time: CmRegisterCallbackEx falhou)
+#    0x06 SEH-FAULT        (__except capturou fault na rewrite)
+#
+#  v5.0.4 tambem publica CallbackInvokeCount, CallbackNameMissCount,
+#  LastMissImageName, e LastArmStatus (separate do LastCallbackStatus).
+# ============================================================
+function Read-CallbackStatus {
+    $rstflt = 'HKLM:\SYSTEM\CurrentControlSet\Services\RstFlt\Parameters'
+    if (-not (Test-Path $rstflt)) { return }
+
+    $tagNames = @{
+        0x00 = 'OK'
+        0x01 = 'NAME-MISS'
+        0x02 = 'RESERVED'
+        0x03 = 'PATH-GET-FAIL'
+        0x04 = 'BUFFER-BAD'
+        0x05 = 'ALLOC-FAIL'
+        0x06 = 'SEH-FAULT'
+    }
+
+    $raw = (Get-ItemProperty -Path $rstflt -Name 'LastCallbackStatus' `
+                              -ErrorAction SilentlyContinue).LastCallbackStatus
+    if ($null -eq $raw) {
+        Write-Host "  [*]    Track D LastCallbackStatus: ausente (callback nunca fired hot path)" -ForegroundColor DarkGray
+    } else {
+        $tag = ($raw -shr 24) -band 0xFF
+        $st  = $raw -band 0x00FFFFFF
+        $tagName = $tagNames[$tag]
+        if (-not $tagName) { $tagName = "UNKNOWN($tag)" }
+
+        $stHex = '0x{0:X6}' -f $st
+        $line  = "  [*]    Track D LastCallbackStatus: $tagName (NTSTATUS=$stHex)"
+        switch ($tag) {
+            0x00 { Write-Host $line -ForegroundColor Green }
+            0x01 {
+                Write-Host $line -ForegroundColor Yellow
+                Write-Host "         v5.0.4: image name do caller nao bateu com 'rubinot' no gate." -ForegroundColor DarkGray
+                Write-Host "         Ver LastMissImageName + CallbackNameMissCount abaixo." -ForegroundColor DarkGray
+            }
+            0x02 { Write-Host $line -ForegroundColor Yellow }
+            0x03 { Write-Host $line -ForegroundColor Yellow }
+            0x04 { Write-Host $line -ForegroundColor Yellow }
+            0x05 {
+                Write-Host $line -ForegroundColor Red
+                Write-Host "         CmRegisterCallbackEx falhou no DriverEntry" -ForegroundColor DarkGray
+                Write-Host "         - Track D nao esta ativo. Ver docs/postmortem-v5-track-d/." -ForegroundColor DarkGray
+            }
+            0x06 {
+                Write-Host $line -ForegroundColor Red
+                Write-Host "         SEH capturou fault ao mutar buffer do caller" -ForegroundColor DarkGray
+                Write-Host "         (possivel corruption de KEY_INFORMATION). Investigar." -ForegroundColor DarkGray
+            }
+            default { Write-Host $line -ForegroundColor Yellow }
+        }
+    }
+
+    # Callback hit count (rewrites que efetivamente reescreveram bytes)
+    $hits = (Get-ItemProperty -Path $rstflt -Name 'CallbackHitCount' `
+                               -ErrorAction SilentlyContinue).CallbackHitCount
+    if ($null -ne $hits) {
+        $color = if ($hits -gt 0) { 'Green' } else { 'DarkGray' }
+        Write-Host ("  [*]    Track D CallbackHitCount: " + $hits + " rewrite(s) desde ultimo flush") -ForegroundColor $color
+    }
+
+    # v5.0.4: CallbackInvokeCount - total de RegNtPostEnumerateKey vistos
+    # pelo callback body post-enable-gate (inclui pass-through, NAME-MISS
+    # e OK). Se 0 apos boot, callback nao esta armado - checar LastArmStatus.
+    $inv = (Get-ItemProperty -Path $rstflt -Name 'CallbackInvokeCount' `
+                              -ErrorAction SilentlyContinue).CallbackInvokeCount
+    if ($null -ne $inv) {
+        Write-Host ("  [*]    Track D CallbackInvokeCount: " + $inv + " invocacao(oes) post-enable-gate") -ForegroundColor DarkGray
+        if ($null -ne $hits -and $inv -gt 0) {
+            $rewriteRatio = [math]::Round(($hits / $inv) * 100, 2)
+            Write-Host ("         rewrite ratio: {0}%" -f $rewriteRatio) -ForegroundColor DarkGray
+        }
+    }
+
+    # v5.0.4: CallbackNameMissCount - invocacoes rejeitadas pelo name gate
+    # (image name do caller nao comeca com "rubinot"). Se >0, o driver vem
+    # sendo perguntado por processos que nao sao alvo - normal em qualquer
+    # boot (Explorer, Discord, etc. lem SCSI\Disk enum tambem).
+    $miss = (Get-ItemProperty -Path $rstflt -Name 'CallbackNameMissCount' `
+                               -ErrorAction SilentlyContinue).CallbackNameMissCount
+    if ($null -ne $miss) {
+        $color = if ($miss -gt 0) { 'Yellow' } else { 'DarkGray' }
+        Write-Host ("  [*]    Track D CallbackNameMissCount: " + $miss + " invocacao(oes) rejeitada(s) pelo name gate") -ForegroundColor $color
+    }
+
+    # v5.0.4: LastMissImageName - primeiros 15 bytes do EPROCESS
+    # ImageFileName do ultimo caller que falhou o name gate. Diagnostico
+    # de quem dominou o trafego de misses.
+    $lastImg = (Get-ItemProperty -Path $rstflt -Name 'LastMissImageName' `
+                                 -ErrorAction SilentlyContinue).LastMissImageName
+    if ($null -ne $lastImg -and $lastImg -ne '') {
+        Write-Host ("  [*]    Track D LastMissImageName: `"" + $lastImg + "`"") -ForegroundColor DarkGray
+    }
+
+    # v5.0.4: LastArmStatus - breadcrumb gravado no ArmTrackD (success
+    # ou failure), mesma codificacao (tag<<24)|NTSTATUS. Serve para
+    # distinguir "callback nunca disparou hot path" (LastCallbackStatus
+    # ausente) de "arm falhou" (LastArmStatus com tag != 0x00).
+    $armRaw = (Get-ItemProperty -Path $rstflt -Name 'LastArmStatus' `
+                                -ErrorAction SilentlyContinue).LastArmStatus
+    if ($null -ne $armRaw) {
+        $armTag  = ($armRaw -shr 24) -band 0xFF
+        $armSt   = $armRaw -band 0x00FFFFFF
+        $armName = $tagNames[$armTag]
+        if (-not $armName) { $armName = "UNKNOWN($armTag)" }
+        $armHex  = '0x{0:X6}' -f $armSt
+        $armLine = "  [*]    Track D LastArmStatus: $armName (NTSTATUS=$armHex)"
+        if ($armTag -eq 0x00) {
+            Write-Host $armLine -ForegroundColor Green
+        } else {
+            Write-Host $armLine -ForegroundColor Red
+            Write-Host "         DriverEntry arm path falhou - callback nao esta ativo" -ForegroundColor DarkGray
+            Write-Host "         mesmo se EnableRegCallback=1. Ver docs/postmortem-v5-track-d/." -ForegroundColor DarkGray
+        }
+    }
+}
+
+Read-CallbackStatus
+
+# ============================================================
 #  v4.0.6: verificar se o rstflt.sys em disco (nao o carregado)
 #  contem o marker "RstFlt-v4.0.6-BUILD-MARKER". PE TimeDateStamp
 #  muda a cada relink e defeats SHA-based identity, entao este

@@ -153,6 +153,343 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v5.0.4 - Simplify PID matching to per-callback image-name check
+ *       (Kickoff sec 3.3 Option A). Remove PsSetCreateProcessNotifyRoutineEx
+ *       + g_TrackDTrackedPids[] + KSPIN_LOCK + g_TrackDOverridePid +
+ *       Parameters\RubinOtPid tap. v5.0.0-v5.0.3 shipped Option B (PID
+ *       array populated by Ps notify) against the kickoff's own MVP
+ *       recommendation. Post-v5.0.3 audit + third bare-metal ban proved
+ *       four independent failure modes could keep the PID array empty
+ *       when rubinot* was actually running:
+ *         (a) driver armed AFTER rubinot* already spawned - Ps notify
+ *             only fires on create, so the pre-existing PID is invisible.
+ *         (b) launcher/updater chain spawns the game via an intermediate
+ *             shim whose ImageFileName is NOT rubi-prefixed - Ps notify
+ *             rejected the shim and by the time the eventual
+ *             rubinot_dx.exe fired its create, its own HW enum had
+ *             already happened in-process during image load.
+ *         (c) Ps-notify-vs-first-callback race: on fast SSDs the first
+ *             RegNtPostEnumerateKey from rubinot_dx.exe can land before
+ *             Ps notify has finished adding the PID (both fire at
+ *             PASSIVE from the same create path). Delta HitCount = 0
+ *             for the launch, HitCount jumps by 1 on the SECOND enum.
+ *         (d) PS_CREATE_NOTIFY_INFO->ImageFileName is documented as
+ *             OPTIONAL - some NtCreateUserProcess paths deliver NULL.
+ *             Our handler bailed silently, missing that spawn.
+ *     - Fix: RstRegistryCallback now calls
+ *         PsGetProcessImageFileName(PsGetCurrentProcess())
+ *       and _strnicmp("rubinot", 7) against the returned 15-byte
+ *       EPROCESS ImageFileName. Next-byte guard rejects anything
+ *       whose char after the prefix is neither '\0' nor '.' nor '_',
+ *       so `rubinotify.exe` cannot slip through. Match runs per-fire,
+ *       imune to (a)-(d) by construction: no PID-enrollment step to
+ *       miss, no ordering constraint, no spawn-time NULL to bail on.
+ *     - Deletions (~70 LOC): RstProcessNotifyCallback + its register/
+ *       unreg calls, g_TrackDTrackedPids[]/g_TrackDTrackedPidCount/
+ *       g_TrackDPidsLock/g_TrackDOverridePid globals, TrackDAdd/Remove/
+ *       MatchesTrackedPid + TrackDImageNameMatchesRubi + TrackDCurrent-
+ *       CallerIsTarget helpers, Parameters\RubinOtPid load in
+ *       LoadTrackDConfig, isPid branch of TrackDHandlePreSetValue,
+ *       KeInitializeSpinLock at arm time.
+ *     - New instrumentation (closes v5.0.3-documented gap "callback
+ *       silent when gate rejects"):
+ *         g_TrackDInvokeCount    LONG - incremented at top of
+ *             RstRegistryCallback after the enable-gate, before the
+ *             name gate. Answers "did the callback fire at all this
+ *             boot" without depending on rewrite success.
+ *         g_TrackDNameMissCount  LONG - incremented when the image-name
+ *             gate rejects the caller (any non-rubinot process).
+ *         g_TrackDLastMissName   CHAR[16] - first 15 bytes of the most
+ *             recent rejected image name, NUL-terminated. Diagnostic
+ *             hint: which process dominates the miss traffic.
+ *       All three persisted by the existing TrackDFlushWorker as
+ *       REG_DWORD / REG_DWORD / REG_SZ under Services\RstFlt\Parameters
+ *       (CallbackInvokeCount / CallbackNameMissCount / LastMissImageName).
+ *       Drift-recheck loop extended to cover all five now-published
+ *       values so on-disk breadcrumbs never permanently lag hot-path.
+ *     - Tag 0x01 redefined in place: TRACKD_TAG_NO_PID -> TRACKD_TAG_
+ *       NAME_MISS. Same slot value (0x01) so pre-v5.0.4 decoders that
+ *       ingested breadcrumbs from older builds still decode without
+ *       collision; the label just changes meaning. Tag 0x02 (was
+ *       PID_STALE) reserved as TRACKD_TAG_STALE_UNUSED so no future
+ *       redefine silently reuses it.
+ *     - Split LastArmStatus from LastCallbackStatus (P0.4 in the
+ *       audit): new WriteLastArmStatus helper writes to
+ *       Parameters\LastArmStatus at ArmTrackD success AND at the
+ *       arm-failure path. LastCallbackStatus is written ONLY from the
+ *       hot-path callback body after v5.0.4. Fixes the v5.0.3-flagged
+ *       ambiguity ("`tag=0x00 OK` from -Diagnose could mean 'callback
+ *       fired cleanly' OR 'callback merely armed cleanly'").
+ *     - Companion userland changes:
+ *         scripts/track-d-arm.ps1 -SetPid removed (no PID plumbing to
+ *             set); -Diagnose prints CallbackInvokeCount /
+ *             CallbackNameMissCount / LastMissImageName / LastArmStatus
+ *             plus decoded tag table with 0x01 = NAME-MISS.
+ *         scripts/check-consistency.ps1 Track D block extended to
+ *             surface the same values; NAME-MISS treated as diagnostic
+ *             (Yellow), not benign.
+ *     - Companion audit: adversarial workflow run 2026-09-01 against
+ *       v5.0.2 tree - 44 findings, 41 CONFIRMED, 1 REFUTED, 2
+ *       PLAUSIBLE. Findings that directly drove this refactor:
+ *         no-invocation-counter (critical), pid-gate-silent-exit
+ *         (critical), lastcallbackstatus-arm-time-only-when-clean
+ *         (high), v503-changelog-anticipates-this-gap (high),
+ *         pid-filter-uses-unicode-imagefilename-with-proper-sync
+ *         (info; REFUTES original ANSI/UNICODE-bug hypothesis).
+ *     - Version marker bumped v5.0.3 -> v5.0.4.
+ *     - Postmortem: docs/postmortem-v5-track-d/incident-v504-pid-
+ *       matching-simplification.md.
+ *     - Backward compat: RubinOtPid REG_DWORD under Parameters is now
+ *       ignored (safe to leave from previous arms; -Enable no longer
+ *       writes it). Tag 0x02 slot reserved for compat with older
+ *       decoders. EnableRegCallback / RegCallbackSeed /
+ *       CallbackHitCount / LastCallbackStatus shapes unchanged.
+ *     - Reentrancy contract preserved: no Zw* inside callback body;
+ *       LastArmStatus write is safe (ArmTrackD runs at PASSIVE,
+ *       DriverEntry context, outside any Cm callback frame).
+ *
+ * v5.0.3 - HOTFIX: add /INTEGRITYCHECK linker flag (required by
+ *       PsSetCreateProcessNotifyRoutineEx).
+ *     - Empirical discovery, bare-metal test 2026-09-01: v5.0.2's
+ *       Ps notify auto-detect silently failed. Cm callback path OK
+ *       (proven via manual SetPid: 4 rewrites landed, HitCount 0->4)
+ *       but no rubinot* process was ever added to
+ *       g_TrackDTrackedPids array (delta HitCount = 0 across launcher
+ *       start + a rubi-prefixed powershell probe test).
+ *     - Root cause: MSDN mandates `/INTEGRITYCHECK` linker flag for
+ *       ANY driver registering PsSetCreateProcessNotifyRoutineEx:
+ *         "Any driver that registers process notify routines via
+ *          PsSetCreateProcessNotifyRoutineEx or ..NotifyRoutineEx2
+ *          must be linked with the /INTEGRITYCHECK linker option."
+ *       Without the flag, the register call returns
+ *       STATUS_ACCESS_DENIED. ArmTrackD ignores this silently
+ *       (non-fatal per design — override PID still works), so from
+ *       userland it looks like the callback armed OK
+ *       (`LastCallbackStatus tag=0x00 OK` — but that's just the Cm
+ *       callback's init breadcrumb; Ps notify has no separate
+ *       breadcrumb). Testsigning does NOT bypass the requirement
+ *       — confirmed empirically on this bare-metal box.
+ *     - Fix: add `/INTEGRITYCHECK` to `LFLAGS_COMMON` in
+ *       `driver/makefile.mak`. Rebuild → PE header carries
+ *       IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY → kernel accepts the
+ *       Ps notify registration on next load. No C source change
+ *       needed.
+ *     - Marker bumped `v5.0.2` -> `v5.0.3` to distinguish the build.
+ *     - Follow-up: consider adding a per-subsystem breadcrumb tag
+ *       (e.g. `LastPsNotifyStatus`) so future arm-time failures are
+ *       visible from `check-consistency.ps1` without spelunking DBG
+ *       output. Deferred to v5.0.4 if needed.
+ * v5.0.2 - Multi-PID array + substring image match for Ps notify.
+ *     - Empirical finding (bare-metal test 2026-09-01): RubinOT ships
+ *       as TWO cooperating processes -
+ *         `RubinOT.exe`      - launcher/client shell; does the initial
+ *                              EMAC registration + HW enumeration
+ *                              (creates ~\emac-uuid, POSTs fingerprint)
+ *                              in sub-1s from process create.
+ *         `rubinot_dx.exe`   - game client; spawned when user picks a
+ *                              server and clicks Play; does its own
+ *                              periodic HW probes during gameplay.
+ *       Both must be intercepted in parallel: the launcher registers
+ *       the machine identity on server, the game client feeds session
+ *       telemetry. If either goes uncaptured, the server sees a
+ *       mismatched (real-launcher, spoofed-game) pair - inherently
+ *       suspicious.
+ *     - v5.0.1's `TRACKD_RUBINOT_IMAGE_STR` suffix-matched only
+ *       `\rubinot_dx.exe` and cached the detected PID in a SINGLE
+ *       slot (`g_TrackDAutoPid`). Two independent failures:
+ *         (a) `RubinOT.exe` launcher never matched -> its HW enum
+ *             (sub-1s) was never intercepted.
+ *         (b) Even if we listed both image names, when the game client
+ *             fired later, `InterlockedExchangePointer` on the single
+ *             slot would OVERWRITE the launcher's PID - the launcher
+ *             would lose interception mid-session.
+ *     - v5.0.2 fixes both. New file-scope globals replace the single
+ *       slot:
+ *           KSPIN_LOCK g_TrackDPidsLock;
+ *           HANDLE     g_TrackDTrackedPids[TRACKD_MAX_TRACKED_PIDS];
+ *           ULONG      g_TrackDTrackedPidCount;
+ *       With TRACKD_MAX_TRACKED_PIDS=8 (comfortable headroom for a
+ *       launcher family plus updaters). Add/Remove helpers use the
+ *       spinlock; the hot-path reader in `TrackDCurrentCallerIsTarget`
+ *       takes the lock too - contention is negligible because Ps
+ *       notify updates are rare (process create/exit only).
+ *     - Image-name match promoted from suffix-exact to
+ *       case-insensitive substring on the LAST PATH COMPONENT ONLY
+ *       (chars after final `\`). Match is: first 4 wchars of that
+ *       component compare equal to `rubi` (case-insensitive). Covers:
+ *         `RubinOT.exe`, `rubinot_dx.exe`, `RubinOTUpdater.exe`,
+ *         any hypothetical rename that starts the leaf with `rubi`
+ *         (Rubinix, RubinOT_v3, etc.). Rejects false positives from
+ *         random paths that CONTAIN rubi but not as a leaf prefix.
+ *     - PsSetCreateProcessNotifyRoutineEx exit branch now calls
+ *       `TrackDRemoveTrackedPid(ProcessId)` unconditionally - safe
+ *       (no-op if PID not tracked), keeps the array from bloating
+ *       across long uptime.
+ *     - `TrackDCurrentCallerIsTarget` now:
+ *         override != 0  ->  return current == override  (unchanged;
+ *                            manual test override still wins)
+ *         override == 0  ->  scan g_TrackDTrackedPids for match
+ *     - `g_TrackDRubinotImage` UNICODE_STRING + `TRACKD_RUBINOT_IMAGE
+ *       _STR` #define both removed - no consumers left after substring
+ *       match.
+ *     - No config surface change - `EnableRegCallback`, `RubinOtPid`,
+ *       `RegCallbackSeed`, `LastCallbackStatus`, `CallbackHitCount`
+ *       stay the same shape. `track-d-arm.ps1` needs no update.
+ *     - Version marker bumped `v5.0.1` -> `v5.0.2`.
+ *     - Reentrancy contract preserved: spinlock is at PASSIVE (Ps
+ *       notify) and PASSIVE (Cm callback) - both allow it. Zero Zw*
+ *       inside the callback body. No new external API surface.
+ * v5.0.1 - Track D expansion + `-Disable` hot-toggle fix.
+ *     - `TrackDHandlePreSetValue` now dispatches by ValueName: still
+ *       taps `RubinOtPid` (v5.0.0), and ADDITIONALLY taps
+ *       `EnableRegCallback`. Userland `track-d-arm.ps1 -Disable` now
+ *       takes effect immediately (previous behavior required reboot
+ *       because `g_TrackDEnabled` was only read at DriverEntry). Same
+ *       tap works for `-Enable` — flipping the DWORD on the fly
+ *       toggles the hot-path gate. Closes the v5.0.0 known limitation
+ *       documented in docs/postmortem-v5-track-d/incident-v500-mvp-
+ *       integration.md sec 0.1.
+ *     - Expanded read intercepts beyond MVP scope. New per-path
+ *       synthesizers, all preserving structural markers and same
+ *       wchar count so caller's NameLength stays valid:
+ *         * `\Enum\PCI\VEN_*&DEV_*&SUBSYS_*&REV_*` -
+ *           rewrites SUBSYS+REV tokens, preserves VEN+DEV+CC (never
+ *           touches VEN or DEV — driver binding is keyed on those).
+ *         * `\Enum\USB\VID_*&PID_*\<serial>` -
+ *           rewrites the leaf serial subkey name, preserves the
+ *           `VID_*&PID_*` parent (driver binding stays intact).
+ *           Parent classification: parent path ends with
+ *           `\Enum\USB\VID_XXXX&PID_XXXX` (case-insensitive; last
+ *           component matches `VID_` + 4 hex + `&PID_` + 4 hex).
+ *         * `\Enum\HID\VID_*&PID_*\<serial>` -
+ *           same shape as USB. Kickoff had this as POST-MVP with
+ *           input-safety caveat; kernel intercept only rewrites the
+ *           returned subkey NAME, does NOT rename actual PnP path or
+ *           change driver binding, so keyboard/mouse keep working.
+ *           Serial-name change only affects readers doing RegEnumKey
+ *           enumeration under the VID_&PID_ parent.
+ *         * `\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\
+ *           Audio\Render\{GUID}` and `\Capture\{GUID}` -
+ *           rewrites the entire endpoint GUID (32 hex chars in
+ *           canonical dashed form), preserves the enclosing `{...}`
+ *           and dash positions.
+ *     - New classifier `TrackDClassifyParent` returns a `TRACKD_PATH_
+ *       TYPE` enum (NONE / SCSI / PCI / USB_INSTANCE / HID_INSTANCE
+ *       / AUDIO_RENDER / AUDIO_CAPTURE). `TrackDHandlePostEnumerate`
+ *       now dispatches by classifier result to the per-type
+ *       synthesizer. Reentrancy contract preserved: zero Zw* inside
+ *       the callback body; all classification is memory-only on the
+ *       parent path returned by `CmCallbackGetKeyObjectID`.
+ *     - New file-scope UNICODE_STRING views for the additional path
+ *       suffixes (`\Enum\PCI`, `\MMDevices\Audio\Render`, `\MMDevices
+ *       \Audio\Capture`) + a shared value-name view for
+ *       `EnableRegCallback`. Initialized once in `ArmTrackD` from
+ *       string literals in `.rdata`; zero heap.
+ *     - Version marker bumped `v5.0.0` → `v5.0.1`.
+ *     - Companion userland: `scripts/track-d-arm.ps1 -Disable` now
+ *       correctly claims immediate effect; README "Level C+/Track D"
+ *       section updated. `-Diagnose` legend unchanged (same tag set,
+ *       same breadcrumb encoding).
+ *     - PatchGuard posture unchanged: same CmRegisterCallbackEx +
+ *       PsSetCreateProcessNotifyRoutineEx registrations, no new
+ *       API surface, no structure patches.
+ *     - Kickoff sec 4 non-goals broken deliberately: HID intercept
+ *       was POST-MVP; included here per user choice for full-coverage
+ *       bare-metal test. If EMAC / RubinOT flags HID rewrites (unlikely
+ *       given kernel intercept doesn't affect binding), revert HID
+ *       via v5.0.2 by masking HID_INSTANCE in the classifier dispatch.
+ * v5.0.0 - Track D: kernel registry callback for Enum\SCSI\Disk subkey
+ *       name rewrite. Root motivation is three consecutive RubinOT / EMAC
+ *       bans (2026-08-31 baseline, 2026-08-31 Level A userland, 2026-09-01
+ *       fresh identity with PRs #12/#13/#14/#15 armed) all inside ~1 minute
+ *       of login. Investigation confirmed H2 from docs/emac-recon-v3.md:
+ *       EMAC reads SUBKEY NAMES via RegEnumKeyEx under
+ *         HKLM\SYSTEM\CurrentControlSet\Enum\{SCSI,PCI,USB,HID}
+ *       and userland spoofers can only rewrite VALUES *inside* those
+ *       subkeys, not the subkey names themselves. User-mode rename in
+ *       PR #13 failed against live devices with open-handle contention
+ *       (SCSI/USB/HID/audio all blocked). See docs/track-d-kernel-
+ *       registry-callback-kickoff.md for the full design rationale.
+ *     - New CmRegisterCallbackEx registration at altitude "321000"
+ *       (test-only altitude range; if this ever ships beyond the
+ *       maintainer's own boxes, requisition an official allocation
+ *       via Microsoft ALTITUDE registry).
+ *     - Callback (RstRegistryCallback) handles TWO REG_NOTIFY_CLASS
+ *       operations. On RegNtPostEnumerateKey it rewrites subkey names
+ *       IN PLACE when: (a) EnableRegCallback=1, (b) caller PID matches
+ *       the tracked RubinOT PID, (c) parent path ends with the MVP
+ *       filter suffix "\Enum\SCSI", (d) subkey name starts with
+ *       "Disk&Ven_" — three of those four are strict same-wchar-count
+ *       rewrites of the Ven/Prod/Rev tokens using deterministic FNV-1a
+ *       hex derived from Parameters\RegCallbackSeed + the real subkey
+ *       name. Post-callback rewrite (not pre-callback + STATUS_CALLBACK_
+ *       BYPASS) is used deliberately: it lets the CM populate the buffer
+ *       normally and we mutate before the caller sees it, with zero
+ *       reentrancy risk of calling Zw* under the CM-internal lock. On
+ *       RegNtPreSetValueKey the callback taps writes to our OWN
+ *       Parameters\RubinOtPid and updates the in-memory override — this
+ *       is how the unit-test workflow (write a specific PID, watch it
+ *       take effect) works without exposing an ioctl.
+ *     - PID discovery uses a companion PsSetCreateProcessNotifyRoutineEx
+ *       registration (deviates from kickoff Opt A recommendation toward
+ *       Opt B) so RubinOT's PID auto-populates on process create and
+ *       auto-clears on exit; robust against restart. Opt A required
+ *       either Zw calls inside the registry callback (deadlock under
+ *       CM lock) or worker-thread polling (ugly), both worse trade-offs.
+ *       Image-name match is a case-insensitive suffix compare against
+ *       "\rubinot_dx.exe" on PS_CREATE_NOTIFY_INFO->ImageFileName.
+ *       Parameters\RubinOtPid override (non-zero) beats the Ps-detected
+ *       PID, so the unit test can point the callback at any process.
+ *     - Configuration surface added to Parameters:
+ *           EnableRegCallback     REG_DWORD  master gate, 0=off default
+ *           RubinOtPid            REG_DWORD  test override (0=use auto)
+ *           RegCallbackSeed       REG_SZ     32-hex FNV seed mirror of
+ *                                            profile.pci_hardwareid.
+ *                                            randomize_seed
+ *           LastCallbackStatus    REG_DWORD  breadcrumb, tag<<24|status
+ *       Tag values (mirror LastReplayStatus shape):
+ *           0x00 OK                (rewrite landed)
+ *           0x01 NO-PID            (RubinOtPid=0 AND Ps hasn't seen it)
+ *           0x02 PID-STALE         (tracked PID no longer exists)
+ *           0x03 PATH-GET-FAIL     (CmCallbackGetKeyObjectID failed)
+ *           0x04 BUFFER-BAD        (KEY_BASIC_INFORMATION malformed)
+ *           0x05 ALLOC-FAIL        (NonPagedPoolNx alloc failed)
+ *           0x06 SEH-FAULT         (__try caught access violation
+ *                                   or other exception in name write)
+ *     - Scope: MVP intercepts ONLY the "\Enum\SCSI" enumerator and
+ *       ONLY subkey names starting with "Disk&Ven_". Expansion to
+ *       Enum\USB / PCI / HID / MMDevices Audio is scheduled by
+ *       bare-metal test result per kickoff section 4.
+ *     - Safety:
+ *         (a) __try/__except wraps every write into the caller's
+ *             KEY_INFORMATION buffer; on EXCEPTION_EXECUTE_HANDLER
+ *             we set LastCallbackStatus tag 0x06 and pass-through
+ *             (caller sees the real name, no bypass).
+ *         (b) PAGED_CODE on the callback body; explicit
+ *             NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL).
+ *         (c) Zero Zw* registry I/O from inside the callback.
+ *             Config (seed, gate, override PID) is cached in
+ *             file-scope globals populated at DriverEntry time
+ *             and mutated only by the RegNtPreSetValueKey tap.
+ *         (d) Same-wchar-count rewrite guarantees the caller's
+ *             NameLength field stays valid without touching it.
+ *     - PatchGuard: CmRegisterCallbackEx and PsSetCreateProcessNotify-
+ *       RoutineEx are BOTH documented Microsoft-supported extensibility
+ *       APIs. Neither is a hook, dispatch swap, or structure patch —
+ *       PatchGuard does NOT flag either. Distinct from the rejected
+ *       "DriverObject->MajorFunction[X] swap" route in docs/roadmap-
+ *       v41-wmi-intercept.md Option C (which PG WOULD flag).
+ *     - DriverUnload intentionally still not registered (same v3.6
+ *       reasoning as before: a DiskDrive UpperFilter always has
+ *       attachments, so unload never fires and CmUnRegisterCallback
+ *       is implicitly released on reboot).
+ *     - Companion userland: scripts/track-d-arm.ps1 (new) writes
+ *       EnableRegCallback + RegCallbackSeed to Parameters, exposes
+ *       -Enable/-Disable/-Diagnose/-SetPid switches.
+ *     - Kickoff and MVP acceptance criteria: docs/track-d-kernel-
+ *       registry-callback-kickoff.md. First postmortem scaffold:
+ *       docs/postmortem-v5-track-d/incident-v500-mvp-integration.md
+ *       (fill after bare-metal RubinOT gameplay test).
  * v4.0.10 - HOTFIX: ValidateSmbiosBlob scan-window bug that produced
  *       spurious 0x03 VALIDATION-FAIL breadcrumbs on Hyper-V (and on
  *       ANY host whose mssmbios wrapper had DmiRevision in {0,1,2,3},
@@ -320,6 +657,16 @@
 
 #include <ntddk.h>
 
+/* v5.0.4: PsGetProcessImageFileName is a semi-documented kernel export
+ * (present in ntoskrnl.exe on every supported Windows version since XP
+ * but not declared in wdm.h/ntddk.h). Prototype mirrors the ntoskrnl
+ * symbol. Returns a pointer to the 15-byte fixed-length ImageFileName
+ * field inside EPROCESS (ANSI, NUL-padded, may be un-terminated when
+ * the leaf reaches 15 chars) - callers must bound their compare. Used
+ * by the per-callback image-name filter that replaced the v5.0.0-v5.0.3
+ * PID-array gate. */
+NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
 /* ================================================================
  *  Constants
  * ================================================================ */
@@ -333,7 +680,7 @@
  * Marker` can validate the installed driver came from v4.0.9+ source
  * without depending on the PE TimeDateStamp (which changes on relink). */
 #pragma comment(linker, "/INCLUDE:RstFltVersion")
-const char RstFltVersion[] = "RstFlt-v4.0.10-BUILD-MARKER";
+const char RstFltVersion[] = "RstFlt-v5.0.4-BUILD-MARKER";
 
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
@@ -349,6 +696,196 @@ const char RstFltVersion[] = "RstFlt-v4.0.10-BUILD-MARKER";
  * DriverEntry or downstream SYSTEM_START drivers. */
 #define CPU_REPLAY_MAX_PASSES  100
 #define CPU_REPLAY_DELAY_MS    100
+
+/* ================================================================
+ *  v5.0.0 Track D constants - Cm registry callback tunables.
+ *
+ *  MVP scope per docs/track-d-kernel-registry-callback-kickoff.md
+ *  section 4: intercept ONLY \Enum\SCSI enumerations, ONLY when the
+ *  child subkey name starts with L"Disk&Ven_". Everything else falls
+ *  through untouched. Expansion (Enum\USB, Enum\PCI, MMDevices\Audio)
+ *  is bare-metal-test gated.
+ * ================================================================ */
+
+/* Altitude for CmRegisterCallbackEx. 321000 is a TEST-ONLY altitude
+ * (Microsoft never allocated it). Fits in the "FSFilter Anti-Virus"
+ * band. If Track D ships beyond the maintainer's own dev boxes,
+ * request an official allocation via Microsoft's ALTITUDE registry. */
+#define TRACKD_ALTITUDE_STR     L"321000"
+
+/* Parent-path suffixes and required child-name prefixes for each
+ * intercepted enumerator. All comparisons case-insensitive via
+ * Rtl*UnicodeString or the local StartsWithI helper.
+ *
+ * Kernel-side names reported by CmCallbackGetKeyObjectID are of the form
+ *   \REGISTRY\MACHINE\SYSTEM\ControlSet001\Enum\SCSI
+ * (numeric ControlSet may vary; suffix match is control-set agnostic)
+ * or for MMDevices
+ *   \REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\
+ *   MMDevices\Audio\Render
+ */
+#define TRACKD_ENUM_SUFFIX_STR    L"\\Enum\\SCSI"           /* SCSI parent */
+#define TRACKD_SUBKEY_PREFIX_STR  L"Disk&Ven_"              /* SCSI child */
+
+#define TRACKD_PCI_SUFFIX_STR         L"\\Enum\\PCI"        /* PCI parent */
+#define TRACKD_PCI_CHILD_PREFIX_STR   L"VEN_"               /* PCI child */
+
+#define TRACKD_MMDEV_RENDER_STR    L"\\MMDevices\\Audio\\Render"
+#define TRACKD_MMDEV_CAPTURE_STR   L"\\MMDevices\\Audio\\Capture"
+
+/* USB/HID: parent path must MATCH the pattern
+ *   \...\Enum\USB\VID_XXXX&PID_XXXX     (case-insensitive; X = hex digit)
+ * or same with \Enum\HID\. We check case-insensitively via
+ * TrackDMatchUsbHidInstanceParent (see below) — the last path
+ * component after `\` starts with VID_ and matches the 17-wchar
+ * `VID_XXXX&PID_XXXX` shape. */
+#define TRACKD_ENUM_USB_MARKER_STR  L"\\Enum\\USB\\"
+#define TRACKD_ENUM_HID_MARKER_STR  L"\\Enum\\HID\\"
+
+/* Suffix on our OWN Parameters key path for the write-tap that lets
+ * userland toggle RubinOtPid + EnableRegCallback without a rebooted
+ * driver having to re-read Parameters (which would deadlock under the
+ * CM callback lock). Compared case-insensitively. */
+#define TRACKD_PARAMS_SUFFIX_STR  L"\\Services\\RstFlt\\Parameters"
+#define TRACKD_ENABLE_VAL_STR     L"EnableRegCallback"     /* v5.0.1 tap */
+
+/* v5.0.4: per-callback ANSI image-name filter. PsGetProcessImageFileName
+ * returns the fixed 15-byte EPROCESS ImageFileName field (may be un-
+ * terminated when the leaf reaches 15 chars); we compare via _strnicmp
+ * on the first N bytes. Length 7 ("rubinot") is strict enough to reject
+ * unrelated processes yet still match every observed RubinOT leaf
+ * ("RubinOT.exe", "rubinot_dx.exe", "RubinOTUpdater.exe"). The filter
+ * body also inspects the byte at offset TRACKD_IMAGE_MATCH_LEN and
+ * requires it to be one of {'\0', '.', '_'} so a hypothetical
+ * "rubinotimposter.exe" cannot slip through. Replaces the pre-v5.0.4
+ * TRACKD_IMAGE_LEAF_PREFIX_STR wide-string prefix used by the removed
+ * Ps notify path. */
+#define TRACKD_IMAGE_MATCH_PREFIX  "rubinot"
+#define TRACKD_IMAGE_MATCH_LEN     7
+
+/* Upper bound for the subkey name we will rewrite in place. Real
+ * SCSI subkey names cap around ~90 wchars; 256 wchars is generous.
+ * Larger names pass through unchanged (defensive: refuse to touch
+ * anything outside the expected shape). */
+#define TRACKD_MAX_NAME_WCHARS  256
+
+/* FNV-1a-64 constants. Match scripts/spoof-pci-hardwareid.ps1
+ * Get-Fnv1a64Hash for the MIXING PRIMITIVE ONLY. The full input
+ * construction (domain-tag inventory, seed encoding, real-field
+ * bytes as raw UTF-16LE, per-round digit byte) differs from what
+ * Get-Fnv1a64Hash on a joined UTF-8 string produces — see
+ * TrackDFillTokenFnv doc comment for the exact recipe, and
+ * docs/track-d-name-recipe.md for the userland-facing spec that a
+ * porter must follow to reproduce this kernel's output byte-for-byte. */
+#define TRACKD_FNV_OFFSET_BASIS  0xCBF29CE484222325ULL
+#define TRACKD_FNV_PRIME         0x00000100000001B3ULL
+
+/* Breadcrumb tags for LastCallbackStatus, encoded (tag<<24)|status.
+ * Shape mirrors LastReplayStatus so scripts/check-consistency.ps1
+ * can share the decoder. */
+#define TRACKD_TAG_OK             0x00u  /* rewrite landed             */
+#define TRACKD_TAG_NAME_MISS      0x01u  /* v5.0.4: image-name gate    */
+                                         /* did not match TRACKD_IMAGE */
+                                         /* _MATCH_PREFIX (replaces    */
+                                         /* pre-v5.0.4 NO_PID; same    */
+                                         /* slot preserved so old      */
+                                         /* decoders decode without    */
+                                         /* value-collision surprise). */
+#define TRACKD_TAG_STALE_UNUSED   0x02u  /* reserved (was PID_STALE    */
+                                         /* pre-v5.0.4; no longer      */
+                                         /* emitted after Ps notify    */
+                                         /* removal - slot kept so no  */
+                                         /* future add silently reuses */
+                                         /* the value)                 */
+#define TRACKD_TAG_PATH_GET_FAIL  0x03u  /* CmCallbackGetKeyObjectID   */
+#define TRACKD_TAG_BUFFER_BAD     0x04u  /* KEY_INFORMATION malformed  */
+#define TRACKD_TAG_ALLOC_FAIL     0x05u  /* NonPagedPoolNx alloc fail  */
+#define TRACKD_TAG_SEH_FAULT      0x06u  /* __except caught fault      */
+
+/* v5.0.1 - path type classifier result for the intercepted parent
+ * enumeration key. Returned by TrackDClassifyParent; used by
+ * TrackDHandlePostEnumerate to dispatch to the right synthesizer. */
+typedef enum _TRACKD_PATH_TYPE {
+    TRACKD_PATH_NONE           = 0,
+    TRACKD_PATH_SCSI           = 1,
+    TRACKD_PATH_PCI            = 2,
+    TRACKD_PATH_USB_INSTANCE   = 3,
+    TRACKD_PATH_HID_INSTANCE   = 4,
+    TRACKD_PATH_AUDIO_RENDER   = 5,
+    TRACKD_PATH_AUDIO_CAPTURE  = 6
+} TRACKD_PATH_TYPE;
+
+/* ================================================================
+ *  v5.0.0 Track D globals (BSS-resident; retained for driver's
+ *  lifetime). Hot path only reads them; the RegNtPreSetValueKey tap
+ *  on our own Parameters and the PsSetCreateProcessNotifyRoutineEx
+ *  callback are the only writers. All accesses to volatile fields
+ *  use InterlockedExchangePointer / plain volatile read as noted.
+ * ================================================================ */
+
+static LARGE_INTEGER   g_TrackDCookie;
+static BOOLEAN         g_TrackDRegistered   = FALSE;
+static BOOLEAN         g_TrackDEnabled      = FALSE;
+
+/* Seed bytes as they appear in Parameters\RegCallbackSeed
+ * (32-char ASCII hex string, stored raw to feed the FNV mixer
+ * verbatim). Length in bytes (0..64). Written once at DriverEntry
+ * inside LoadTrackDConfig; never modified afterwards. */
+static UCHAR           g_TrackDSeed[64];
+static ULONG           g_TrackDSeedLen      = 0;
+
+/* Callback-observable breadcrumb. volatile LONG so
+ * InterlockedExchange can update without racing overlapping
+ * callback invocations. */
+static volatile LONG   g_TrackDLastStatus   = 0;
+
+/* v5.0.4 instrumentation counters. Written on every callback invocation
+ * (Invoke, post enable-gate, before name gate) or every image-name-miss
+ * exit (NameMiss); persisted lazily by TrackDFlushWorker as REG_DWORDs
+ * `CallbackInvokeCount` and `CallbackNameMissCount`. LastMissName is a
+ * 16-byte buffer storing the most-recent image name that failed the
+ * filter (raw first 15 bytes of EPROCESS ImageFileName, NUL-terminated).
+ * Persisted as REG_SZ `LastMissImageName`. Purpose: with the Ps notify
+ * path removed the filter runs blind against every process's registry
+ * access; these three values let userland diagnose "why did zero
+ * rewrites happen this boot" (invoke=0 vs. name_miss=all vs. invoke>0
+ * + hit>0 as expected). Race on LastMissName buffer is acceptable for
+ * a diagnostic - see TrackDRecordNameMiss comment. */
+static volatile LONG   g_TrackDInvokeCount   = 0;
+static volatile LONG   g_TrackDNameMissCount = 0;
+static CHAR            g_TrackDLastMissName[16] = {0};
+
+/* Cached UNICODE_STRING views over the string literals above,
+ * initialized once in ArmTrackD via RtlInitUnicodeString. */
+static UNICODE_STRING  g_TrackDAltitude;
+static UNICODE_STRING  g_TrackDEnumSuffix;         /* \Enum\SCSI */
+static UNICODE_STRING  g_TrackDSubkeyPrefix;       /* Disk&Ven_ */
+static UNICODE_STRING  g_TrackDParamsSuffix;
+/* v5.0.4: g_TrackDPidValueName removed - the Parameters\RubinOtPid tap
+ * disappeared with the Ps notify + PID array subsystem. See v5.0.4
+ * changelog block for the empirical driver for this refactor. */
+/* v5.0.1 - additional path/value views */
+static UNICODE_STRING  g_TrackDPciSuffix;          /* \Enum\PCI */
+static UNICODE_STRING  g_TrackDPciChildPrefix;     /* VEN_ */
+static UNICODE_STRING  g_TrackDMMDevRender;        /* \MMDevices\Audio\Render */
+static UNICODE_STRING  g_TrackDMMDevCapture;       /* \MMDevices\Audio\Capture */
+static UNICODE_STRING  g_TrackDEnableValueName;    /* EnableRegCallback */
+
+/* Rewrite counter (incremented once per successful in-place mutation)
+ * plus flush infrastructure. The Cm callback never opens registry
+ * directly (would deadlock under CM-internal lock); instead it
+ * updates g_TrackDLastStatus/g_TrackDHitCount atomically and (if not
+ * already pending) queues g_TrackDFlushWorkItem to a delayed system
+ * worker thread that runs at PASSIVE, outside the callback's context,
+ * and safely persists both DWORDs to Parameters. */
+static volatile LONG   g_TrackDHitCount    = 0;
+static WORK_QUEUE_ITEM g_TrackDFlushWorkItem;
+static volatile LONG   g_TrackDFlushQueued = 0;
+
+/* Full NT path to our Parameters key, cached at DriverEntry for the
+ * flusher's ZwOpenKey. g_TrackDParamsBuf backs the UNICODE_STRING. */
+static UNICODE_STRING  g_TrackDParamsFullPath;
+static WCHAR           g_TrackDParamsBuf[512];
 
 /* ================================================================
  *  Device extension - attached to each filtered disk device.
@@ -402,6 +939,42 @@ static VOID    ReplayCpuRegistry(PUNICODE_STRING RegPath);
 static VOID    CpuReplayWorker(PVOID Context);
 static BOOLEAN IsCpuReplayEnabled(PUNICODE_STRING RegPath);
 static VOID    WriteLastReplayStatus(HANDLE hParams, UCHAR tag, NTSTATUS st);
+
+/* v5.0.0 Track D forward declarations */
+static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath);
+static NTSTATUS LoadTrackDConfig(PUNICODE_STRING RegPath);
+static VOID     WriteLastCallbackStatus(UCHAR tag, NTSTATUS st);
+static VOID     TrackDFlushWorker(PVOID unused);
+static ULONGLONG TrackDFnvHash64(const UCHAR *data, ULONG len);
+static VOID     TrackDFillTokenFnv(WCHAR *outName, ULONG cursor, ULONG fieldLen,
+                                   const WCHAR *realName, ULONG realStart,
+                                   ULONG realFieldLen,
+                                   const UCHAR *domain, ULONG domainLen);
+static VOID     TrackDBuildSyntheticName(const WCHAR *realName, ULONG realWchars,
+                                         WCHAR *outName);
+/* v5.0.1 additional synthesizers + classifier + helpers */
+static VOID     TrackDBuildSyntheticPciName(const WCHAR *realName, ULONG realWchars,
+                                            WCHAR *outName);
+static VOID     TrackDBuildSyntheticUsbHidInstance(const WCHAR *realName, ULONG realWchars,
+                                                   WCHAR *outName);
+static VOID     TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchars,
+                                              WCHAR *outName);
+static BOOLEAN  TrackDStartsWithI(const WCHAR *text, ULONG textLen,
+                                  const WCHAR *prefix, ULONG prefixLen);
+static BOOLEAN  TrackDIsHexWchar(WCHAR c);
+static BOOLEAN  TrackDMatchUsbHidInstanceParent(PCUNICODE_STRING parent,
+                                                BOOLEAN wantUsb);
+static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent);
+/* v5.0.4: image-name filter + miss recorder + arm-status writer.
+ * Replaces the v5.0.2 PID-array + Ps notify helpers (all removed). */
+static BOOLEAN  TrackDCurrentCallerNameMatches(VOID);
+static VOID     TrackDRecordNameMiss(VOID);
+static VOID     WriteLastArmStatus(UCHAR tag, NTSTATUS st);
+static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2);
+static VOID     TrackDHandlePreSetValue(PVOID Argument2);
+static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
+                                    PVOID Argument1,
+                                    PVOID Argument2);
 
 /* ================================================================
  *  WriteLastReplayStatus - v4.0.6 diagnostic breadcrumb.
@@ -1469,6 +2042,1208 @@ static VOID CpuReplayWorker(PVOID Context)
 }
 
 /* ================================================================
+ *  v5.0.0 Track D - implementation
+ *
+ *  Layered so each helper has a single responsibility:
+ *    TrackDFnvHash64            - deterministic 64-bit hash primitive
+ *    TrackDFillTokenFnv         - fill a WCHAR field with FNV-derived
+ *                                 hex; called for Ven/Prod/Rev tokens
+ *    TrackDBuildSyntheticName   - rewrite Disk&Ven_/Prod_/Rev_ tokens
+ *                                 in place, same wchar count
+ *    TrackDCurrentCallerNameMatches - v5.0.4: does
+ *                                 PsGetProcessImageFileName(current)
+ *                                 begin with "rubinot"? Replaces the
+ *                                 removed PID-array gate.
+ *    TrackDRecordNameMiss       - v5.0.4: snapshot rejected image
+ *                                 name into g_TrackDLastMissName and
+ *                                 bump miss counter (diagnostic).
+ *    TrackDHandlePostEnumerate  - RegNtPostEnumerateKey body: match
+ *                                 parent path suffix + child prefix,
+ *                                 SEH-wrap the buffer mutate
+ *    TrackDHandlePreSetValue    - RegNtPreSetValueKey tap on our own
+ *                                 Parameters\EnableRegCallback
+ *    RstRegistryCallback        - Cm dispatch by REG_NOTIFY_CLASS
+ *    TrackDFlushWorker          - one-shot worker that flushes the
+ *                                 in-memory breadcrumb to Parameters
+ *    WriteLastCallbackStatus    - callback-safe wrapper: interlocked
+ *                                 update + guarded work item queue
+ *    LoadTrackDConfig           - one-time Parameters read at
+ *                                 DriverEntry (safe context)
+ *    ArmTrackD                  - register Cm + Ps callbacks; called
+ *                                 from DriverEntry after existing
+ *                                 SMBIOS/CPU wiring
+ *
+ *  Reentrancy contract:
+ *    - Callback body (RstRegistryCallback and children) NEVER calls
+ *      any Zw* registry primitive. All persisted state either lives
+ *      in file-scope globals updated by the Parameters tap, or is
+ *      deferred to TrackDFlushWorker (which runs OUTSIDE the CM
+ *      callback stack via the delayed system worker queue).
+ *    - PatchGuard: CmRegisterCallbackEx is a Microsoft-supported
+ *      extensibility API, distinct from the rejected
+ *      DriverObject->MajorFunction[] swap (see
+ *      docs/roadmap-v41-wmi-intercept.md Option C).
+ * ================================================================ */
+
+/* FNV-1a-64 mixing primitive. Same algorithm and constants as
+ * scripts/spoof-pci-hardwareid.ps1 Get-Fnv1a64Hash — any userland
+ * port can reproduce this kernel's synthetic names byte-for-byte
+ * given the same seed and input.
+ *
+ * C89 unsigned long long naturally wraps at 2^64, matching the
+ * PS BigInteger `-band $mask` explicit mask. */
+static ULONGLONG TrackDFnvHash64(const UCHAR *data, ULONG len)
+{
+    ULONGLONG h = TRACKD_FNV_OFFSET_BASIS;
+    ULONG i;
+    for (i = 0; i < len; i++) {
+        h ^= (ULONGLONG)data[i];
+        h = h * TRACKD_FNV_PRIME;
+    }
+    return h;
+}
+
+/* Fill a WCHAR field of `fieldLen` wchars starting at outName[cursor]
+ * with hex characters derived from FNV over
+ *     <domain> + <seedBytes> + '|' + <realFieldBytes> + '|' + '<round>'
+ * repeated with round=0,1,2,... until we have emitted enough hex to
+ * cover fieldLen wchars. `realFieldBytes` are the raw WCHAR bytes of
+ * the real name at positions [realStart, realStart+realFieldLen); we
+ * feed the raw UTF-16LE bytes to keep the mixer input canonical.
+ *
+ * The output is always ASCII-safe uppercase hex, so the field parses
+ * as a valid PnP token component (letters + digits, no `&` or `\`). */
+static VOID TrackDFillTokenFnv(WCHAR *outName, ULONG cursor, ULONG fieldLen,
+                               const WCHAR *realName, ULONG realStart,
+                               ULONG realFieldLen,
+                               const UCHAR *domain, ULONG domainLen)
+{
+    static const WCHAR HEX_UPPER[16] =
+        { L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
+          L'8', L'9', L'A', L'B', L'C', L'D', L'E', L'F' };
+    ULONG round = 0;
+    ULONG produced = 0;
+    UCHAR buf[192];
+    ULONG bufLen;
+    ULONG realBytes;
+    ULONGLONG h;
+    ULONG i;
+
+    if (fieldLen == 0) return;
+
+    while (produced < fieldLen) {
+        bufLen = 0;
+
+        if (bufLen + domainLen > sizeof(buf)) break;
+        RtlCopyMemory(buf + bufLen, domain, domainLen);
+        bufLen += domainLen;
+
+        if (g_TrackDSeedLen > 0) {
+            if (bufLen + g_TrackDSeedLen > sizeof(buf)) break;
+            RtlCopyMemory(buf + bufLen, g_TrackDSeed, g_TrackDSeedLen);
+            bufLen += g_TrackDSeedLen;
+        }
+
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)'|';
+
+        realBytes = realFieldLen * sizeof(WCHAR);
+        if (bufLen + realBytes > sizeof(buf)) realBytes = sizeof(buf) - bufLen;
+        if (realBytes > 0) {
+            RtlCopyMemory(buf + bufLen, (const UCHAR *)(realName + realStart),
+                          realBytes);
+            bufLen += realBytes;
+        }
+
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)'|';
+
+        /* Round marker: one ASCII byte per hash iteration. `('0' +
+         * (round & 0xF))` emits '0'..'9' for rounds 0..9 then
+         * ':',';','<','=','>','?' for rounds 10..15, then wraps back
+         * to '0' at round 16 (mod-16 mask). This is INTENTIONAL — the
+         * mixer only needs a monotonically-varying byte per round;
+         * ASCII digits vs punctuation is irrelevant. Any userland
+         * reproducer MUST mirror this exactly rather than assuming
+         * decimal digits. SCSI Ven/Prod/Rev tokens today cap at ~20
+         * wchars = round 1, so the wrap never triggers in production;
+         * documented for future maintainer expanding TrackD to wider
+         * fields. See docs/track-d-name-recipe.md. */
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)('0' + (round & 0xF));
+
+        h = TrackDFnvHash64(buf, bufLen);
+
+        for (i = 0; i < 16 && produced < fieldLen; i++) {
+            outName[cursor + produced] =
+                HEX_UPPER[(ULONG)((h >> (60 - i * 4)) & 0xFULL)];
+            produced++;
+        }
+        round++;
+    }
+}
+
+/* Rewrite a Disk&Ven_XXX&Prod_YYY[&Rev_ZZ] subkey name in place,
+ * preserving structural markers (positions of `Disk&Ven_`, `&Prod_`,
+ * `&Rev_`, and any trailing `&` separators inside them). Same wchar
+ * count throughout, so the caller's NameLength stays valid without
+ * mutation.
+ *
+ * Best-effort by design: if the real name has an unexpected shape
+ * (missing &Prod_, weird casing, extra tokens), we only rewrite the
+ * fields we recognize and leave the rest as-is. Worst case: nothing
+ * gets rewritten and outName == realName (a strict pass-through). */
+static VOID TrackDBuildSyntheticName(const WCHAR *realName, ULONG realWchars,
+                                     WCHAR *outName)
+{
+    static const UCHAR DOMAIN_VEN[]  = "SCSI_VEN|";
+    static const UCHAR DOMAIN_PROD[] = "SCSI_PROD|";
+    static const UCHAR DOMAIN_REV[]  = "SCSI_REV|";
+    static const ULONG DOMAIN_VEN_LEN  = sizeof(DOMAIN_VEN) - 1;
+    static const ULONG DOMAIN_PROD_LEN = sizeof(DOMAIN_PROD) - 1;
+    static const ULONG DOMAIN_REV_LEN  = sizeof(DOMAIN_REV) - 1;
+
+    /* MVP filter guaranteed the prefix, so realWchars >= 9. */
+    ULONG venStart, venEnd;
+    ULONG prodStart = 0, prodEnd = 0;
+    ULONG revStart  = 0, revEnd  = 0;
+    BOOLEAN hasProd = FALSE, hasRev = FALSE;
+    ULONG i;
+
+    /* Copy real to out as the baseline; we overwrite specific token
+     * ranges below. Structural chars (Disk&Ven_, &Prod_, &Rev_) stay
+     * literal in both input and output. */
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    if (realWchars < 9) return;    /* not "Disk&Ven_..." shape */
+
+    /* Ven token = chars right after L"Disk&Ven_" up to next `&`. */
+    venStart = 9;
+    venEnd = venStart;
+    while (venEnd < realWchars && realName[venEnd] != L'&') venEnd++;
+
+    /* Locate &Prod_ marker after venEnd. Case-insensitive by folding
+     * ASCII 'P'/'p', 'r'/'R', etc. */
+    for (i = venEnd; i + 6 <= realWchars; i++) {
+        if (realName[i]     == L'&' &&
+            (realName[i+1] == L'P' || realName[i+1] == L'p') &&
+            (realName[i+2] == L'r' || realName[i+2] == L'R') &&
+            (realName[i+3] == L'o' || realName[i+3] == L'O') &&
+            (realName[i+4] == L'd' || realName[i+4] == L'D') &&
+            realName[i+5]  == L'_')
+        {
+            prodStart = i + 6;
+            hasProd = TRUE;
+            break;
+        }
+    }
+    if (hasProd) {
+        prodEnd = prodStart;
+        while (prodEnd < realWchars && realName[prodEnd] != L'&') prodEnd++;
+
+        /* Locate &Rev_ marker after prodEnd. */
+        for (i = prodEnd; i + 5 <= realWchars; i++) {
+            if (realName[i]     == L'&' &&
+                (realName[i+1] == L'R' || realName[i+1] == L'r') &&
+                (realName[i+2] == L'e' || realName[i+2] == L'E') &&
+                (realName[i+3] == L'v' || realName[i+3] == L'V') &&
+                realName[i+4]  == L'_')
+            {
+                revStart = i + 5;
+                hasRev = TRUE;
+                break;
+            }
+        }
+        if (hasRev) {
+            revEnd = revStart;
+            while (revEnd < realWchars && realName[revEnd] != L'&') revEnd++;
+        }
+    }
+
+    if (venEnd > venStart) {
+        TrackDFillTokenFnv(outName, venStart, venEnd - venStart,
+                           realName, venStart, venEnd - venStart,
+                           DOMAIN_VEN, DOMAIN_VEN_LEN);
+    }
+    if (hasProd && prodEnd > prodStart) {
+        TrackDFillTokenFnv(outName, prodStart, prodEnd - prodStart,
+                           realName, prodStart, prodEnd - prodStart,
+                           DOMAIN_PROD, DOMAIN_PROD_LEN);
+    }
+    if (hasRev && revEnd > revStart) {
+        TrackDFillTokenFnv(outName, revStart, revEnd - revStart,
+                           realName, revStart, revEnd - revStart,
+                           DOMAIN_REV, DOMAIN_REV_LEN);
+    }
+}
+
+/* ================================================================
+ *  v5.0.1 Track D - additional synthesizers, path classifier,
+ *  and helpers for USB/HID/PCI/Audio intercept coverage.
+ *
+ *  Same reentrancy contract as v5.0.0: no Zw* or Nt* registry calls,
+ *  everything memory-only on the parent path returned by
+ *  CmCallbackGetKeyObjectID. Same-wchar-count rewrites throughout so
+ *  KEY_INFORMATION.NameLength stays valid without mutation.
+ * ================================================================ */
+
+/* ASCII case-insensitive prefix check on raw WCHAR arrays. Folds
+ * lowercase a..z to A..Z in both text and prefix; other codepoints
+ * compare literally. Sufficient for the ASCII-only path patterns
+ * we match (Enum\SCSI, VID_, VEN_, etc.). */
+static BOOLEAN TrackDStartsWithI(const WCHAR *text, ULONG textLen,
+                                 const WCHAR *prefix, ULONG prefixLen)
+{
+    ULONG i;
+    if (prefix == NULL || text == NULL) return FALSE;
+    if (prefixLen > textLen) return FALSE;
+    for (i = 0; i < prefixLen; i++) {
+        WCHAR a = text[i];
+        WCHAR b = prefix[i];
+        if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+        if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+/* TRUE iff the given wchar is a valid hex digit [0-9A-Fa-f]. */
+static BOOLEAN TrackDIsHexWchar(WCHAR c)
+{
+    return (c >= L'0' && c <= L'9') ||
+           (c >= L'A' && c <= L'F') ||
+           (c >= L'a' && c <= L'f');
+}
+
+/* Test whether `parent` looks like `\...\Enum\{USB|HID}\VID_XXXX&PID_XXXX`
+ * (case-insensitive; last path component is 17 wchars matching the
+ * `VID_` + 4 hex + `&PID_` + 4 hex shape). wantUsb=TRUE checks USB
+ * marker; wantUsb=FALSE checks HID. */
+static BOOLEAN TrackDMatchUsbHidInstanceParent(PCUNICODE_STRING parent,
+                                               BOOLEAN wantUsb)
+{
+    static const WCHAR USB_MARKER[] = L"\\Enum\\USB\\";
+    static const WCHAR HID_MARKER[] = L"\\Enum\\HID\\";
+    const WCHAR *marker;
+    ULONG markerLen;
+    ULONG pathWchars;
+    LONG i;
+    ULONG lastSep;
+    ULONG compStart;
+    ULONG compLen;
+    ULONG segStart;
+    const WCHAR *p;
+
+    if (parent == NULL || parent->Buffer == NULL || parent->Length < 34) {
+        /* 34 bytes = 17 wchars min for VID_XXXX&PID_XXXX itself */
+        return FALSE;
+    }
+    p = parent->Buffer;
+    pathWchars = parent->Length / sizeof(WCHAR);
+
+    marker = wantUsb ? USB_MARKER : HID_MARKER;
+    markerLen = wantUsb ? (ULONG)((sizeof(USB_MARKER) - sizeof(WCHAR)) / sizeof(WCHAR))
+                        : (ULONG)((sizeof(HID_MARKER) - sizeof(WCHAR)) / sizeof(WCHAR));
+    /* markerLen counts the `\Enum\{USB|HID}\` including trailing `\`. */
+
+    /* Find the LAST `\` — everything after it is the last component. */
+    lastSep = 0;
+    for (i = (LONG)pathWchars - 1; i >= 0; i--) {
+        if (p[i] == L'\\') { lastSep = (ULONG)i; break; }
+    }
+    if (lastSep == 0) return FALSE;
+
+    compStart = lastSep + 1;
+    if (compStart >= pathWchars) return FALSE;
+    compLen = pathWchars - compStart;
+
+    /* VID_XXXX&PID_XXXX is exactly 17 wchars. */
+    if (compLen != 17) return FALSE;
+    if (!TrackDStartsWithI(p + compStart, compLen, L"VID_", 4)) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 4])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 5])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 6])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 7])) return FALSE;
+    if (p[compStart + 8] != L'&') return FALSE;
+    if (!TrackDStartsWithI(p + compStart + 9, 4, L"PID_", 4)) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 13])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 14])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 15])) return FALSE;
+    if (!TrackDIsHexWchar(p[compStart + 16])) return FALSE;
+
+    /* Enclosing segment before `lastSep` must end with the `\Enum\{USB|HID}\`
+     * marker (with trailing slash lining up on lastSep). */
+    if (lastSep + 1 < markerLen) return FALSE;
+    segStart = lastSep + 1 - markerLen;
+    if (!TrackDStartsWithI(p + segStart, markerLen, marker, markerLen)) return FALSE;
+
+    return TRUE;
+}
+
+/* Classify the parent path for intercept dispatch. Returns
+ * TRACKD_PATH_NONE if no filter matches (fall through to pass-through). */
+static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL || parent->Length == 0) {
+        return TRACKD_PATH_NONE;
+    }
+    if (RtlSuffixUnicodeString(&g_TrackDEnumSuffix,   parent, TRUE)) return TRACKD_PATH_SCSI;
+    if (RtlSuffixUnicodeString(&g_TrackDPciSuffix,    parent, TRUE)) return TRACKD_PATH_PCI;
+    if (RtlSuffixUnicodeString(&g_TrackDMMDevRender,  parent, TRUE)) return TRACKD_PATH_AUDIO_RENDER;
+    if (RtlSuffixUnicodeString(&g_TrackDMMDevCapture, parent, TRUE)) return TRACKD_PATH_AUDIO_CAPTURE;
+    if (TrackDMatchUsbHidInstanceParent(parent, TRUE))  return TRACKD_PATH_USB_INSTANCE;
+    if (TrackDMatchUsbHidInstanceParent(parent, FALSE)) return TRACKD_PATH_HID_INSTANCE;
+    return TRACKD_PATH_NONE;
+}
+
+/* PCI subkey rewriter. Input shape (any subset):
+ *   VEN_XXXX&DEV_XXXX&SUBSYS_XXXXXXXX&REV_XX
+ * Rewrites SUBSYS and REV tokens using FNV(seed + realTokenBytes).
+ * PRESERVES VEN and DEV (driver binding is keyed on those; changing
+ * them breaks PnP). CC_ (class code) also preserved literally when
+ * present. Same-wchar-count for all rewritten fields.
+ *
+ * Non-matching or malformed shapes fall through as pure pass-through
+ * (outName == realName). */
+static VOID TrackDBuildSyntheticPciName(const WCHAR *realName, ULONG realWchars,
+                                        WCHAR *outName)
+{
+    static const UCHAR DOMAIN_SUBSYS[] = "PCI_SUBSYS|";
+    static const UCHAR DOMAIN_REV[]    = "PCI_REV|";
+    static const ULONG DOMAIN_SUBSYS_LEN = sizeof(DOMAIN_SUBSYS) - 1;
+    static const ULONG DOMAIN_REV_LEN    = sizeof(DOMAIN_REV) - 1;
+
+    ULONG i;
+    ULONG subStart = 0, subEnd = 0;
+    ULONG revStart = 0, revEnd = 0;
+    BOOLEAN hasSubsys = FALSE, hasRev = FALSE;
+
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    /* Locate &SUBSYS_ marker (8 wchars). */
+    for (i = 0; i + 8 <= realWchars; i++) {
+        if (realName[i]     == L'&' &&
+            (realName[i+1] == L'S' || realName[i+1] == L's') &&
+            (realName[i+2] == L'U' || realName[i+2] == L'u') &&
+            (realName[i+3] == L'B' || realName[i+3] == L'b') &&
+            (realName[i+4] == L'S' || realName[i+4] == L's') &&
+            (realName[i+5] == L'Y' || realName[i+5] == L'y') &&
+            (realName[i+6] == L'S' || realName[i+6] == L's') &&
+            realName[i+7]  == L'_')
+        {
+            subStart = i + 8;
+            hasSubsys = TRUE;
+            break;
+        }
+    }
+    if (hasSubsys) {
+        subEnd = subStart;
+        while (subEnd < realWchars && realName[subEnd] != L'&') subEnd++;
+    }
+
+    /* Locate &REV_ marker (5 wchars). */
+    for (i = 0; i + 5 <= realWchars; i++) {
+        if (realName[i]     == L'&' &&
+            (realName[i+1] == L'R' || realName[i+1] == L'r') &&
+            (realName[i+2] == L'E' || realName[i+2] == L'e') &&
+            (realName[i+3] == L'V' || realName[i+3] == L'v') &&
+            realName[i+4]  == L'_')
+        {
+            revStart = i + 5;
+            hasRev = TRUE;
+            break;
+        }
+    }
+    if (hasRev) {
+        revEnd = revStart;
+        while (revEnd < realWchars && realName[revEnd] != L'&') revEnd++;
+    }
+
+    if (hasSubsys && subEnd > subStart) {
+        TrackDFillTokenFnv(outName, subStart, subEnd - subStart,
+                           realName, subStart, subEnd - subStart,
+                           DOMAIN_SUBSYS, DOMAIN_SUBSYS_LEN);
+    }
+    if (hasRev && revEnd > revStart) {
+        TrackDFillTokenFnv(outName, revStart, revEnd - revStart,
+                           realName, revStart, revEnd - revStart,
+                           DOMAIN_REV, DOMAIN_REV_LEN);
+    }
+}
+
+/* USB/HID instance-serial rewriter. Input is the leaf subkey name
+ * under `\Enum\{USB|HID}\VID_XXXX&PID_XXXX\`, typically shapes like:
+ *   "4&2af66358&0&0001"   (PnP-synthesized: N&hex&N&decimal)
+ *   "AABBCCDD1234"        (iSerialNumber from descriptor)
+ *   "5&2b47d091&0&010000" (composite)
+ *
+ * We regenerate the entire name with FNV hex derived from
+ *   USB_INST|<seed>|<realNameUTF16LE>|<round>
+ * preserving:
+ *   - `&` separator positions
+ *   - Purely-decimal short components (<= 4 digits — port/hub/interface
+ *     indexes that Windows PnP re-checks and would refuse to bind if
+ *     changed).
+ *   - Same wchar count.
+ *
+ * This mirrors the userland spoof-usb-ids.ps1 New-SyntheticInstance
+ * philosophy (see PR #12 spoof-usb-ids.ps1 lines 179-204). */
+static VOID TrackDBuildSyntheticUsbHidInstance(const WCHAR *realName, ULONG realWchars,
+                                               WCHAR *outName)
+{
+    static const UCHAR DOMAIN_INST[] = "USB_INST|";
+    static const ULONG DOMAIN_INST_LEN = sizeof(DOMAIN_INST) - 1;
+
+    ULONG i;
+    ULONG segStart;
+    BOOLEAN allDecimalShort;
+
+    if (realWchars == 0) return;
+
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    /* Walk components separated by `&`. Each component is either:
+     *  - preserved (short pure-decimal, <= 4 digits)
+     *  - rewritten with FNV hex of same wchar count */
+    segStart = 0;
+    for (i = 0; i <= realWchars; i++) {
+        if (i == realWchars || realName[i] == L'&') {
+            ULONG segLen = i - segStart;
+            if (segLen > 0) {
+                allDecimalShort = FALSE;
+                if (segLen <= 4) {
+                    ULONG k;
+                    allDecimalShort = TRUE;
+                    for (k = 0; k < segLen; k++) {
+                        WCHAR c = realName[segStart + k];
+                        if (c < L'0' || c > L'9') { allDecimalShort = FALSE; break; }
+                    }
+                }
+                if (!allDecimalShort) {
+                    /* Rewrite this component with FNV hex. */
+                    TrackDFillTokenFnv(outName, segStart, segLen,
+                                       realName, segStart, segLen,
+                                       DOMAIN_INST, DOMAIN_INST_LEN);
+                }
+            }
+            segStart = i + 1;
+        }
+    }
+}
+
+/* MMDevices Audio endpoint GUID rewriter. Input is the leaf subkey
+ * name shape `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (38 wchars,
+ * including braces). Rewrites the 32 hex nibbles preserving the
+ * enclosing `{`, `}`, and 4 dashes at fixed offsets.
+ *
+ * If input doesn't match the exact GUID shape, pass-through unchanged. */
+static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchars,
+                                          WCHAR *outName)
+{
+    static const UCHAR DOMAIN_AUDIO[] = "AUDIO_GUID|";
+    static const ULONG DOMAIN_AUDIO_LEN = sizeof(DOMAIN_AUDIO) - 1;
+    static const WCHAR HEX_UPPER[16] =
+        { L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
+          L'8', L'9', L'A', L'B', L'C', L'D', L'E', L'F' };
+    /* Structural positions (0-indexed) in a 38-wchar canonical GUID
+     * `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` : dashes at 9, 14, 19,
+     * 24; braces at 0, 37. */
+    UCHAR buf[192];
+    ULONG bufLen;
+    ULONGLONG h1;
+    ULONG round = 0;
+    ULONG produced = 0;
+    ULONG cursor;
+    ULONG i;
+
+    if (realWchars != 38) return;    /* not a canonical GUID */
+    if (realName[0]  != L'{') return;
+    if (realName[37] != L'}') return;
+    if (realName[9]  != L'-' || realName[14] != L'-' ||
+        realName[19] != L'-' || realName[24] != L'-') return;
+
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    /* Produce 32 hex chars from FNV rounds, skipping dash positions. */
+    cursor = 1;    /* first hex slot inside `{` */
+    while (produced < 32) {
+        bufLen = 0;
+        if (bufLen + DOMAIN_AUDIO_LEN > sizeof(buf)) break;
+        RtlCopyMemory(buf + bufLen, DOMAIN_AUDIO, DOMAIN_AUDIO_LEN);
+        bufLen += DOMAIN_AUDIO_LEN;
+        if (g_TrackDSeedLen > 0) {
+            if (bufLen + g_TrackDSeedLen > sizeof(buf)) break;
+            RtlCopyMemory(buf + bufLen, g_TrackDSeed, g_TrackDSeedLen);
+            bufLen += g_TrackDSeedLen;
+        }
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)'|';
+        {
+            ULONG realBytes = realWchars * sizeof(WCHAR);
+            if (bufLen + realBytes > sizeof(buf)) realBytes = sizeof(buf) - bufLen;
+            if (realBytes > 0) {
+                RtlCopyMemory(buf + bufLen, (const UCHAR *)realName, realBytes);
+                bufLen += realBytes;
+            }
+        }
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)'|';
+        if (bufLen + 1 > sizeof(buf)) break;
+        buf[bufLen++] = (UCHAR)('0' + (round & 0xF));
+
+        h1 = TrackDFnvHash64(buf, bufLen);
+        /* Emit up to 16 hex chars from this round, skipping dashes. */
+        for (i = 0; i < 16 && produced < 32; i++) {
+            /* Skip dash positions when advancing cursor. */
+            while (cursor == 9 || cursor == 14 || cursor == 19 || cursor == 24) cursor++;
+            if (cursor >= 37) break;   /* would land on `}` */
+            outName[cursor] = HEX_UPPER[(ULONG)((h1 >> (60 - i * 4)) & 0xFULL)];
+            cursor++;
+            produced++;
+        }
+        round++;
+    }
+}
+
+/* v5.0.4: in-band image-name filter. Called synchronously from the Cm
+ * callback body (PASSIVE_LEVEL - same context as the RegNtPostEnumerate
+ * dispatcher below). PsGetProcessImageFileName returns the 15-byte
+ * EPROCESS ImageFileName field; we _strnicmp-compare its first 7 bytes
+ * against "rubinot" and reject anything with a non-delimiter next byte
+ * so "rubinotimposter.exe" cannot slip through. PsGetCurrentProcess
+ * returning NULL is a defensive check - inside a Cm callback dispatched
+ * by user-mode NtEnumerateKey there is always an attached process, but
+ * keep the check to survive future dispatch paths. */
+static BOOLEAN TrackDCurrentCallerNameMatches(VOID)
+{
+    PEPROCESS proc;
+    PCHAR name;
+    CHAR next;
+
+    proc = PsGetCurrentProcess();
+    if (proc == NULL) return FALSE;
+    name = PsGetProcessImageFileName(proc);
+    if (name == NULL) return FALSE;
+    if (_strnicmp(name, TRACKD_IMAGE_MATCH_PREFIX, TRACKD_IMAGE_MATCH_LEN) != 0)
+        return FALSE;
+    /* Delimiter guard: accept 'rubinot' only when the next byte terminates
+     * the leaf (NUL / dot / underscore). Rejects "rubinotimposter.exe". */
+    next = name[TRACKD_IMAGE_MATCH_LEN];
+    if (next != '\0' && next != '.' && next != '_') return FALSE;
+    return TRUE;
+}
+
+/* v5.0.4: record the leaf that failed the filter into g_TrackDLastMissName
+ * and bump the miss counter. Safe at PASSIVE (called only from the
+ * TrackDHandlePostEnumerate name-miss branch, dispatched by
+ * RstRegistryCallback under PAGED_CODE()). The name copy is best-effort:
+ * concurrent callback invocations on different CPUs may interleave the
+ * 16-byte write - the ImageFileName the flusher publishes is guaranteed
+ * to be A recent miss but not necessarily THE last one. Acceptable for a
+ * diagnostic breadcrumb; the callback body path is intentionally free of
+ * spinlocks (v5.0.4 removed the v5.0.2 KSPIN_LOCK on the PID array; we
+ * do not reintroduce one for a diagnostic value). */
+static VOID TrackDRecordNameMiss(VOID)
+{
+    PEPROCESS proc;
+    PCHAR name;
+    CHAR local[16];
+    ULONG i;
+
+    InterlockedIncrement(&g_TrackDNameMissCount);
+
+    proc = PsGetCurrentProcess();
+    if (proc == NULL) return;
+    name = PsGetProcessImageFileName(proc);
+    if (name == NULL) return;
+
+    /* Copy at most 15 bytes, force NUL-termination. */
+    for (i = 0; i < 15; i++) {
+        CHAR c = name[i];
+        local[i] = c;
+        if (c == '\0') break;
+    }
+    for (; i < 15; i++) local[i] = '\0';
+    local[15] = '\0';
+
+    /* Publish. RtlCopyMemory here is a best-effort snapshot; racing
+     * TrackDFlushWorker readers see either the pre- or the post-write
+     * bytes (or a torn mixture - acceptable for a diagnostic). */
+    RtlCopyMemory(g_TrackDLastMissName, local, sizeof(g_TrackDLastMissName));
+}
+
+/* RegNtPostEnumerateKey body: classify parent path, dispatch to the
+ * matching child-name gate + synthesizer, rewrite the enumerated
+ * subkey name in place. Same wchar count guaranteed by all
+ * synthesizers; caller's NameLength never touched.
+ *
+ * v5.0.1: classifier-driven multi-path dispatch (SCSI, PCI, USB, HID,
+ * Audio Render/Capture). Non-classified parents pass-through silently. */
+static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
+{
+    PREG_POST_OPERATION_INFORMATION post;
+    PREG_ENUMERATE_KEY_INFORMATION pre;
+    NTSTATUS keyIdSt;
+    PCUNICODE_STRING keyName = NULL;
+    ULONG_PTR keyId = 0;
+    ULONG nameLenBytes = 0;
+    ULONG nameOffset = 0;
+    PWCHAR namePtr = NULL;
+    WCHAR real[TRACKD_MAX_NAME_WCHARS];
+    WCHAR synth[TRACKD_MAX_NAME_WCHARS];
+    ULONG realWchars;
+    UNICODE_STRING realUs;
+    TRACKD_PATH_TYPE pathType;
+    BOOLEAN childOk = FALSE;
+
+    post = (PREG_POST_OPERATION_INFORMATION)Argument2;
+    if (post == NULL) return STATUS_SUCCESS;
+    if (!NT_SUCCESS(post->Status)) return STATUS_SUCCESS;
+    if (post->PreInformation == NULL) return STATUS_SUCCESS;
+
+    /* v5.0.4: image-name gate BEFORE the more expensive Cm callback-
+     * get-key-object-id call. Rejected callers bump the name-miss
+     * counter and stash their leaf into g_TrackDLastMissName for
+     * userland diagnostics - see TrackDRecordNameMiss. */
+    if (!TrackDCurrentCallerNameMatches()) {
+        TrackDRecordNameMiss();
+        return STATUS_SUCCESS;
+    }
+
+    pre = (PREG_ENUMERATE_KEY_INFORMATION)post->PreInformation;
+    if (pre->KeyInformation == NULL || pre->Length == 0) return STATUS_SUCCESS;
+
+    /* Parent-path classification. */
+    keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object,
+                                       &keyId, &keyName);
+    if (!NT_SUCCESS(keyIdSt) || keyName == NULL) {
+        WriteLastCallbackStatus(TRACKD_TAG_PATH_GET_FAIL, keyIdSt);
+        return STATUS_SUCCESS;
+    }
+    pathType = TrackDClassifyParent(keyName);
+    if (pathType == TRACKD_PATH_NONE) return STATUS_SUCCESS;
+
+    /* Extract subkey name from caller's buffer per KeyInformationClass. */
+    switch (pre->KeyInformationClass) {
+    case KeyBasicInformation:
+        if (pre->Length < (ULONG)FIELD_OFFSET(KEY_BASIC_INFORMATION, Name)) {
+            WriteLastCallbackStatus(TRACKD_TAG_BUFFER_BAD, STATUS_BUFFER_TOO_SMALL);
+            return STATUS_SUCCESS;
+        }
+        {
+            PKEY_BASIC_INFORMATION bi =
+                (PKEY_BASIC_INFORMATION)pre->KeyInformation;
+            nameLenBytes = bi->NameLength;
+            nameOffset = (ULONG)FIELD_OFFSET(KEY_BASIC_INFORMATION, Name);
+            namePtr = bi->Name;
+        }
+        break;
+    case KeyNodeInformation:
+        if (pre->Length < (ULONG)FIELD_OFFSET(KEY_NODE_INFORMATION, Name)) {
+            WriteLastCallbackStatus(TRACKD_TAG_BUFFER_BAD, STATUS_BUFFER_TOO_SMALL);
+            return STATUS_SUCCESS;
+        }
+        {
+            PKEY_NODE_INFORMATION ni =
+                (PKEY_NODE_INFORMATION)pre->KeyInformation;
+            nameLenBytes = ni->NameLength;
+            nameOffset = (ULONG)FIELD_OFFSET(KEY_NODE_INFORMATION, Name);
+            namePtr = ni->Name;
+        }
+        break;
+    default:
+        /* KeyFullInformation, KeyNameInformation, etc. — pass-through. */
+        return STATUS_SUCCESS;
+    }
+
+    if (nameLenBytes == 0 || (nameLenBytes % sizeof(WCHAR)) != 0)
+        return STATUS_SUCCESS;
+    realWchars = nameLenBytes / sizeof(WCHAR);
+    if (realWchars > TRACKD_MAX_NAME_WCHARS) return STATUS_SUCCESS;
+    if (nameOffset + nameLenBytes > pre->Length) {
+        WriteLastCallbackStatus(TRACKD_TAG_BUFFER_BAD, STATUS_BUFFER_OVERFLOW);
+        return STATUS_SUCCESS;
+    }
+
+    /* Snapshot real name into stack-local (SEH — caller's buffer
+     * origin unknown; probe would need to be done by CM already,
+     * but defense is cheap). */
+    __try {
+        RtlCopyMemory(real, namePtr, nameLenBytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT, GetExceptionCode());
+        return STATUS_SUCCESS;
+    }
+
+    realUs.Buffer = real;
+    realUs.Length = (USHORT)nameLenBytes;
+    realUs.MaximumLength = (USHORT)nameLenBytes;
+
+    /* Per-type child-name prefix gate + synthesizer dispatch. */
+    switch (pathType) {
+    case TRACKD_PATH_SCSI:
+        if (RtlPrefixUnicodeString(&g_TrackDSubkeyPrefix, &realUs, TRUE)) {
+            TrackDBuildSyntheticName(real, realWchars, synth);
+            childOk = TRUE;
+        }
+        break;
+    case TRACKD_PATH_PCI:
+        if (RtlPrefixUnicodeString(&g_TrackDPciChildPrefix, &realUs, TRUE)) {
+            TrackDBuildSyntheticPciName(real, realWchars, synth);
+            childOk = TRUE;
+        }
+        break;
+    case TRACKD_PATH_USB_INSTANCE:
+    case TRACKD_PATH_HID_INSTANCE:
+        /* No child-name prefix gate: enumerating under a validated
+         * VID_&PID_ parent means every child is an instance-serial
+         * candidate. Empty or malformed names are handled by the
+         * synthesizer itself (no-op copy). */
+        TrackDBuildSyntheticUsbHidInstance(real, realWchars, synth);
+        childOk = TRUE;
+        break;
+    case TRACKD_PATH_AUDIO_RENDER:
+    case TRACKD_PATH_AUDIO_CAPTURE:
+        /* GUID synthesizer bails internally if shape !=
+         * `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`. */
+        if (realWchars == 38 && real[0] == L'{' && real[37] == L'}') {
+            TrackDBuildSyntheticAudioGuid(real, realWchars, synth);
+            childOk = TRUE;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (!childOk) return STATUS_SUCCESS;
+
+    /* Write back. Same wchar count -> NameLength unchanged. */
+    __try {
+        RtlCopyMemory(namePtr, synth, nameLenBytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT, GetExceptionCode());
+        return STATUS_SUCCESS;
+    }
+
+    InterlockedIncrement(&g_TrackDHitCount);
+    WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+    return STATUS_SUCCESS;
+}
+
+/* RegNtPreSetValueKey tap on our OWN Parameters key.
+ *
+ * v5.0.4: dispatches only on `EnableRegCallback` writes -> update
+ * g_TrackDEnabled directly, giving track-d-arm.ps1 -Enable/-Disable
+ * hot-toggle without reboot. The pre-v5.0.4 `RubinOtPid` arm went
+ * away with the Ps notify + PID array subsystem (v5.0.4 changelog).
+ *
+ * Any other ValueName in our Parameters key (LastCallbackStatus,
+ * LastArmStatus, CallbackHitCount, CallbackInvokeCount,
+ * CallbackNameMissCount, LastMissImageName, EnableSmbiosReplay,
+ * EnableCpuReplay, etc.) is IGNORED silently. Our own TrackDFlushWorker
+ * writes those and its writes fire this tap - the value-name filter
+ * here prevents any recursion or unintended side effects. */
+static VOID TrackDHandlePreSetValue(PVOID Argument2)
+{
+    PREG_SET_VALUE_KEY_INFORMATION info;
+    NTSTATUS keyIdSt;
+    ULONG_PTR keyId = 0;
+    PCUNICODE_STRING keyName = NULL;
+    ULONG newValue = 0;
+
+    info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
+    if (info == NULL || info->ValueName == NULL) return;
+    if (info->Type != REG_DWORD || info->DataSize < sizeof(ULONG)) return;
+    if (info->Data == NULL) return;
+
+    /* v5.0.4: only EnableRegCallback survives as a hot-toggle tap. The
+     * pre-v5.0.4 RubinOtPid arm went away with the Ps notify + PID
+     * array subsystem (name-based gate needs no PID plumbing). */
+    if (!RtlEqualUnicodeString(&g_TrackDEnableValueName,
+                               info->ValueName, TRUE)) {
+        return;
+    }
+
+    /* Verify parent path is our OWN Parameters key. */
+    keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, info->Object,
+                                       &keyId, &keyName);
+    if (!NT_SUCCESS(keyIdSt) || keyName == NULL) return;
+    if (!RtlSuffixUnicodeString(&g_TrackDParamsSuffix,
+                                (PCUNICODE_STRING)keyName, TRUE)) return;
+
+    __try {
+        RtlCopyMemory(&newValue, info->Data, sizeof(ULONG));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+
+    /* Toggle the hot-path gate. Plain BOOLEAN write; the hot path
+     * reads g_TrackDEnabled without a lock (single-byte MOV is
+     * inherently atomic on x86-64). Value semantics: 1 = enabled,
+     * anything else = disabled (mirrors LoadTrackDConfig). */
+    g_TrackDEnabled = (newValue == 1) ? TRUE : FALSE;
+#if DBG
+    DbgPrint("[RstFlt/TrackD] EnableRegCallback toggled to %u via Parameters tap (g_TrackDEnabled=%d)\n",
+             newValue, g_TrackDEnabled);
+#endif
+}
+
+/* Cm dispatch. Runs at PASSIVE_LEVEL per MSDN contract. */
+static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
+                                    PVOID Argument1,
+                                    PVOID Argument2)
+{
+    REG_NOTIFY_CLASS notifyClass;
+
+    UNREFERENCED_PARAMETER(CallbackContext);
+    /* PAGED_CODE (matches changelog claim + TrackDFlushWorker style).
+     * NT_ASSERT below is stricter on the IRQL axis (PAGED_CODE allows
+     * up to APC_LEVEL; we assert exactly PASSIVE_LEVEL per Cm contract). */
+    PAGED_CODE();
+
+    if (!g_TrackDEnabled || Argument2 == NULL) return STATUS_SUCCESS;
+
+    /* v5.0.4: instrument every post-gate invocation. Placed BEFORE the
+     * IRQL assert so an accidental non-PASSIVE dispatch also bumps the
+     * counter and is visible in the breadcrumb. Counter answers
+     * "did the callback fire at all this boot" without depending on
+     * rewrite success (g_TrackDHitCount stays a rewrite-landed counter). */
+    InterlockedIncrement(&g_TrackDInvokeCount);
+
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    notifyClass = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
+    switch (notifyClass) {
+    case RegNtPostEnumerateKey:
+        (void)TrackDHandlePostEnumerate(Argument2);
+        break;
+    case RegNtPreSetValueKey:
+        TrackDHandlePreSetValue(Argument2);
+        break;
+    default:
+        break;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* Flush the in-memory breadcrumb to Parameters\LastCallbackStatus
+ * and Parameters\CallbackHitCount. Runs at PASSIVE outside any
+ * Cm callback stack — safe to Zw*.
+ *
+ * v5.0.0 post-review fix (adversarial workflow finding #1 CONFIRMED,
+ * MED severity): the original body persisted the snapshot then cleared
+ * g_TrackDFlushQueued unconditionally. Any WriteLastCallbackStatus that
+ * fired between snapshot and guard-clear would InterlockedExchange the
+ * new value into g_TrackDLastStatus, then find the guard still set,
+ * fail its CAS, and skip re-queue — the on-disk breadcrumb would
+ * permanently lag the in-memory volatile until another callback fired.
+ * Fix: after clearing the guard, re-read the volatiles; if either has
+ * drifted from the snapshot we just persisted, re-queue the work item
+ * so the next iteration flushes the drift. This closes the window
+ * without introducing concurrent-worker complexity. */
+static VOID TrackDFlushWorker(PVOID unused)
+{
+    NTSTATUS st;
+    HANDLE hParams = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING valName;
+    /* Initialized here so the drift check after `out:` sees defined
+     * values even if we took the early goto (Length==0 path). */
+    ULONG statusValue = 0, hitValue = 0;
+    ULONG invokeValue = 0, nameMissValue = 0;
+    ULONG postStatus, postHit, postInvoke, postNameMiss;
+    CHAR  missSnap[16];
+    CHAR  postMissSnap[16];
+    WCHAR missWide[16];
+    ULONG i, wlen;
+
+    UNREFERENCED_PARAMETER(unused);
+    PAGED_CODE();
+
+    if (g_TrackDParamsFullPath.Length == 0) goto out;
+
+    /* Snapshot all five hot-path publishers before opening the key.
+     * Order matters only for the drift-recheck symmetry below. */
+    statusValue   = (ULONG)InterlockedCompareExchange(&g_TrackDLastStatus,     0, 0);
+    hitValue      = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount,       0, 0);
+    invokeValue   = (ULONG)InterlockedCompareExchange(&g_TrackDInvokeCount,    0, 0);
+    nameMissValue = (ULONG)InterlockedCompareExchange(&g_TrackDNameMissCount,  0, 0);
+    RtlCopyMemory(missSnap, g_TrackDLastMissName, sizeof(missSnap));
+    missSnap[15] = '\0'; /* defensive re-termination */
+
+    InitializeObjectAttributes(&oa, &g_TrackDParamsFullPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwOpenKey(&hParams, KEY_SET_VALUE, &oa);
+    if (!NT_SUCCESS(st)) goto out;
+
+    RtlInitUnicodeString(&valName, L"LastCallbackStatus");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &statusValue, sizeof(statusValue));
+
+    RtlInitUnicodeString(&valName, L"CallbackHitCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &hitValue, sizeof(hitValue));
+
+    /* v5.0.4 additions */
+    RtlInitUnicodeString(&valName, L"CallbackInvokeCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &invokeValue, sizeof(invokeValue));
+
+    RtlInitUnicodeString(&valName, L"CallbackNameMissCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &nameMissValue, sizeof(nameMissValue));
+
+    /* LastMissImageName: promote ANSI snapshot to UTF-16LE for REG_SZ.
+     * Empty string is still written so the value always exists once
+     * armed (userland can distinguish "never ran" from "ran, no miss").
+     * Data size includes the trailing L'\0'. */
+    wlen = 0;
+    for (i = 0; i < 15 && missSnap[i] != '\0'; i++) {
+        missWide[i] = (WCHAR)(UCHAR)missSnap[i];
+        wlen++;
+    }
+    missWide[wlen] = L'\0';
+    RtlInitUnicodeString(&valName, L"LastMissImageName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_SZ,
+                        missWide, (wlen + 1) * sizeof(WCHAR));
+
+out:
+    if (hParams) ZwClose(hParams);
+    /* Release the guard so a concurrent update can re-queue. */
+    InterlockedExchange(&g_TrackDFlushQueued, 0);
+    /* Drift check (see banner comment). If any hot-path publish fired
+     * inside the persist window, its value never reached the registry -
+     * re-queue ourselves to flush it. Reads are cheap Interlocked reads;
+     * guarded re-queue prevents thrash. LastMissImageName drift is
+     * detected byte-wise; matches the snapshot semantics. */
+    postStatus   = (ULONG)InterlockedCompareExchange(&g_TrackDLastStatus,     0, 0);
+    postHit      = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount,       0, 0);
+    postInvoke   = (ULONG)InterlockedCompareExchange(&g_TrackDInvokeCount,    0, 0);
+    postNameMiss = (ULONG)InterlockedCompareExchange(&g_TrackDNameMissCount,  0, 0);
+    RtlCopyMemory(postMissSnap, g_TrackDLastMissName, sizeof(postMissSnap));
+    if (postStatus   != statusValue   ||
+        postHit      != hitValue      ||
+        postInvoke   != invokeValue   ||
+        postNameMiss != nameMissValue ||
+        RtlCompareMemory(postMissSnap, missSnap, sizeof(missSnap)) != sizeof(missSnap))
+    {
+        if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
+            ExQueueWorkItem(&g_TrackDFlushWorkItem, DelayedWorkQueue);
+        }
+    }
+}
+
+/* Callback-safe breadcrumb setter. Updates the in-memory volatile
+ * atomically and — if a flush isn't already pending — queues one. */
+static VOID WriteLastCallbackStatus(UCHAR tag, NTSTATUS st)
+{
+    ULONG code = ((ULONG)tag << 24) | ((ULONG)st & 0x00FFFFFFUL);
+    InterlockedExchange(&g_TrackDLastStatus, (LONG)code);
+    if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
+        /* Item pre-initialized in ArmTrackD; safe to Queue while flag
+         * held. */
+        ExQueueWorkItem(&g_TrackDFlushWorkItem, DelayedWorkQueue);
+    }
+}
+
+/* v5.0.4: arm-time breadcrumb setter. Written into a SEPARATE registry
+ * value (Parameters\LastArmStatus) so a boot-time arm failure can no
+ * longer be masked by a subsequent hot-path callback that overwrites
+ * LastCallbackStatus. Called EXCLUSIVELY from ArmTrackD (PASSIVE,
+ * driver-init context, OUTSIDE any Cm callback stack) - direct Zw is
+ * safe: no CM-internal lock is held. Uses g_TrackDParamsFullPath cached
+ * by LoadTrackDConfig; a NULL path is silently skipped (same failure-
+ * tolerance policy as the existing WriteLastReplayStatus /
+ * WriteLastCallbackStatus). */
+static VOID WriteLastArmStatus(UCHAR tag, NTSTATUS st)
+{
+    HANDLE hParams = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING valName;
+    ULONG code;
+
+    if (g_TrackDParamsFullPath.Length == 0) return;
+
+    code = ((ULONG)tag << 24) | ((ULONG)st & 0x00FFFFFFUL);
+    InitializeObjectAttributes(&oa, &g_TrackDParamsFullPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&hParams, KEY_SET_VALUE, &oa))) return;
+    RtlInitUnicodeString(&valName, L"LastArmStatus");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &code, sizeof(code));
+    ZwClose(hParams);
+}
+
+/* Read Parameters into globals + cache the full Parameters NT path
+ * for the flusher. Runs at PASSIVE from DriverEntry (safe context;
+ * Cm callback is not yet armed so no risk of recursion). */
+static NTSTATUS LoadTrackDConfig(PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+    HANDLE hParams = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING paramsPath, tail, valName;
+    WCHAR paramsBuf[512];
+    UCHAR flagBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    PKEY_VALUE_PARTIAL_INFORMATION flagInfo =
+        (PKEY_VALUE_PARTIAL_INFORMATION)flagBuf;
+    UCHAR seedBuf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 132];
+    PKEY_VALUE_PARTIAL_INFORMATION seedInfo =
+        (PKEY_VALUE_PARTIAL_INFORMATION)seedBuf;
+    ULONG need = 0;
+    ULONG flagVal = 0;
+
+    if (RegPath == NULL || RegPath->Buffer == NULL || RegPath->Length == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    paramsPath.Buffer = paramsBuf;
+    paramsPath.Length = 0;
+    paramsPath.MaximumLength = sizeof(paramsBuf);
+    st = RtlAppendUnicodeStringToString(&paramsPath, RegPath);
+    if (!NT_SUCCESS(st)) return st;
+    RtlInitUnicodeString(&tail, L"\\Parameters");
+    st = RtlAppendUnicodeStringToString(&paramsPath, &tail);
+    if (!NT_SUCCESS(st)) return st;
+
+    InitializeObjectAttributes(&oa, &paramsPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwOpenKey(&hParams, KEY_READ | KEY_SET_VALUE, &oa);
+    if (!NT_SUCCESS(st)) return st;
+
+    /* Cache full Parameters path for the flusher's later ZwOpenKey. */
+    if ((ULONG)paramsPath.Length + sizeof(WCHAR) <= sizeof(g_TrackDParamsBuf)) {
+        RtlCopyMemory(g_TrackDParamsBuf, paramsPath.Buffer, paramsPath.Length);
+        g_TrackDParamsBuf[paramsPath.Length / sizeof(WCHAR)] = L'\0';
+        g_TrackDParamsFullPath.Buffer = g_TrackDParamsBuf;
+        g_TrackDParamsFullPath.Length = paramsPath.Length;
+        g_TrackDParamsFullPath.MaximumLength = (USHORT)sizeof(g_TrackDParamsBuf);
+    }
+
+    /* EnableRegCallback (REG_DWORD, default 0). */
+    RtlInitUnicodeString(&valName, L"EnableRegCallback");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &need);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) g_TrackDEnabled = TRUE;
+    }
+
+    /* RegCallbackSeed (REG_SZ, up to 64 hex chars). Stored raw as
+     * lower bytes of each WCHAR (ASCII-safe assumption; a non-ASCII
+     * seed would still hash deterministically, just with fewer bits
+     * of effective entropy). */
+    RtlInitUnicodeString(&valName, L"RegCallbackSeed");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         seedInfo, sizeof(seedBuf), &need);
+    if (NT_SUCCESS(st) &&
+        seedInfo->Type == REG_SZ &&
+        seedInfo->DataLength >= sizeof(WCHAR))
+    {
+        ULONG wcount = seedInfo->DataLength / sizeof(WCHAR);
+        ULONG i;
+        PWCHAR wsrc = (PWCHAR)seedInfo->Data;
+        if (wcount > 0 && wsrc[wcount - 1] == L'\0') wcount--;
+        if (wcount > sizeof(g_TrackDSeed)) wcount = sizeof(g_TrackDSeed);
+        for (i = 0; i < wcount; i++) {
+            g_TrackDSeed[i] = (UCHAR)(wsrc[i] & 0xFF);
+        }
+        g_TrackDSeedLen = wcount;
+    }
+
+    /* v5.0.4: pre-v5.0.4 loaded Parameters\RubinOtPid into
+     * g_TrackDOverridePid here. Removed with the entire PID-array +
+     * override subsystem; the name-based gate replaces it and needs no
+     * config surface. Any stale RubinOtPid value left in Parameters
+     * from an older install is now ignored. */
+
+    ZwClose(hParams);
+    return STATUS_SUCCESS;
+}
+
+/* Register CmRegisterCallbackEx. Any failure is silent from
+ * DriverEntry's perspective - driver still loads, other paths
+ * unaffected. v5.0.4: PsSetCreateProcessNotifyRoutineEx registration
+ * removed; per-callback image-name gate replaces the PID array. */
+static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+
+    /* Initialize UNICODE_STRING views over the string literals. Safe
+     * to call before we know if we'll register — they're just
+     * headers pointing at .rdata. */
+    RtlInitUnicodeString(&g_TrackDAltitude,        TRACKD_ALTITUDE_STR);
+    RtlInitUnicodeString(&g_TrackDEnumSuffix,      TRACKD_ENUM_SUFFIX_STR);
+    RtlInitUnicodeString(&g_TrackDSubkeyPrefix,    TRACKD_SUBKEY_PREFIX_STR);
+    RtlInitUnicodeString(&g_TrackDParamsSuffix,    TRACKD_PARAMS_SUFFIX_STR);
+    /* v5.0.4: g_TrackDPidValueName init removed - Parameters\RubinOtPid
+     * tap disappeared with the Ps notify + PID array subsystem. */
+    /* v5.0.4: KeInitializeSpinLock(&g_TrackDPidsLock) removed - array
+     * gone; the per-callback name gate needs no synchronization. */
+    /* v5.0.1 additional views */
+    RtlInitUnicodeString(&g_TrackDPciSuffix,       TRACKD_PCI_SUFFIX_STR);
+    RtlInitUnicodeString(&g_TrackDPciChildPrefix,  TRACKD_PCI_CHILD_PREFIX_STR);
+    RtlInitUnicodeString(&g_TrackDMMDevRender,     TRACKD_MMDEV_RENDER_STR);
+    RtlInitUnicodeString(&g_TrackDMMDevCapture,    TRACKD_MMDEV_CAPTURE_STR);
+    RtlInitUnicodeString(&g_TrackDEnableValueName, TRACKD_ENABLE_VAL_STR);
+
+    ExInitializeWorkItem(&g_TrackDFlushWorkItem, TrackDFlushWorker, NULL);
+
+    /* Load config (also caches Parameters path for later flusher). */
+    st = LoadTrackDConfig(RegPath);
+    if (!NT_SUCCESS(st)) {
+#if DBG
+        DbgPrint("[RstFlt/TrackD] LoadTrackDConfig 0x%08X; Track D not armed\n",
+                 st);
+#endif
+        return st;
+    }
+
+    if (!g_TrackDEnabled) {
+#if DBG
+        DbgPrint("[RstFlt/TrackD] EnableRegCallback=0; callback not armed\n");
+#endif
+        return STATUS_SUCCESS;
+    }
+
+    /* v5.0.4: PsSetCreateProcessNotifyRoutineEx registration removed -
+     * per-callback name gate makes it unnecessary. Only CmRegister-
+     * CallbackEx remains. */
+
+    st = CmRegisterCallbackEx(RstRegistryCallback,
+                              &g_TrackDAltitude,
+                              DrvObj,
+                              NULL,
+                              &g_TrackDCookie,
+                              NULL);
+    if (!NT_SUCCESS(st)) {
+#if DBG
+        DbgPrint("[RstFlt/TrackD] CmRegisterCallbackEx 0x%08X\n", st);
+#endif
+        /* v5.0.4: arm-failure breadcrumb goes to LastArmStatus (separate
+         * value from LastCallbackStatus) so a subsequent hot-path event
+         * cannot mask the arm failure userland is trying to diagnose. */
+        WriteLastArmStatus(TRACKD_TAG_ALLOC_FAIL, st);
+        return st;
+    }
+    g_TrackDRegistered = TRUE;
+
+#if DBG
+    DbgPrint("[RstFlt/TrackD] armed. cookie=0x%llx seedLen=%u\n",
+             g_TrackDCookie.QuadPart, g_TrackDSeedLen);
+#endif
+
+    /* v5.0.4: arm-success breadcrumb goes to LastArmStatus. LastCallback-
+     * Status is reserved for hot-path callback events after the split. */
+    WriteLastArmStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+    return STATUS_SUCCESS;
+}
+
+/* ================================================================
  *  PnpStartCompletion - signals event when IRP_MN_START completes
  * ================================================================ */
 static NTSTATUS PnpStartCompletion(
@@ -1946,6 +3721,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
        remain unchanged for that boot. */
     ApplySmbiosBlobIfCached(RegPath);
 
+    /* v5.0.0 Track D: register the Cm registry callback for Enum\SCSI
+       subkey name rewrite (MVP scope per docs/track-d-kernel-registry-
+       callback-kickoff.md section 4). No-op unless
+       Parameters\EnableRegCallback=1. Any failure is silent — driver
+       still loads, other paths unaffected. See changelog above and
+       ArmTrackD implementation for the safety contract. */
+    (void)ArmTrackD(DrvObj, RegPath);
+
     /* Default: all IRPs pass through (v3.6: DEVICE_CONTROL included) */
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         DrvObj->MajorFunction[i] = DispatchPassthrough;
@@ -1958,7 +3741,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* Intentionally no DriverUnload — see note above. */
 
 #if DBG
-    DbgPrint("[RstFlt] DriverEntry OK (v4.0.9, SMBIOS no-op+breadcrumb + gated CPU replay + paging-path handler + Authenticode signed)\n");
+    DbgPrint("[RstFlt] DriverEntry OK (v5.0.3, SMBIOS no-op+breadcrumb + gated CPU replay + paging-path handler + Track D {SCSI,PCI,USB,HID,Audio} + multi-PID rubi-substring Ps notify (/INTEGRITYCHECK-signed) + Authenticode signed)\n");
 #endif
     return STATUS_SUCCESS;
 }

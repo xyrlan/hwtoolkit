@@ -108,6 +108,119 @@ Validado em smoke test VM (2026-08-31):
     bare-metal onde o driver de video real preserva a
     escrita.
 
+## MODO LEVEL C+ / TRACK D (Cm registry callback kernel, v5.0.0+)
+
+Track D e a linha de spoof kernel ADICIONAL sobre Level C que
+intercepta LEITURAS de nomes de subkey em
+`HKLM\SYSTEM\CurrentControlSet\Enum\SCSI\Disk&Ven_*` via
+`CmRegisterCallbackEx`. Motivacao: tres bans empiricos consecutivos
+observados 2026-08-31/2026-09-01 (baseline, Level A userland, fresh
+identity com PRs #12/#13/#14/#15) confirmaram H2 do
+docs/emac-recon-v3.md - EMAC le NOMES DE SUBKEYS via `RegEnumKeyEx`,
+e os spoofers userland so reescrevem VALUES *dentro* dos subkeys.
+Renomear em user-mode falhou em PR #13 por handle contention do
+PnP Manager.
+
+Kickoff completo: `docs/track-d-kernel-registry-callback-kickoff.md`.
+Design decisions e trade-offs: `docs/postmortem-v5-track-d/incident-
+v500-mvp-integration.md`. Especificacao byte-a-byte do sintetizador
+de nome (para portar validador userland): `docs/track-d-name-recipe.md`.
+
+Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
+Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
+
+  * `\Enum\SCSI\Disk&Ven_*&Prod_*&Rev_*` - Ven/Prod/Rev tokens.
+  * `\Enum\PCI\VEN_*&DEV_*&SUBSYS_*&REV_*` - SUBSYS+REV rewritten;
+    VEN+DEV+CC preserved (driver binding stays intact).
+  * `\Enum\USB\VID_*&PID_*\<serial>` - leaf serial subkey rewritten;
+    VID_&PID_ parent preserved.
+  * `\Enum\HID\VID_*&PID_*\<serial>` - same shape as USB (kernel
+    intercept only rewrites the enumerated NAME - does not affect
+    device binding, so keyboard/mouse keep working).
+  * `\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\
+    Render\{GUID}` and `\Capture\{GUID}` - endpoint GUID rewritten
+    inside the enclosing braces.
+
+Ativacao (pipeline recomendado):
+
+```
+.\02-compilar-driver.bat                  # gera rstflt.sys v5.0.0 assinado
+.\03-instalar-driver.bat                  # instala + registra + reboot
+.\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid   # Level A userland (defense in depth)
+.\scripts\track-d-arm.ps1 -Enable         # seta EnableRegCallback=1 + seed
+# reboot para o Cm callback armar
+```
+
+Track D e ORTOGONAL a Level A e Level C: pode conviver com ambos.
+Level A cobre read-VALUE (userland), Track D cobre read-NAME (kernel).
+
+Diagnostico:
+
+```
+.\scripts\track-d-arm.ps1 -Diagnose
+```
+
+Le `Parameters\LastCallbackStatus` decoded (tag + NTSTATUS),
+`LastArmStatus` (breadcrumb separado do arm-time, v5.0.4+),
+`CallbackHitCount` (rewrites que landaram), `CallbackInvokeCount`
+(entradas no callback body, v5.0.4+), `CallbackNameMissCount`
+(invocacoes rejeitadas pelo image-name gate, v5.0.4+), e
+`LastMissImageName` (primeiros 15 bytes do image name do ultimo
+caller rejeitado, v5.0.4+).
+
+Tags (v5.0.4): 0x00 OK, 0x01 NAME-MISS, 0x02 RESERVED, 0x03
+PATH-GET-FAIL, 0x04 BUFFER-BAD, 0x05 ALLOC-FAIL, 0x06 SEH-FAULT.
+(Pre-v5.0.4: 0x01 era NO-PID, 0x02 era PID-STALE. Slots mantidos
+para compat com decodificadores antigos.)
+
+Identificacao de processo alvo (v5.0.4+): image-name gate inline
+dentro do callback body. Toda invocacao chama
+`PsGetProcessImageFileName(PsGetCurrentProcess())` e faz
+`_strnicmp("rubinot", 7)` sobre os primeiros bytes do
+`EPROCESS.ImageFileName` (15-byte ANSI). Bate qualquer
+`RubinOT.exe`, `rubinot_dx.exe`, `RubinOTUpdater.exe`; rejeita
+`rubinotimposter.exe` via next-char guard. Nenhum Ps notify, nenhum
+PID array, nenhum override manual - o gate discrimina por invocacao
+sem depender de ordering driver-vs-target. Para probar em VM:
+spawnar qualquer executavel com nome comecando `rubinot*` (ex:
+`Copy-Item C:\Windows\System32\reg.exe C:\Users\<u>\Downloads\rubinot_probe.exe; .\rubinot_probe.exe query HKLM\SYSTEM\CurrentControlSet\Enum\SCSI`).
+
+(Historico pre-v5.0.4: PID discovery era via
+`PsSetCreateProcessNotifyRoutineEx` + array de PIDs + override
+manual via `-SetPid`. Removido em v5.0.4 - motivos e evidencia em
+`docs/postmortem-v5-track-d/incident-v504-pid-matching-simplification.md`.)
+
+Desativacao (sem uninstall do driver):
+
+```
+.\scripts\track-d-arm.ps1 -Disable        # EnableRegCallback=0, efeito imediato v5.0.1+
+```
+
+Em `v5.0.1+` o `-Disable` toma efeito imediatamente: o tap
+`RegNtPreSetValueKey` no proprio Parameters detecta a escrita e
+alterna `g_TrackDEnabled=FALSE` em runtime, sem reboot. Callback
+continua registrado no kernel mas hot path vira pass-through para
+todos os PIDs. `-Enable` seguido de qualquer nova enumeration
+tambem re-liga imediatamente. (Historical note: em `v5.0.0` o
+disable exigia reboot; fixado em v5.0.1 per docs/postmortem-v5-
+track-d/incident-v500-mvp-integration.md sec 0.1.)
+
+Rollback total: `.\08-desinstalar-driver.bat` (remove RstFlt +
+restaura UpperFilters) + reboot.
+
+Safety notes:
+
+  - `CmRegisterCallbackEx` e uma API supported pela Microsoft, distinta
+    do dispatch swap (`DriverObject->MajorFunction[X]` que sim triggga
+    PatchGuard, rejeitado em roadmap-v41-wmi-intercept.md Option C).
+    `PsGetProcessImageFileName` (v5.0.4+ image-name gate) e um export
+    do ntoskrnl semi-documentado mas estavel desde WinXP.
+  - Callback body 100% SEH-wrapped para writes no buffer do caller.
+  - Zero Zw* dentro do Cm callback (config lida uma vez em
+    DriverEntry, breadcrumb via deferred work item fora do callback
+    stack).
+  - Same-wchar-count rewrite: `NameLength` do caller nunca mutada.
+
 ## ESTRUTURA
 
 ```
