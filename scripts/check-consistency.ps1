@@ -246,6 +246,62 @@ function Read-CallbackStatus {
             Write-Host "         mesmo se EnableRegCallback=1. Ver docs/postmortem-v5-track-d/." -ForegroundColor DarkGray
         }
     }
+
+    # v5.0.5 Phase 0: per-path-type breakdown de CallbackHitCount.
+    # Se CallbackHitCount>0 mas todos os per-type=0 -> driver pre-v5.0.5
+    # (rodar 03-instalar-driver.bat de novo com binario atual).
+    # Se HitCount alto mas so um per-type > 0 -> rewriters de outros
+    # path types nao estao sendo exercised nesta sessao (pode ser normal).
+    $perPathNames = @('CallbackHit_SCSI','CallbackHit_PCI','CallbackHit_USB',
+                      'CallbackHit_HID','CallbackHit_AudioR','CallbackHit_AudioC',
+                      'CallbackHit_BTH','CallbackHit_Storage')
+    $perPathAny = $false
+    foreach ($n in $perPathNames) {
+        $v = (Get-ItemProperty -Path $rstflt -Name $n -ErrorAction SilentlyContinue).$n
+        if ($null -ne $v) {
+            $perPathAny = $true
+            $color = if ($v -gt 0) { 'Green' } else { 'DarkGray' }
+            Write-Host ("  [*]    Track D {0,-24}: {1}" -f $n, $v) -ForegroundColor $color
+        }
+    }
+    if (-not $perPathAny -and $null -ne $hits -and $hits -gt 0) {
+        Write-Host "  [!]    Track D CallbackHit_* per-path counters ausentes: driver pre-v5.0.5 carregado" -ForegroundColor Yellow
+    }
+
+    # v5.0.5 Phase 0: non-rubi parent match counter.
+    # >0 = algum processo NAO matchando "rubinot" prefix + delimiter
+    # enumerou um dos nossos 6 target parents (SCSI/PCI/USB/HID/AudioR/
+    # AudioC). Indica que o gate _strnicmp("rubinot", 7) esta cego pra
+    # esse processo - candidato pra broadening do gate em v5.0.6.
+    $nrp = (Get-ItemProperty -Path $rstflt -Name 'CallbackNonRubiParentMatch' `
+                              -ErrorAction SilentlyContinue).CallbackNonRubiParentMatch
+    if ($null -ne $nrp) {
+        $color = if ($nrp -gt 0) { 'Yellow' } else { 'DarkGray' }
+        Write-Host ("  [*]    Track D CallbackNonRubiParentMatch: {0}" -f $nrp) -ForegroundColor $color
+        if ($nrp -gt 0) {
+            Write-Host "         Algum processo nao-rubinot tocou nossos target parents." -ForegroundColor DarkGray
+            Write-Host "         Rodar 'track-d-arm.ps1 -Diagnose' para ver ring buffer (last 16 hits)." -ForegroundColor DarkGray
+        }
+    }
+
+    # v5.0.5 Phase 0: ring buffer sanity summary. Full decode em
+    # track-d-arm.ps1 -Diagnose; aqui so contagem de slots ocupados
+    # e breakdown gated vs non-rubi.
+    $ring = (Get-ItemProperty -Path $rstflt -Name 'HitRingBuffer' `
+                               -ErrorAction SilentlyContinue).HitRingBuffer
+    if ($null -ne $ring -and $ring.Length -ge 96) {
+        $recSize = 96
+        $slotCount = [Math]::Min(16, [int]($ring.Length / $recSize))
+        $filled = 0; $gated = 0; $nonrubi = 0
+        for ($i = 0; $i -lt $slotCount; $i++) {
+            $off = $i * $recSize
+            $ts = [System.BitConverter]::ToInt64($ring, $off)
+            if ($ts -eq 0) { continue }
+            $filled++
+            if ($ring[$off + 25] -eq 1) { $gated++ } else { $nonrubi++ }
+        }
+        Write-Host ("  [*]    Track D HitRingBuffer: {0}/16 slots preenchidos ({1} gated, {2} non-rubi)" -f $filled, $gated, $nonrubi) -ForegroundColor DarkGray
+    }
 }
 
 Read-CallbackStatus
