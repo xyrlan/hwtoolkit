@@ -57,7 +57,14 @@ $scsiRootPs   = "HKLM:\SYSTEM\CurrentControlSet\Enum\SCSI"
 
 function Invoke-Reg {
     param([string[]]$RegArgs)
-    $out = & reg.exe @RegArgs 2>&1
+    # PS 5.1 gotcha: com $ErrorActionPreference='Stop' no scope pai, `2>&1`
+    # de nativo converte stderr em NativeCommandError e THROW mesmo quando
+    # o exit code eh 0 (ex.: reg.exe pt-BR escreve "A operacao foi concluida
+    # com exito" no stderr em SUCESSO). Isolamos com scope + Continue pref.
+    $out = & {
+        $ErrorActionPreference = 'Continue'
+        & reg.exe @RegArgs 2>&1
+    }
     if ($LASTEXITCODE -ne 0) {
         throw ("reg.exe " + ($RegArgs -join ' ') + " falhou (" + $LASTEXITCODE + "): " + ($out -join "`n"))
     }
