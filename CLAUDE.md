@@ -45,8 +45,10 @@ Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (
   Otherwise the Hyper-V watchdog resets the guest at ~52-56s post-Winlogon when KVP encounters the modified registry state (Bug 4, closed as H2 host-side reset — see `incident-v405-vm-pipeline-validation.md` header). Names above are Windows PT-BR; EN names are `Heartbeat` and `Key-Value Pair Exchange`.
 - Restore config re-enables both services on VM checkpoint restore — always redisable after `Restore-VMCheckpoint`.
 - File transfer host → guest: `Copy-VMFile -Name '<vm>' -SourcePath <host> -DestinationPath <guest> -CreateFullPath -FileSource Host -Force`. Requires guest's `vmicguestinterface` service running (Manual startup, resets to Stopped on each reboot — the user starts it manually per session). Copy-VMFile **guest → host does not exist**; use base64-into-chat or SMB share for that direction.
-- Working checkpoints on the VM (as of PR #9):
-  - `clean-v409-installed` — driver v4.0.9 signed installed, no arming. **Best base for iterating arming tests.**
+- Working checkpoints on the VM (as of PR #16):
+  - `clean-v504-armed-track-d-tested` (2026-09-01) — **driver v5.0.4 installed + EnableRegCallback=1 + probed once (HitCount=1). Ideal base para bare-metal test setup ou iteracao de patches sobre v5.0.4 gate.** State: shutdown limpo pos-VM unit test.
+  - `clean-v501-armed-track-d` (2026-09-01) — driver v5.0.1 armed, superseded pelo v5.0.4 checkpoint acima.
+  - `clean-v409-installed` — driver v4.0.9 signed installed, no arming. Base historica.
   - `clean-no-driver` — no `RstFlt` registered anywhere. Base for install-from-scratch tests.
   - `pre-v406-test` — the last v4.0.4 checkpoint kept around for the historical binary if needed.
 

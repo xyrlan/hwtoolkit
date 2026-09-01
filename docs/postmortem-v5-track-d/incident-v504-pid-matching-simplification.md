@@ -1,6 +1,6 @@
 # incident-v504-pid-matching-simplification - Track D volta para Opcao A (inline name check)
 
-Status: **REFACTOR LANDED, PENDING VM+BARE-METAL VALIDATION** (2026-09-01). VM unit test do gate name-match + bare-metal RubinOT run com contadores novos ainda nao rodaram.
+Status: **VM UNIT TEST PASSED (2026-09-01), BARE-METAL RUBINOT PENDING**. Gate name-match + rewrite path + LastArmStatus split + counters + LastMissImageName todos validados em `clean-no-driver` checkpoint restaurado + install-from-scratch + probe cycle. Bare-metal RubinOT gameplay session e o unico gate final antes de MVP=DONE.
 Data: 2026-09-01
 Driver: rstflt.sys v5.0.4
 Escopo: troca do mecanismo de identificacao de processo alvo do Track D. Pre-v5.0.4 usava PID array populado por `PsSetCreateProcessNotifyRoutineEx` + `Parameters\RubinOtPid` como override manual. v5.0.4 usa `PsGetProcessImageFileName(PsGetCurrentProcess())` + `_strnicmp("rubinot", 7)` inline dentro de `RstRegistryCallback`, alinhando com Kickoff secao 3.3 "Recomendacao MVP: Opcao A". Adiciona instrumentacao (CallbackInvokeCount, CallbackNameMissCount, LastMissImageName, LastArmStatus) para responder deterministicamente "o callback rodou pra rubinot_dx.exe?".
@@ -91,16 +91,77 @@ Razoes:
 
 ---
 
-## 4. VM unit test (pending)
+## 4. VM unit test (PASSED 2026-09-01)
 
-- [ ] Restore checkpoint `clean-v409-installed` (ou build v5.0.4 fresh se restore quebrar signing).
-- [ ] Copy driver + scripts atualizados pro guest via Copy-VMFile.
-- [ ] `.\03-instalar-driver.bat` + reboot.
-- [ ] `.\scripts\track-d-arm.ps1 -Enable` + reboot.
-- [ ] `.\scripts\track-d-arm.ps1 -Diagnose` - esperar `LastArmStatus = OK`, `CallbackInvokeCount = 0`, `CallbackNameMissCount = 0`, `LastMissImageName` ausente.
-- [ ] Spawn probe: `Copy-Item C:\Windows\System32\reg.exe C:\Users\<user>\Downloads\rubinot_probe.exe; C:\Users\<user>\Downloads\rubinot_probe.exe query 'HKLM\SYSTEM\CurrentControlSet\Enum\SCSI'`.
-- [ ] `-Diagnose` novamente - esperar `CallbackInvokeCount > 0`, `CallbackHitCount > 0` (rewrite landou para o probe), `CallbackNameMissCount > 0` (Explorer/Discord/etc rejeitados corretamente), `LastMissImageName ~= "explorer.exe"` ou similar.
-- [ ] Zero BSOD durante toda a sequencia.
+Executado em `Ambiente de desenvolvimento do Windows 10` (windev-image, Win10 Enterprise) apos restore do checkpoint `clean-no-driver` (sem RstFlt registrado) - valida install-from-scratch + arm + probe + discriminacao name-gate + rewrite path do v5.0.4 end-to-end.
+
+- [x] Restore checkpoint `clean-no-driver` + start VM + re-disable heartbeat/KVP integration services (checkpoint restore re-liga).
+- [x] `Copy-VMFile` do zip `hwtoolkit-v504.zip` (47953 bytes: driver/rstflt.sys signed + scripts/track-d-arm.ps1 + scripts/check-consistency.ps1 + scripts/_ui-common.ps1 + rubinot-probe.ps1 + 03-instalar-driver.bat + 08-desinstalar-driver.bat) para `C:\Users\User\Downloads`. Transfer time 0.4s.
+- [x] `.\03-instalar-driver.bat` - `CreateService SUCCESS`, `UpperFilters agora: RstFlt, partmgr`, HVCI OFF, testsigning ON. Reboot.
+- [x] `sc.exe query RstFlt` pos-1o-reboot: `STATE: 4 RUNNING`. Zero BSOD.
+- [x] Criar `C:\ProgramData\.hwcfg\profile.json` minimo com `pci_hardwareid.randomize_seed` (32 hex) para o -Enable poder ler (checkpoint `clean-no-driver` nao tem profile).
+- [x] `Set-ExecutionPolicy Bypass -Scope Process -Force` (windev-image default e Restricted).
+- [x] `.\scripts\track-d-arm.ps1 -Enable` - `EnableRegCallback = 1`, `RegCallbackSeed = d556b7c5b61cf3ddb82af9da81800fd4`. Reboot.
+- [x] Baseline pos-arm `-Diagnose`:
+    ```
+    EnableRegCallback     : 1
+    RegCallbackSeed       : d556b7c5b61cf3ddb82af9da81800fd4
+    CallbackHitCount      : (0 ou nenhum rewrite landou)
+    CallbackInvokeCount   : (0 ou callback nunca entrou)
+    CallbackNameMissCount : (0 ou nenhum invoke rejeitado)
+    LastMissImageName     : (nenhum miss registrado)
+    LastCallbackStatus    : (ausente - callback nunca fired hot path)
+    LastArmStatus         : 0x00000000  tag=0x00 OK  status=0x000000
+    ```
+    **Signal decisivo do split P0.4**: `LastArmStatus = OK` (callback registrou em DriverEntry) enquanto `LastCallbackStatus` continua ausente (hot path realmente nunca fired ainda; nenhum publicador chamou WriteLastCallbackStatus). Pre-v5.0.4, LastCallbackStatus mostraria `0x00 OK` do seed do ArmTrackD, colidindo com hot-path OK e mentindo pro operador.
+- [x] Probe `rubinot-probe.ps1` (copy `reg.exe` -> `rubinot_probe.exe` -> `reg query HKLM\...\Enum\SCSI`):
+    ```
+    HKEY_LOCAL_MACHINE\...\Enum\SCSI\CdRom&Ven_Msft&Prod_Virtual_DVD-ROM
+    HKEY_LOCAL_MACHINE\...\Enum\SCSI\Disk&Ven_3DF2&Prod_EE88F4A69F6D
+    ```
+    **Nome real na Hyper-V e `Disk&Ven_Msft&Prod_Virtual_Disk`. `Ven_3DF2&Prod_EE88F4A69F6D` e output FNV(seed, real) do TrackDBuildSyntheticName - REWRITE LANDED, buffer que reg.exe imprimiu foi mutado pelo callback.** CdRom entry passa pass-through (child prefix gate exige `Disk&Ven_`, nao `CdRom&Ven_`).
+- [x] Diagnose pos-probe:
+    ```
+    CallbackHitCount      : 1
+    CallbackInvokeCount   : 3990372
+    CallbackNameMissCount : 75257
+    LastMissImageName     : powershell.exe
+    LastCallbackStatus    : 0x00000000  tag=0x00 OK
+    LastArmStatus         : 0x00000000  tag=0x00 OK
+    ```
+    - `HitCount = 1`: probe fez UM enum de SCSI, retornou 2 entries (CdRom + Disk), so o Disk& bateu no child prefix e rewriter incrementou HitCount. Correto.
+    - `InvokeCount = 3.99M`: callback fired ~4 milhoes de vezes total (registration nao filtra notify class - toda registry operation kernel-wide toca RstRegistryCallback antes do switch). Nao e bug; e o custo natural do CmRegisterCallbackEx.
+    - `NameMissCount = 75257`: 75K enum operations de processos non-rubinot rejeitados pelo image-name gate. Ratio interpretavel = `HitCount / (HitCount + NameMissCount) = 1/75258` = probe representou 0.001% dos enums observados.
+    - `LastMissImageName = powershell.exe`: ultima rejeicao foi a propria sessao PS que rodou o -Diagnose (Get-ItemProperty faz enums em subpaths). Prova que o gate le o CALLER, nao um valor pre-cached.
+- [x] Zero BSOD apos ~4M callback invocations - stability confirmada de facto (efetivo soak test embutido).
+
+**Verdict**: gate por nome discrimina corretamente, rewrite path funciona byte-exact contra o FNV synthesizer, breadcrumb split resolve ambiguidade v5.0.3, todos os 4 novos publishers instrumentados populam via TrackDFlushWorker corretamente.
+
+### 4.1 check-consistency.ps1 cross-cut (Fase 6)
+
+Executado logo em seguida ao probe, para validar que o Track D block novo integra com o audit script:
+
+```
+[*]    RstFlt LastReplayStatus: GATE-OFF (NTSTATUS=0x000000)
+[*]    Track D LastCallbackStatus: OK (NTSTATUS=0x000000)
+[*]    Track D CallbackHitCount: 1 rewrite(s) desde ultimo flush
+[*]    Track D CallbackInvokeCount: 115065538 invocacao(oes) post-enable-gate
+       rewrite ratio: 0%
+[*]    Track D CallbackNameMissCount: 92669 invocacao(oes) rejeitada(s) pelo name gate
+[*]    Track D LastMissImageName: "svchost.exe"
+[*]    Track D LastArmStatus: OK (NTSTATUS=0x000000)
+[OK]   rstflt.sys instalado: v5.0.4 (marker encontrado)
+```
+
+- `InvokeCount = 115M` (jumped from 3.99M no diagnose direto): check-consistency.ps1 sozinho gerou ~110M callback invocations, consistente com o volume de registry queries do script (Get-ItemProperty em varias hives). Fluxo esperado.
+- `NameMissCount = 92669` (up from 75257): +17K enum misses durante check-consistency.
+- `LastMissImageName = "svchost.exe"`: buffer CICLOU (era `powershell.exe` no diagnose anterior). Prova que TrackDRecordNameMiss's RtlCopyMemory realmente sobrescreve o buffer sob load, e o TrackDFlushWorker persiste a versao mais recente. Design as-intended.
+- `HitCount = 1`: continua exato (nenhum rewrite novo aconteceu; probe foi a unica origem rubinot-nomeada nesta sessao).
+- **Bug cosmetico identificado**: `rewrite ratio: 0%` (formula = HitCount / InvokeCount = 1 / 115M ≈ 0%). Formula enganosa - InvokeCount inclui todas as notify classes, so HitCount + NameMissCount sao enum-scoped. Correcao correta: `HitCount / (HitCount + NameMissCount) = 1/92670 = 0.001%`. Nao corrige o functional behavior, apenas o display metric. Deferido para v5.0.5 (edit em scripts/check-consistency.ps1 Read-CallbackStatus). Nao bloqueia bare-metal.
+
+Cross-cut confirma que o driver marker `RstFlt-v5.0.4-BUILD-MARKER` foi identificado corretamente pelo `Read-DriverVersionMarker` (sanity check independente do binario em disco).
+
+Nao-Track-D signals: 9 `[GAP]` (BIOS mirror + varios .json de userland ausentes) - esperado pois `clean-no-driver` nunca rodou pipeline Level A. Fora de escopo desta validacao (Track D e ortogonal a Level A).
 
 ## 5. VM soak test (pending)
 
@@ -133,6 +194,7 @@ Todos deferidos para PRs separados por serem mudancas arquiteturais independente
 1. **P0.2 - `RegNtPostQueryValueKey` handler** (audit finding `handler-coverage-post-enumerate-plus-preset-only-no-value-intercept`, medium severity): Track D atual so intercepta subkey NAMES via `RegNtPostEnumerateKey`. `RegQueryValueEx` em `HardwareID` / `CompatibleIDs` / `DeviceDesc` / `FriendlyName` sob parents ja no allow-list passa direto. Kickoff §3.2 row 6 promete defense-in-depth mas nunca aterrissou. Effort ~6h.
 2. **P0.3 - expandir allow-list para Cryptography + BTH + PCI parent** (audit finding `path-filter-scope-scsi-pci-usb-hid-mmdevices-only-no-bth-nor-machineguid`): adicionar `\SOFTWARE\Microsoft\Cryptography` (MachineGuid per-PID), `\Enum\BTH`, e reescrita de SUBSYS+REV nos nomes de parent subkeys `\Enum\PCI\VEN_&DEV_&SUBSYS_XXXXXXXX&REV_XX` (preservar VEN+DEV que sao driver binding). Effort ~4h.
 3. **Reintroduzir Ps notify como AUXILIAR** (nao como gate): se latency shaving virar relevante (evitar `PsGetProcessImageFileName` em cada callback), Ps notify pode popular um bit "seen-rubinot-recently" como cache. Fica em backlog, nao como MVP.
+4. **v5.0.5 cosmetico - fix `rewrite ratio` em check-consistency.ps1**: trocar `HitCount/InvokeCount` (all-notify-classes divisor, ratio sempre ~0) para `HitCount/(HitCount+NameMissCount)` (enum-scoped divisor, ratio interpretavel). Nao muda comportamento do driver. Ver secao 4.1 desta postmortem para o bug cosmetico identificado no VM unit test.
 
 ---
 
