@@ -55,7 +55,12 @@
 param(
     [Parameter(ParameterSetName='Apply')]   [switch]$Apply,
     [Parameter(ParameterSetName='Restore')] [switch]$Restore,
-    [Parameter(ParameterSetName='Show')]    [switch]$Show
+    [Parameter(ParameterSetName='Show')]    [switch]$Show,
+    # -DryRun sem ParameterSetName = valido em qualquer modo (__AllParameterSets).
+    # 08b-rollback-userland.bat injeta -DryRun em todos os -Restore quando --dry-run;
+    # sem esse switch, CmdletBinding rejeita e o rollback falha com FAIL(nls-locale)
+    # em vez de preview limpo.
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
@@ -221,6 +226,10 @@ if ($mode -eq 'Restore') {
     $removed = 0
     foreach ($n in @($bk.added_names_extended)) {
         if ([string]::IsNullOrEmpty($n)) { continue }
+        if ($DryRun) {
+            Write-Info ("[DryRun] ExtendedLocale : removeria '{0}'" -f $n)
+            continue
+        }
         try {
             Remove-ItemProperty -Path $extendedPath -Name $n -Force -ErrorAction Stop
             Write-OK ("ExtendedLocale : removido '{0}'" -f $n)
@@ -231,6 +240,10 @@ if ($mode -eq 'Restore') {
     }
     foreach ($n in @($bk.added_names_custom)) {
         if ([string]::IsNullOrEmpty($n)) { continue }
+        if ($DryRun) {
+            Write-Info ("[DryRun] CustomLocale   : removeria '{0}'" -f $n)
+            continue
+        }
         try {
             Remove-ItemProperty -Path $customPath -Name $n -Force -ErrorAction Stop
             Write-OK ("CustomLocale   : removido '{0}'" -f $n)
@@ -241,7 +254,11 @@ if ($mode -eq 'Restore') {
     }
 
     Write-Host ""
-    Write-Info ("Total removido: {0}" -f $removed)
+    if ($DryRun) {
+        Write-Info "DryRun ativo - nenhuma escrita feita"
+    } else {
+        Write-Info ("Total removido: {0}" -f $removed)
+    }
     Write-Host "=== Fim ===" -ForegroundColor Cyan
     Write-Host ""
     exit 0
@@ -265,7 +282,7 @@ if (-not (Test-Path $customPath)) {
 # forense) + a lista de nomes que ADICIONAMOS (usada por -Restore).
 if (-not (Test-Path $backupPath)) {
     $backupDir = Split-Path $backupPath -Parent
-    if (-not (Test-Path $backupDir)) {
+    if (-not (Test-Path $backupDir) -and -not $DryRun) {
         New-Item -Path $backupDir -ItemType Directory -Force | Out-Null
     }
 
@@ -278,10 +295,14 @@ if (-not (Test-Path $backupPath)) {
         original_custom_dump   = Get-KeyValueMap $customPath
     }
     $json = $bkObj | ConvertTo-Json -Depth 5
-    $tmp = "$backupPath.tmp"
-    Set-Content -Path $tmp -Value $json -Encoding UTF8 -Force
-    Move-Item -Path $tmp -Destination $backupPath -Force
-    Write-OK ("Backup criado: {0}" -f $backupPath)
+    if ($DryRun) {
+        Write-Info ("[DryRun] Criaria backup em: {0}" -f $backupPath)
+    } else {
+        $tmp = "$backupPath.tmp"
+        Set-Content -Path $tmp -Value $json -Encoding UTF8 -Force
+        Move-Item -Path $tmp -Destination $backupPath -Force
+        Write-OK ("Backup criado: {0}" -f $backupPath)
+    }
 } else {
     Write-Info ("Backup ja existe (preservado): {0}" -f $backupPath)
 }
@@ -305,11 +326,16 @@ if ($cusMap.ContainsKey($cusName)) {
 }
 
 # Grava as duas entradas (New-ItemProperty com -Force = upsert).
-New-ItemProperty -Path $extendedPath -Name $extName -Value $extValue -PropertyType String -Force | Out-Null
-Write-OK ("ExtendedLocale : {0} = {1}" -f $extName, $extValue)
+if ($DryRun) {
+    Write-Info ("[DryRun] ExtendedLocale : escreveria '{0}' = '{1}'" -f $extName, $extValue)
+    Write-Info ("[DryRun] CustomLocale   : escreveria '{0}' = '{1}'" -f $cusName, $cusValue)
+} else {
+    New-ItemProperty -Path $extendedPath -Name $extName -Value $extValue -PropertyType String -Force | Out-Null
+    Write-OK ("ExtendedLocale : {0} = {1}" -f $extName, $extValue)
 
-New-ItemProperty -Path $customPath -Name $cusName -Value $cusValue -PropertyType String -Force | Out-Null
-Write-OK ("CustomLocale   : {0} = {1}" -f $cusName, $cusValue)
+    New-ItemProperty -Path $customPath -Name $cusName -Value $cusValue -PropertyType String -Force | Out-Null
+    Write-OK ("CustomLocale   : {0} = {1}" -f $cusName, $cusValue)
+}
 
 Write-Host ""
 Write-Info "EMAC le esses valores on-demand - vale ja no proximo start do cliente."
