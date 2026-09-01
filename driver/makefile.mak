@@ -43,8 +43,16 @@ CFLAGS_COMMON = /nologo /W4 /WX /wd4996 /Ox /GS- /Zl \
 
 LFLAGS_COMMON = /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry \
                 /NODEFAULTLIB \
+                /INTEGRITYCHECK \
                 /LIBPATH:"$(WDK_LIB)\km\x64" \
                 ntoskrnl.lib hal.lib BufferOverflowK.lib
+# /INTEGRITYCHECK (v5.0.3 requirement): MSDN mandates it for any driver
+# using PsSetCreateProcessNotifyRoutineEx. Empirically confirmed on
+# bare-metal test 2026-09-01: without this flag, the Ps notify
+# registration in ArmTrackD returns STATUS_ACCESS_DENIED and Track D
+# never auto-detects rubinot processes (silent fail — g_TrackDPs
+# Registered stays FALSE). Testsigning does NOT bypass. See v5.0.3
+# changelog block in rstflt.c.
 
 # rstflt: legacy WDM upper filter (needs wdmsec.lib)
 RSTFLT_LIBS = wdmsec.lib
