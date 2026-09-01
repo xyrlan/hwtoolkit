@@ -126,7 +126,14 @@ $BlacklistClasses = @(
 
 function Invoke-Reg {
     param([string[]]$RegArgs)
-    $out = & reg.exe @RegArgs 2>&1
+    # PS 5.1 gotcha: com $ErrorActionPreference='Stop' no scope pai, `2>&1`
+    # de nativo converte stderr em NativeCommandError e THROW mesmo quando
+    # o exit code eh 0 (ex.: reg.exe pt-BR escreve "A operacao foi concluida
+    # com exito" no stderr em SUCESSO). Isolamos com scope + Continue pref.
+    $out = & {
+        $ErrorActionPreference = 'Continue'
+        & reg.exe @RegArgs 2>&1
+    }
     if ($LASTEXITCODE -ne 0) {
         throw ("reg.exe " + ($RegArgs -join ' ') + " falhou (" + $LASTEXITCODE + "): " + ($out -join "`n"))
     }
@@ -218,17 +225,24 @@ function Get-InstanceLocationInfo {
     }
 }
 
-# Le ContainerID (DEVPKEY_Device_ContainerId aparece como REG_SZ com prefixo em algumas builds).
-# ContainerID vive em Properties\{8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c}\0007\(Default),
-# mas caminho mais confiavel eh Get-PnpDeviceProperty. Aqui usamos leitura direta como fallback.
+# Le ContainerID via cfgmgr32 (Get-PnpDeviceProperty). Historicamente a versao
+# antiga tentava leitura direta em Properties\{fmtid}\<pid-hex>\(Default), mas
+# a pid hex nao eh universal entre builds (Win7 vs Win8 vs Win10 divergiam
+# entre \0002 e \0007 - ambos aparecem em documentacoes distintas). O caminho
+# via cfgmgr32 normaliza e eh o mesmo usado por Get-ProtectedContainerIds,
+# garantindo que os dois lados leem a mesma fonte de verdade.
 function Get-InstanceContainerId {
     param([string]$InstancePathPs)
-    # 1) Leitura direta em Properties (funciona em Win10)
-    $propPath = Join-Path $InstancePathPs "Properties\{8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c}\0007"
+    # Derive InstanceId PnP a partir do path do registry.
+    # Ex: "...\Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\USB\VID_046D&PID_C077\5&2f34a9b&0&5"
+    #     -> "USB\VID_046D&PID_C077\5&2f34a9b&0&5"
     try {
-        $v = Get-ItemProperty -Path $propPath -Name "(Default)" -ErrorAction Stop
-        $c = [string]$v.'(Default)'
-        if ($c) { return $c.Trim().ToLower() }
+        $marker = "\Enum\"
+        $idx = $InstancePathPs.IndexOf($marker)
+        if ($idx -lt 0) { return $null }
+        $instanceId = $InstancePathPs.Substring($idx + $marker.Length)
+        $prop = Get-PnpDeviceProperty -InstanceId $instanceId -KeyName 'DEVPKEY_Device_ContainerId' -ErrorAction Stop
+        if ($prop -and $prop.Data) { return ([string]$prop.Data).Trim().ToLower() }
     } catch {}
     return $null
 }
@@ -257,10 +271,13 @@ function Get-ProtectedContainerIds {
         Write-Warn ("Nao consegui inspecionar boot volume: " + $_.Exception.Message)
     }
 
-    # Mice + Keyboards Present
+    # Mice + Keyboards presentes. -PresentOnly (em vez de -Status OK) para pegar
+    # tambem devices em Degraded/Unknown/Error; senao um mouse com driver mal-
+    # aplicado ou keyboard com Code 10 nao entra na lista e o loop poderia
+    # renomear a subchave USB do dongle dele.
     foreach ($cls in @('Mouse','Keyboard')) {
         try {
-            $devs = Get-PnpDevice -Class $cls -Status OK -ErrorAction Stop
+            $devs = Get-PnpDevice -Class $cls -PresentOnly -ErrorAction Stop
             foreach ($d in $devs) {
                 try {
                     $c = Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName 'DEVPKEY_Device_ContainerId' -ErrorAction Stop
@@ -271,6 +288,145 @@ function Get-ProtectedContainerIds {
     }
 
     return $protected
+}
+
+# ============================================================
+#  Per-device PnP pause/resume (handle-contention fix - Approach B)
+#
+#  reg.exe delete de HKLM\SYSTEM\CurrentControlSet\Enum\USB\<parent>\<inst>
+#  falha com sharing violation quando PnP Manager mantem handle na subkey de
+#  instancia (comportamento default do PnP Manager quando o device esta
+#  arm e enumerado). Solucao: Disable-PnpDevice antes do rename (release do
+#  handle); Enable-PnpDevice contra o NOVO InstanceId depois (o velho
+#  InstanceId nao existe mais no Enum\USB apos rename bem-sucedido).
+#
+#  Trade-off conhecido: 2-5 segundos com o device sem driver (pause de
+#  camera USB, pause de printer status, etc). Mouse/teclado sao BLINDADOS
+#  pela lista Get-ProtectedContainerIds acima - nunca chegam aqui.
+#
+#  CAVEAT PnP:
+#    Enable-PnpDevice contra o novo InstanceId as vezes falha porque o
+#    Device Manager ainda associa InstanceId=velho ao device fisico. Sem
+#    disparar `pnputil /scan-devices` (que pode recriar a subkey ORIGINAL
+#    ao lado da fake - double-record obvio para EMAC), o device volta em
+#    re-scan periodico do PnP ou por re-plug fisico. Log warn e siga.
+# ============================================================
+
+function Suspend-DeviceForRename {
+    param([string]$InstanceId)
+    # Retorna $true se disable teve efeito, $false caso contrario (device
+    # ja disabled, device ausente, sem permissao). Nao lanca em erro para
+    # nao interromper o loop - se falhar, tentamos o rename mesmo assim.
+    try {
+        Disable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Info ("  PnP disabled: " + $InstanceId)
+        return $true
+    } catch {
+        Write-Warn ("  Disable-PnpDevice falhou (" + $InstanceId + "): " + $_.Exception.Message)
+        Write-Warn "  Prosseguindo com rename - pode falhar com sharing violation"
+        return $false
+    }
+}
+
+function Resume-DeviceForRename {
+    param([string]$InstanceId)
+    # Tenta enable via InstanceId fornecido. Se falhar, warn e siga - o
+    # device retorna em re-scan periodico do PnP ou por re-plug.
+    try {
+        Enable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Info ("  PnP re-enabled: " + $InstanceId)
+    } catch {
+        Write-Warn ("  Enable-PnpDevice falhou (" + $InstanceId + "): " + $_.Exception.Message)
+        Write-Warn "  Device pode precisar re-plug fisico OU volta em re-scan PnP"
+    }
+}
+
+# ============================================================
+#  Boundary-safe rename dentro do .reg exportado
+#
+#  Substituir o nome de instancia via [regex]::Replace no arquivo inteiro eh
+#  perigoso: instNames curtos/numericos podem casar dentro de LocationInformation
+#  (ex.: "Port_#0005"), ParentIdPrefix, BusRelations, fragmentos de GUID, etc.,
+#  causando corrupcao colateral silenciosa. Este helper aplica a substituicao
+#  APENAS em:
+#    (a) linhas de section header:  [HKLM\...\Enum\USB\<parentKey>\<instName>...]
+#    (b) linhas de valor conhecidas: HardwareID, CompatibleIDs,
+#         LocationInformation, ContainerID
+#    (c) linhas de continuacao (backslash no fim) de um dos valores em (b),
+#         para cobrir hex(7) multi-linha.
+# ============================================================
+function Rename-InstanceInReg {
+    param(
+        [string]$Content,
+        [string]$ParentKey,
+        [string]$OldInst,
+        [string]$NewInst
+    )
+    if ([string]::IsNullOrEmpty($Content)) { return $Content }
+    $escOld    = [regex]::Escape($OldInst)
+    $escParent = [regex]::Escape($ParentKey)
+    # Section header: linha comeca com '[HKEY_LOCAL_MACHINE\...\Enum\USB\<parent>\<inst>'
+    # e termina em '\...]' ou ']'.
+    $headerRe = '(?i)^\[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\USB\\' + $escParent + '\\' + $escOld + '(\\|\])'
+    # Value line: um dos fingerprint values conhecidos.
+    $valueRe  = '(?i)^"(HardwareID|CompatibleIDs|LocationInformation|ContainerID)"='
+
+    # Preserva os separadores de linha originais dividindo em linhas fisicas.
+    $lines = $Content -split "`r`n", -1
+    $out = New-Object System.Collections.Generic.List[string]
+    $inTargetValue = $false
+    foreach ($line in $lines) {
+        $shouldReplace = $false
+        if ($line -match $headerRe) {
+            $shouldReplace = $true
+            $inTargetValue = $false
+        } elseif ($line -match $valueRe) {
+            $shouldReplace = $true
+            # Se termina em backslash, ha continuacao hex nas linhas seguintes.
+            $inTargetValue = ($line.TrimEnd() -match '\\$')
+        } elseif ($inTargetValue) {
+            $shouldReplace = $true
+            $inTargetValue = ($line.TrimEnd() -match '\\$')
+        } else {
+            $inTargetValue = $false
+        }
+        if ($shouldReplace) {
+            $out.Add([regex]::Replace($line, $escOld, $NewInst, 'IgnoreCase'))
+        } else {
+            $out.Add($line)
+        }
+    }
+    return ($out -join "`r`n")
+}
+
+# Parser leve de hex(7) (REG_MULTI_SZ UTF-16LE) dentro de conteudo .reg exportado.
+# Retorna array de strings (sem terminador vazio) ou $null se nao encontrar.
+# Usado como cross-check no spoof: garante que os valores HardwareID/CompatibleIDs
+# no .reg exportado batem com $savedValues lidos via Get-ItemProperty antes de
+# reescrever - defesa contra corrupcao/desalinhamento.
+function Get-RegMultiSzFromReg {
+    param([string]$Content, [string]$ValueName)
+    if ([string]::IsNullOrEmpty($Content)) { return $null }
+    $esc = [regex]::Escape($ValueName)
+    # hex(7) pode se estender em multiplas linhas com '\' + CRLF + espacos.
+    $pattern = '(?im)^"' + $esc + '"=hex\(7\):((?:[0-9a-fA-F]{2},?\s*\\?\s*)+)'
+    $m = [regex]::Match($Content, $pattern)
+    if (-not $m.Success) { return $null }
+    $hex = $m.Groups[1].Value
+    # Remove continuacoes, whitespace, virgulas
+    $hex = ($hex -replace '[\\\r\n\s]', '')
+    $tokens = @($hex -split ',')
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    foreach ($t in $tokens) {
+        if ($t -match '^[0-9a-fA-F]{2}$') {
+            [void]$bytes.Add([byte]::Parse($t, [System.Globalization.NumberStyles]::HexNumber))
+        }
+    }
+    if ($bytes.Count -eq 0) { return $null }
+    $str = [System.Text.Encoding]::Unicode.GetString($bytes.ToArray())
+    # MULTI_SZ: strings separadas por \0, terminadas por \0\0
+    $parts = $str.TrimEnd([char]0) -split "`0"
+    return @($parts | Where-Object { $_ -ne '' })
 }
 
 # ============================================================
@@ -309,14 +465,22 @@ if ($Restore) {
             continue
         }
 
+        # InstanceIds completos para PnP suspend/resume. No Restore, o device
+        # comeca com o NOME SPOOFADO ($newInst) e termina com o ORIGINAL ($origInst).
+        $currentInstanceId  = "USB\" + $parentKey + "\" + $newInst
+        $restoredInstanceId = "USB\" + $parentKey + "\" + $origInst
         $tmpFile = Join-Path $env:TEMP ("usb-restore-" + [guid]::NewGuid().ToString() + ".reg")
+        $deviceWasSuspended = $false
         try {
+            $deviceWasSuspended = Suspend-DeviceForRename -InstanceId $currentInstanceId
+
             [void](Invoke-Reg -RegArgs @("export", $currentPathReg, $tmpFile, "/y"))
             $content = Get-Content -Path $tmpFile -Raw -Encoding Unicode
 
-            # Reverte o nome de instancia no path e em referencias textuais
-            $escNew = [regex]::Escape($newInst)
-            $newContent = [regex]::Replace($content, $escNew, $origInst, 'IgnoreCase')
+            # Reverte o nome de instancia SOMENTE em section headers e em value lines
+            # conhecidas (HardwareID/CompatibleIDs/LocationInformation/ContainerID),
+            # evitando substituicao colateral em Port_#XXXX, ParentIdPrefix, etc.
+            $newContent = Rename-InstanceInReg -Content $content -ParentKey $parentKey -OldInst $newInst -NewInst $origInst
 
             Set-Content -Path $tmpFile -Value $newContent -Encoding Unicode -NoNewline
             [void](Invoke-Reg -RegArgs @("import", $tmpFile))
@@ -346,6 +510,15 @@ if ($Restore) {
             $failedRestore++
         } finally {
             if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+            if ($deviceWasSuspended) {
+                # Prefer novo path (rename bem-sucedido) senao velho (rename falhou -
+                # subkey original ainda existe). Test-Path decide.
+                if (Test-Path (Join-Path (Join-Path $usbRootPs $parentKey) $origInst)) {
+                    Resume-DeviceForRename -InstanceId $restoredInstanceId
+                } else {
+                    Resume-DeviceForRename -InstanceId $currentInstanceId
+                }
+            }
         }
     }
 
@@ -409,12 +582,27 @@ $vidKeys = @($allDevKeys | Where-Object {
     $n = $_.PSChildName
     ($n -match '^(?i)VID_[0-9A-F]{4}&PID_[0-9A-F]{4}(&MI_[0-9A-F]{2})?$')
 })
+
+# Detecta composite parents (VID&PID com filhos MI_XX ao lado no mesmo nivel).
+# usbccgp.sys linka parent<->children via BaseContainerId, LocationInformation
+# Port_#XXXX.Hub_#YYYY, e PDO paths embutidos no registry dos filhos. Renomear
+# somente o parent quebra os filhos porque a subkey referenciada some.
+# Estrategia: pular o parent VID&PID inteiro quando qualquer MI_XX irmao existir.
+$compositeParents = New-Object System.Collections.Generic.HashSet[string]
+foreach ($k in $allDevKeys) {
+    $nm = $k.PSChildName
+    if ($nm -match '^(?i)(VID_[0-9A-F]{4}&PID_[0-9A-F]{4})&MI_[0-9A-F]{2}$') {
+        [void]$compositeParents.Add($matches[1].ToUpper())
+    }
+}
+
 $skippedRootHub = @($allDevKeys | Where-Object { $_.PSChildName -match '^(?i)ROOT_HUB' }).Count
 $skippedUsbstor = @($allDevKeys | Where-Object { $_.PSChildName -eq 'USBSTOR' }).Count
 
 Write-OK ("Devices VID&PID candidatos: " + $vidKeys.Count)
 if ($skippedRootHub -gt 0) { Write-Info ("Root hubs pulados: " + $skippedRootHub) }
 if ($skippedUsbstor -gt 0) { Write-Info ("USBSTOR pulado (coberto por spoof-disk-registry): " + $skippedUsbstor) }
+if ($compositeParents.Count -gt 0) { Write-Info ("Composite parents detectados (parents com filhos MI_XX): " + $compositeParents.Count) }
 
 if ($vidKeys.Count -eq 0) {
     Write-Warn "Nenhum device VID_*&PID_* encontrado - nada a fazer"
@@ -438,15 +626,25 @@ $backupEntries = @()
 $newMapping    = @{}
 $processed     = 0
 $failed        = 0
-$skippedHid    = 0
-$skippedProt   = 0
-$skippedClass  = 0
-$skippedBoot   = 0
-$skippedOther  = 0
+$skippedHid       = 0
+$skippedProt      = 0
+$skippedClass     = 0
+$skippedBoot      = 0
+$skippedOther     = 0
+$skippedComposite = 0
 
 foreach ($dev in $vidKeys) {
     $parentKey = $dev.PSChildName
     $devPathPs = $dev.PSPath
+
+    # Fix atomicidade composite: pula parent VID&PID inteiro quando ele tem
+    # filhos MI_XX. Renomear apenas o parent quebraria os filhos porque a
+    # subkey de referencia (BaseContainerId/PDO path) desaparece.
+    if ($parentKey -match '^(?i)VID_[0-9A-F]{4}&PID_[0-9A-F]{4}$' -and $compositeParents.Contains($parentKey.ToUpper())) {
+        Write-Warn ($parentKey + " - composite parent (tem MI_XX irmaos), pulando familia inteira para evitar quebrar filhos")
+        $skippedComposite++
+        continue
+    }
 
     $instances = @()
     try { $instances = @(Get-ChildItem -Path $devPathPs -ErrorAction Stop) } catch {}
@@ -559,24 +757,67 @@ foreach ($dev in $vidKeys) {
         # Rename via export/replace/import/delete
         $oldPathReg = "$usbRoot\$parentKey\$instName"
         $newPathReg = "$usbRoot\$parentKey\$newInst"
+        # InstanceIds completos para PnP suspend/resume. Comeca com nome ORIGINAL
+        # ($instName) e termina com nome SPOOFADO ($newInst).
+        $oldInstanceId = "USB\" + $parentKey + "\" + $instName
+        $newInstanceId = "USB\" + $parentKey + "\" + $newInst
         $tmpFile = Join-Path $env:TEMP ("usb-swap-" + [guid]::NewGuid().ToString() + ".reg")
+        $deviceWasSuspended = $false
         try {
+            $deviceWasSuspended = Suspend-DeviceForRename -InstanceId $oldInstanceId
+
             [void](Invoke-Reg -RegArgs @("export", $oldPathReg, $tmpFile, "/y"))
             $content = Get-Content -Path $tmpFile -Raw -Encoding Unicode
 
-            # Substitui nome de instancia no path e em referencias textuais (HardwareID,
-            # CompatibleIDs, LocationInformation, ContainerID podem carregar o serial).
-            $escInst = [regex]::Escape($instName)
-            $newContent = [regex]::Replace($content, $escInst, $newInst, 'IgnoreCase')
+            # Cross-check antes de reescrever: os HardwareID/CompatibleIDs no .reg
+            # exportado devem bater com $savedValues lidos via Get-ItemProperty.
+            # Divergencia -> reg export capturou estado diferente (device re-enumerado
+            # entre leitura live e export). Abortar por seguranca em vez de gravar
+            # bytes inconsistentes.
+            foreach ($vn in @('HardwareID','CompatibleIDs')) {
+                $liveArr = $savedValues.$vn
+                if ($null -eq $liveArr) { continue }
+                $regArr = Get-RegMultiSzFromReg -Content $content -ValueName $vn
+                if ($null -eq $regArr) { continue }
+                $liveJoin = ((@($liveArr)) -join "`0")
+                $regJoin  = ((@($regArr))  -join "`0")
+                if ($liveJoin -ne $regJoin) {
+                    throw ("Sanity cross-check falhou para " + $vn + ": .reg export divergente do live registry")
+                }
+            }
 
-            # Sanity: o nome de instancia original nao pode mais existir no .reg
-            if ([regex]::IsMatch($newContent, $escInst, 'IgnoreCase')) {
-                throw "Sanity check falhou: instancia original ainda presente apos replace"
+            # Substitui nome de instancia APENAS em section headers e value lines
+            # conhecidas (HardwareID/CompatibleIDs/LocationInformation/ContainerID).
+            # Evita corrupcao colateral em Port_#XXXX, ParentIdPrefix, GUID frags, etc.
+            $newContent = Rename-InstanceInReg -Content $content -ParentKey $parentKey -OldInst $instName -NewInst $newInst
+
+            # Sanity: o nome de instancia original nao pode mais existir em section
+            # headers ou value lines conhecidas do .reg apos o rename.
+            $verifyContent = Rename-InstanceInReg -Content $newContent -ParentKey $parentKey -OldInst $instName -NewInst "__DETECT__"
+            if ($verifyContent -ne $newContent) {
+                throw "Sanity check falhou: instancia original ainda referenciada apos rename"
             }
 
             Set-Content -Path $tmpFile -Value $newContent -Encoding Unicode -NoNewline
             [void](Invoke-Reg -RegArgs @("import", $tmpFile))
-            [void](Invoke-Reg -RegArgs @("delete", $oldPathReg, "/f"))
+
+            # Retry-com-backoff no delete: PnP libera handle da subkey de forma
+            # assincrona mesmo apos Disable-PnpDevice retornar. 3 tentativas x 100ms.
+            $deleteOk = $false
+            $lastErr  = $null
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    [void](Invoke-Reg -RegArgs @("delete", $oldPathReg, "/f"))
+                    $deleteOk = $true
+                    break
+                } catch {
+                    $lastErr = $_
+                    if ($attempt -lt 3) { Start-Sleep -Milliseconds 100 }
+                }
+            }
+            if (-not $deleteOk) {
+                throw ("delete do original falhou apos 3 tentativas: " + $lastErr.Exception.Message)
+            }
 
             $backupEntries += [pscustomobject]@{
                 parent_key    = $parentKey
@@ -596,8 +837,31 @@ foreach ($dev in $vidKeys) {
         } catch {
             Write-Err ("Falha spoof " + $mapKey + ": " + $_.Exception.Message)
             $failed++
+
+            # Rollback: se o fake foi importado mas o delete do original falhou,
+            # apaga o fake para evitar cascata fake-of-fake no proximo run e para
+            # nao deixar registry com AMBAS subkeys convivendo (deteccao trivial).
+            $fakePathPs = Join-Path (Join-Path $usbRootPs $parentKey) $newInst
+            $origPathPsHere = Join-Path (Join-Path $usbRootPs $parentKey) $instName
+            if ((Test-Path $fakePathPs) -and (Test-Path $origPathPsHere)) {
+                try {
+                    [void](Invoke-Reg -RegArgs @('delete', $newPathReg, '/f'))
+                    Write-Warn ("Rollback do fake OK: " + $parentKey + "\" + $newInst)
+                } catch {
+                    Write-Warn ("Rollback do fake tambem falhou: " + $_.Exception.Message)
+                }
+            }
         } finally {
             if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+            if ($deviceWasSuspended) {
+                # Prefer novo path (rename bem-sucedido) senao velho (rename falhou
+                # ou foi feito rollback). Test-Path decide qual InstanceId existe.
+                if (Test-Path (Join-Path (Join-Path $usbRootPs $parentKey) $newInst)) {
+                    Resume-DeviceForRename -InstanceId $newInstanceId
+                } else {
+                    Resume-DeviceForRename -InstanceId $oldInstanceId
+                }
+            }
         }
     }
 }
@@ -645,13 +909,14 @@ if (-not $DryRun -and $processed -gt 0) {
 
 # 7) Resumo
 Write-Section "Resumo"
-Write-Host ("  Instancias renomeadas         : " + $processed)     -ForegroundColor Cyan
-Write-Host ("  Falhas                        : " + $failed)        -ForegroundColor Cyan
-Write-Host ("  Puladas (HID/mouse/keyboard)  : " + $skippedHid)    -ForegroundColor Cyan
-Write-Host ("  Puladas (ContainerID protegido): " + $skippedProt)  -ForegroundColor Cyan
-Write-Host ("  Puladas (Class blacklist/misc): " + $skippedClass)  -ForegroundColor Cyan
-Write-Host ("  Puladas (boot/system hint)    : " + $skippedBoot)   -ForegroundColor Cyan
-Write-Host ("  Puladas (outros)              : " + $skippedOther)  -ForegroundColor Cyan
+Write-Host ("  Instancias renomeadas          : " + $processed)        -ForegroundColor Cyan
+Write-Host ("  Falhas                         : " + $failed)           -ForegroundColor Cyan
+Write-Host ("  Puladas (HID/mouse/keyboard)   : " + $skippedHid)       -ForegroundColor Cyan
+Write-Host ("  Puladas (ContainerID protegido): " + $skippedProt)      -ForegroundColor Cyan
+Write-Host ("  Puladas (Class blacklist/misc) : " + $skippedClass)     -ForegroundColor Cyan
+Write-Host ("  Puladas (boot/system hint)     : " + $skippedBoot)      -ForegroundColor Cyan
+Write-Host ("  Puladas (composite parent)     : " + $skippedComposite) -ForegroundColor Cyan
+Write-Host ("  Puladas (outros)               : " + $skippedOther)     -ForegroundColor Cyan
 if ($DryRun) { Write-Warn "DryRun ativo - nenhuma escrita feita" }
 Write-Host ""
 Write-Warn "PnP manager pode RE-ENUMERAR e recriar as instancias originais em hot-plug USB."

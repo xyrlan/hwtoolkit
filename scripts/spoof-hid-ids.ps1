@@ -112,11 +112,83 @@ $blacklistClassGuidsLower = @(
 
 function Invoke-Reg {
     param([string[]]$RegArgs)
-    $out = & reg.exe @RegArgs 2>&1
+    # PS 5.1 gotcha: com $ErrorActionPreference='Stop' no scope pai, `2>&1`
+    # de nativo converte stderr em NativeCommandError e THROW mesmo quando
+    # o exit code eh 0 (ex.: reg.exe pt-BR escreve "A operacao foi concluida
+    # com exito" no stderr em SUCESSO). Isolamos com scope + Continue pref.
+    $out = & {
+        $ErrorActionPreference = 'Continue'
+        & reg.exe @RegArgs 2>&1
+    }
     if ($LASTEXITCODE -ne 0) {
         throw ("reg.exe " + ($RegArgs -join ' ') + " falhou (" + $LASTEXITCODE + "): " + ($out -join "`n"))
     }
     return $out
+}
+
+# ============================================================
+#  Rename-InstanceInReg
+#
+#  Reescreve o instance name dentro do texto de um .reg exportado APENAS
+#  em contextos que legitimamente carregam o path da instancia:
+#    - Section headers: [HKLM\...\Enum\HID\<parent>\<inst>...] (com boundary
+#      lookahead [\\\]] para nao matchar prefixos de outra instance name).
+#    - Value lines das chaves whitelistadas (HardwareID, CompatibleIDs,
+#      ParentIdPrefix, ContainerID) e suas linhas de continuacao (\ ao final).
+#
+#  Motivo: a implementacao antiga fazia [regex]::Replace no conteudo inteiro
+#  com o instance name como pattern, o que corrompia silenciosamente hex bytes
+#  de Bluetooth pairing / GUID fragments quando o nome era substring casual.
+#
+#  Retorna o texto reescrito. Nao valida - use sanity check no chamador.
+# ============================================================
+function Rename-InstanceInReg {
+    param(
+        [Parameter(Mandatory=$true)][string]$Content,
+        [Parameter(Mandatory=$true)][string]$ParentKey,
+        [Parameter(Mandatory=$true)][string]$OldInstance,
+        [Parameter(Mandatory=$true)][string]$NewInstance
+    )
+    $escOld    = [regex]::Escape($OldInstance)
+    $escParent = [regex]::Escape($ParentKey)
+    # Header token: casa "\<oldInst>" seguido de "\" (subkey continua) ou "]"
+    # (fim do header). Nao consome o char de boundary; substitui o token.
+    $headerTokenRe = '(?i)(\\)' + $escOld + '(?=[\\\]])'
+    # Path-header line inteira sob nosso parent (para saber se a linha eh header
+    # do subtree que queremos reescrever).
+    $isHeaderRe = '(?i)^\[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\HID\\' + $escParent + '\\'
+    # Value names que legitimamente embedam o path da instancia.
+    $embedNamesRe = '(?i)^"(HardwareID|CompatibleIDs|ParentIdPrefix|ContainerID)"='
+
+    # reg.exe export usa CRLF; split preservando linhas em branco.
+    $lines = $Content -split "`r`n"
+    $inEmbedValue = $false
+    for ($i = 0; $i -lt $lines.Length; $i++) {
+        $line = $lines[$i]
+        if ($line.StartsWith('[')) {
+            # Nova section: fecha qualquer continuacao aberta.
+            $inEmbedValue = $false
+            if ([regex]::IsMatch($line, $isHeaderRe)) {
+                # Header sob nosso parent: reescreve o token da instance.
+                $lines[$i] = [regex]::Replace($line, $headerTokenRe, ('$1' + $NewInstance))
+            }
+            continue
+        }
+        if ([regex]::IsMatch($line, $embedNamesRe)) {
+            # Inicio de value line whitelistada.
+            $lines[$i] = [regex]::Replace($line, '(?i)' + $escOld, $NewInstance)
+            # Continua na proxima linha se termina em '\' (REG_MULTI_SZ hex).
+            $inEmbedValue = $line.TrimEnd().EndsWith('\')
+            continue
+        }
+        if ($inEmbedValue) {
+            $lines[$i] = [regex]::Replace($line, '(?i)' + $escOld, $NewInstance)
+            $inEmbedValue = $line.TrimEnd().EndsWith('\')
+            continue
+        }
+        # Qualquer outra linha: preservar intacta.
+    }
+    return ($lines -join "`r`n")
 }
 
 # FNV-1a 64bit - deterministico, mesmo padrao de spoof-pci-hardwareid.ps1.
@@ -194,7 +266,12 @@ function Get-ProtectedInstances {
     $out = @()
     $devs = @()
     try {
-        $devs = @(Get-PnpDevice -Class $Class -Status OK -ErrorAction Stop)
+        # -PresentOnly em vez de -Status OK: captura devices em Degraded/Unknown/Error
+        # tambem (mouse post-driver-update, keyboard com Code 10 do anti-cheat, etc).
+        # -Status OK deixaria esses devices ativos FORA da lista de protecao - se o
+        # unico teclado presente estiver em Unknown, o loop poderia renomear a
+        # subchave HID dele e brickar input no proximo boot.
+        $devs = @(Get-PnpDevice -Class $Class -PresentOnly -ErrorAction Stop)
     } catch {
         throw ("Get-PnpDevice -Class " + $Class + " falhou: " + $_.Exception.Message)
     }
@@ -240,6 +317,55 @@ function Get-InstanceClassGuid {
 }
 
 # ============================================================
+#  Per-device PnP pause/resume (handle-contention fix - Approach B)
+#
+#  reg.exe delete de HKLM\SYSTEM\CurrentControlSet\Enum\HID\<parent>\<inst>
+#  falha com sharing violation quando PnP Manager mantem handle na subkey de
+#  instancia. Solucao: Disable-PnpDevice antes do rename (release do handle);
+#  Enable-PnpDevice contra o NOVO InstanceId depois.
+#
+#  Trade-off conhecido: 2-5 segundos com o HID device sem driver. Mouse e
+#  teclado sao BLINDADOS por Get-ProtectedInstances (Get-PnpDevice Mouse +
+#  Keyboard Status=OK; blacklist por ClassGUID e defesa em profundidade)
+#  - nunca chegam ao ponto de suspend.
+#
+#  CAVEAT PnP:
+#    Enable-PnpDevice contra o novo InstanceId as vezes falha porque o
+#    Device Manager ainda associa InstanceId=velho ao device fisico. Sem
+#    disparar `pnputil /scan-devices` (que pode recriar a subkey ORIGINAL
+#    ao lado da fake - double-record obvio para EMAC), o device volta em
+#    re-scan periodico do PnP ou por re-plug fisico do device pai USB.
+# ============================================================
+
+function Suspend-DeviceForRename {
+    param([string]$InstanceId)
+    # Retorna $true se disable teve efeito. Nao lanca em erro - se falhar,
+    # tentamos o rename mesmo assim (com risco de sharing violation).
+    try {
+        Disable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Info ("  PnP disabled: " + $InstanceId)
+        return $true
+    } catch {
+        Write-Warn ("  Disable-PnpDevice falhou (" + $InstanceId + "): " + $_.Exception.Message)
+        Write-Warn "  Prosseguindo com rename - pode falhar com sharing violation"
+        return $false
+    }
+}
+
+function Resume-DeviceForRename {
+    param([string]$InstanceId)
+    # Tenta enable via InstanceId fornecido. Se falhar, warn e siga - o
+    # device retorna em re-scan periodico do PnP ou por re-plug do pai USB.
+    try {
+        Enable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Info ("  PnP re-enabled: " + $InstanceId)
+    } catch {
+        Write-Warn ("  Enable-PnpDevice falhou (" + $InstanceId + "): " + $_.Exception.Message)
+        Write-Warn "  Device pode precisar re-plug fisico do pai USB OU volta em re-scan PnP"
+    }
+}
+
+# ============================================================
 #  Restore mode
 # ============================================================
 if ($Restore) {
@@ -255,7 +381,9 @@ if ($Restore) {
         exit 1
     }
 
-    $restored = 0
+    $restored     = 0
+    $failedRestore = 0      # hard failures - guarda-corpos para nao apagar backup em falha parcial
+    $stillSpoofed  = @()    # entries que ainda estao spoofadas mas nao restauramos - preservadas
     foreach ($e in @($bkp.entries)) {
         $vidPidKey    = $e.vidpid_key      # ex: "VID_046D&PID_C077&Col01"
         $currentInst  = $e.new_instance    # nome da subchave apos spoof
@@ -266,15 +394,22 @@ if ($Restore) {
         $origPathPs   = Join-Path $parentPs $origInst
 
         if (-not (Test-Path $parentPs)) {
+            # Parent VID&PID sumiu - PnP removeu o device. Nada spoofado aqui.
             Write-Warn ("Parent VID&PID ausente (device removido?): " + $vidPidKey)
             continue
         }
         if (-not (Test-Path $curPathPs)) {
+            # Instancia spoofada foi embora - ou PnP re-enumerou, ou usuario deletou.
+            # Nada a restaurar; entrada obsoleta.
             Write-Warn ("Instance spoofada ausente: " + $vidPidKey + "\" + $currentInst)
             continue
         }
         if (Test-Path $origPathPs) {
+            # Ambas as instancias coexistem (spoofada + original) - PnP re-enumerou
+            # e recriou a original ao lado da fake. Nao restauramos (fake ainda existe),
+            # marcamos para preservacao do backup para investigacao manual.
             Write-Warn ("Original ja re-existe (PnP re-enumerou): " + $vidPidKey + "\" + $origInst)
+            $stillSpoofed += $e
             continue
         }
 
@@ -283,13 +418,29 @@ if ($Restore) {
             continue
         }
 
+        # InstanceIds completos para PnP suspend/resume. No Restore comeca com
+        # nome SPOOFADO ($currentInst) e termina com nome ORIGINAL ($origInst).
+        $currentInstanceId  = "HID\" + $vidPidKey + "\" + $currentInst
+        $restoredInstanceId = "HID\" + $vidPidKey + "\" + $origInst
         $tmpFile = Join-Path $env:TEMP ("hid-restore-" + [guid]::NewGuid().ToString() + ".reg")
+        $deviceWasSuspended = $false
         try {
+            $deviceWasSuspended = Suspend-DeviceForRename -InstanceId $currentInstanceId
+
             [void](Invoke-Reg -RegArgs @("export", $curPathReg, $tmpFile, "/y"))
             $content = Get-Content -Path $tmpFile -Raw -Encoding Unicode
 
-            $escCur = [regex]::Escape($currentInst)
-            $newContent = [regex]::Replace($content, $escCur, $origInst, 'IgnoreCase')
+            # Rename tokenizado (headers + values whitelistados). Substring
+            # casual em outros lugares (hex de pairing Bluetooth etc) NAO eh
+            # tocada. Espelha o guarda-corpo do spoof mode.
+            $newContent = Rename-InstanceInReg -Content $content -ParentKey $vidPidKey `
+                -OldInstance $currentInst -NewInstance $origInst
+
+            $sanityHeaderRe = '(?im)^\[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\HID\\' + `
+                [regex]::Escape($vidPidKey) + '\\' + [regex]::Escape($currentInst) + '(?=[\\\]])'
+            if ([regex]::IsMatch($newContent, $sanityHeaderRe)) {
+                throw "Sanity check falhou: section header da instance spoofada ainda presente apos rename."
+            }
 
             Set-Content -Path $tmpFile -Value $newContent -Encoding Unicode -NoNewline
             [void](Invoke-Reg -RegArgs @("import", $tmpFile))
@@ -299,21 +450,55 @@ if ($Restore) {
             Write-OK ("Restaurado: " + $vidPidKey + "\" + $currentInst + " -> " + $origInst)
         } catch {
             Write-Err ("Falha restaurando " + $currentInst + ": " + $_.Exception.Message)
+            $failedRestore++
+            $stillSpoofed += $e   # preservar entrada no backup para retry
         } finally {
             if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+            if ($deviceWasSuspended) {
+                # Prefer novo path (rename bem-sucedido) senao velho (rename falhou).
+                if (Test-Path (Join-Path (Join-Path $hidRootPs $vidPidKey) $origInst)) {
+                    Resume-DeviceForRename -InstanceId $restoredInstanceId
+                } else {
+                    Resume-DeviceForRename -InstanceId $currentInstanceId
+                }
+            }
         }
     }
 
-    if (-not $DryRun -and $restored -gt 0) {
-        try {
-            Remove-Item $backupPath -Force -ErrorAction SilentlyContinue
-            if (Test-Path $mappingPath) { Remove-Item $mappingPath -Force -ErrorAction SilentlyContinue }
-            Write-OK "Backup e mapping removidos"
-        } catch {}
+    # Preserva backup+mapping se qualquer entrada ficou pra tras (throw duro,
+    # ou original co-existindo com fake). Sem essa guarda, falha parcial apaga
+    # o backup e deixa devices spoofados sem caminho de reversao.
+    if (-not $DryRun) {
+        if ($stillSpoofed.Count -eq 0) {
+            # Sucesso total OU todas as entradas viraram obsoletas (parent/spoof gone).
+            try {
+                Remove-Item $backupPath -Force -ErrorAction SilentlyContinue
+                if (Test-Path $mappingPath) { Remove-Item $mappingPath -Force -ErrorAction SilentlyContinue }
+                Write-OK "Backup e mapping removidos (nada pendente)"
+            } catch {}
+        } else {
+            # Re-escreve o backup so com as entradas ainda pendentes de restore.
+            # Mesmo padrao merge de spoof-mode (linhas 630-650) para atomicidade.
+            $newBkp = [pscustomobject]@{
+                generated_at = (Get-Date).ToString('o')
+                entries      = $stillSpoofed
+            }
+            $tmpBkp = $backupPath + ".tmp"
+            try {
+                $newBkp | ConvertTo-Json -Depth 6 | Set-Content -Path $tmpBkp -Encoding UTF8
+                Move-Item -Path $tmpBkp -Destination $backupPath -Force
+                Write-Warn ("Backup preservado com " + $stillSpoofed.Count + " entrada(s) pendente(s) em " + $backupPath)
+                Write-Warn ("Falhas duras: " + $failedRestore + " - investigue e re-execute -Restore")
+            } catch {
+                Write-Err ("Falha reescrevendo backup: " + $_.Exception.Message)
+                Write-Err ("Backup ORIGINAL preservado em " + $backupPath + " - retente -Restore")
+                if (Test-Path $tmpBkp) { Remove-Item $tmpBkp -Force -ErrorAction SilentlyContinue }
+            }
+        }
     }
 
     Write-Section "Resumo restore"
-    Write-Host ("  Restaurados: " + $restored) -ForegroundColor Cyan
+    Write-Host ("  Restaurados: " + $restored + " / falhas: " + $failedRestore + " / pendentes: " + $stillSpoofed.Count) -ForegroundColor Cyan
     Write-Warn "PnP pode re-enumerar no proximo boot - reconferir com check-consistency.ps1"
     exit 0
 }
@@ -379,14 +564,33 @@ foreach ($m in $protectedMice) { Write-Info ("  proteg mouse : " + $m) }
 Write-OK ("Keyb instances protegidas  : " + $protectedKbs.Count)
 foreach ($k in $protectedKbs)  { Write-Info ("  proteg keyb  : " + $k) }
 
-# Guarda-corpo #4: se so tem 1 mouse OU 1 keyboard, pula essa classe inteira
-# adicionando um marcador. Como toda instance dessa classe esta em $protectedMice
-# ou $protectedKbs, ela ja sera pulada. Nada a fazer explicitamente aqui alem
-# de LOGAR - a decisao efetiva ocorre no loop (skip por match em protegido).
-if ($protectedMice.Count -le 1) {
+# Guarda-corpo #4 (endurecido pos-review): ABORT quando count e ZERO, senao o
+# loop nao tem nada pra comparar contra e o teclado/mouse ativo cai no rename.
+# Cenarios que produzem Count==0 mesmo com input ativo:
+#   - HID interface enumerada como KEYBOARD\HID_DEVICE_SYSTEM_KEYS\... em vez
+#     de HID\VID_*; o filtro InstanceId -like 'HID\*' em Get-ProtectedInstances
+#     descarta a entrada
+#   - Win32_Keyboard.PNPDeviceID como ACPI\PNP0303\... (PS/2 phantom em
+#     ACPI keyboards)
+#   - WMI complementar falhou silenciosamente (Get-ProtectedInstancesFromWmi
+#     empty catch retorna @())
+# Nesses casos preferimos ABORTAR o script inteiro a arriscar brickar o input.
+if ($protectedMice.Count -eq 0) {
+    Write-Err "Zero mouses detectados via Get-PnpDevice+WMI - protection list vazia."
+    Write-Err "Rodar spoof-hid-ids.ps1 sem protecao pode renomear a subchave HID do mouse ativo."
+    Write-Err "Abortando. Verifique: Get-PnpDevice -Class Mouse -PresentOnly"
+    exit 1
+}
+if ($protectedKbs.Count -eq 0) {
+    Write-Err "Zero teclados detectados via Get-PnpDevice+WMI - protection list vazia."
+    Write-Err "Rodar spoof-hid-ids.ps1 sem protecao pode renomear a subchave HID do teclado ativo."
+    Write-Err "Abortando. Verifique: Get-PnpDevice -Class Keyboard -PresentOnly"
+    exit 1
+}
+if ($protectedMice.Count -eq 1) {
     Write-Warn "Apenas 1 mouse presente - nenhuma redundancia; qualquer HID de mouse sera pulado."
 }
-if ($protectedKbs.Count -le 1) {
+if ($protectedKbs.Count -eq 1) {
     Write-Warn "Apenas 1 teclado presente - nenhuma redundancia; qualquer HID de keyboard sera pulado."
 }
 
@@ -497,23 +701,53 @@ foreach ($vk in $vidPidKeys) {
             continue
         }
 
+        # InstanceIds completos para PnP suspend/resume. Comeca com ORIGINAL
+        # ($instName), termina com SPOOFADO ($newInst).
+        $oldInstanceId = "HID\" + $vidPidName + "\" + $instName
+        $newInstanceId = "HID\" + $vidPidName + "\" + $newInst
         $tmpFile = Join-Path $env:TEMP ("hid-swap-" + [guid]::NewGuid().ToString() + ".reg")
+        $deviceWasSuspended = $false
+        $fakeCreated = $false
         try {
+            $deviceWasSuspended = Suspend-DeviceForRename -InstanceId $oldInstanceId
+
             [void](Invoke-Reg -RegArgs @("export", $instPathReg, $tmpFile, "/y"))
             $content = Get-Content -Path $tmpFile -Raw -Encoding Unicode
 
-            # Substituicao textual do instance name no conteudo do .reg. Preservamos
-            # tudo o mais (parent path VID&PID, ClassGUID, HardwareID etc).
-            $escInst = [regex]::Escape($instName)
-            $newContent = [regex]::Replace($content, $escInst, $newInst, 'IgnoreCase')
+            # Rename tokenizado: reescreve so section headers do nosso subtree
+            # e valores whitelistados. Substring casual do instance name em hex
+            # de Bluetooth pairing / GUID fragments FICA intacta.
+            $newContent = Rename-InstanceInReg -Content $content -ParentKey $vidPidName `
+                -OldInstance $instName -NewInstance $newInst
 
-            if ([regex]::IsMatch($newContent, $escInst, 'IgnoreCase')) {
-                throw "Sanity check falhou: instance name original ainda presente apos replace."
+            $sanityHeaderRe = '(?im)^\[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Enum\\HID\\' + `
+                [regex]::Escape($vidPidName) + '\\' + [regex]::Escape($instName) + '(?=[\\\]])'
+            if ([regex]::IsMatch($newContent, $sanityHeaderRe)) {
+                throw "Sanity check falhou: section header do instance original ainda presente apos rename."
             }
 
             Set-Content -Path $tmpFile -Value $newContent -Encoding Unicode -NoNewline
             [void](Invoke-Reg -RegArgs @("import", $tmpFile))
-            [void](Invoke-Reg -RegArgs @("delete", $instPathReg, "/f"))
+            $fakeCreated = $true
+
+            # Delete original com retry-with-backoff. PnP as vezes segura handle
+            # por milissegundos extras apos Disable-PnpDevice; 3 tentativas com
+            # 100ms de espera cobrem sharing violation transitorio.
+            $deleteOk = $false
+            $lastDeleteErr = $null
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    [void](Invoke-Reg -RegArgs @("delete", $instPathReg, "/f"))
+                    $deleteOk = $true
+                    break
+                } catch {
+                    $lastDeleteErr = $_.Exception.Message
+                    if ($attempt -lt 3) { Start-Sleep -Milliseconds 100 }
+                }
+            }
+            if (-not $deleteOk) {
+                throw ("delete do original falhou apos 3 tentativas: " + $lastDeleteErr)
+            }
 
             $backupEntries += [pscustomobject]@{
                 vidpid_key    = $vidPidName
@@ -528,8 +762,32 @@ foreach ($vk in $vidPidKeys) {
             Write-OK ($mapKey + "  ->  " + $newInst)
         } catch {
             Write-Err ("Falha spoof " + $mapKey + ": " + $_.Exception.Message)
+            # Rollback: se o fake foi criado mas o delete do original falhou,
+            # apagar o fake evita o "double-record" que o CAVEAT do PnP alerta
+            # (fake + original coexistindo sob mesmo VID&PID). Next-run
+            # fake-of-fake cascade fica prevenida.
+            if ($fakeCreated) {
+                $newInstPathReg = "$hidRoot\$vidPidName\$newInst"
+                $newInstPathPs2 = Join-Path (Join-Path $hidRootPs $vidPidName) $newInst
+                if (Test-Path $newInstPathPs2) {
+                    try {
+                        [void](Invoke-Reg -RegArgs @('delete', $newInstPathReg, '/f'))
+                        Write-Warn ("  Rollback: fake " + $newInst + " removido")
+                    } catch {
+                        Write-Warn ("Rollback do fake tambem falhou: " + $_.Exception.Message)
+                    }
+                }
+            }
         } finally {
             if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+            if ($deviceWasSuspended) {
+                # Prefer novo path (rename bem-sucedido) senao velho (rename falhou).
+                if (Test-Path (Join-Path (Join-Path $hidRootPs $vidPidName) $newInst)) {
+                    Resume-DeviceForRename -InstanceId $newInstanceId
+                } else {
+                    Resume-DeviceForRename -InstanceId $oldInstanceId
+                }
+            }
         }
     }
 }

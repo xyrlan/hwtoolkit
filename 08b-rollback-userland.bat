@@ -149,11 +149,11 @@ if exist "%HWCFG%\emac-uuid-backup.json" (
 
 rem --- 10. Audio GUIDs ---
 echo [*] Restaurando Audio GUIDs...
-if exist "%HWCFG%\audio-guids-backup.json" (
+if exist "%HWCFG%\audio-rotation.json" (
     powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPTS%\spoof-audio-guids.ps1" -Restore %DRYRUN_ARG%
     if %errorlevel% neq 0 set "STATUS=FAIL(audio-guids)"
 ) else (
-    echo     (audio-guids-backup.json ausente, pulando)
+    echo     (audio-rotation.json ausente, pulando)
 )
 
 rem --- 11. MAC (nao suportado) ---
