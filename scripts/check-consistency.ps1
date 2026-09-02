@@ -313,22 +313,26 @@ function Read-CallbackStatus {
         Write-Host ("  [*]    Track D CallbackNonRubiParentMatch: {0}" -f $nrp) -ForegroundColor $color
         if ($nrp -gt 0) {
             Write-Host "         Algum processo nao-rubinot tocou nossos target parents." -ForegroundColor DarkGray
-            Write-Host "         Rodar 'track-d-arm.ps1 -Diagnose' para ver ring buffer (last 16 hits)." -ForegroundColor DarkGray
+            Write-Host "         Rodar 'track-d-arm.ps1 -Diagnose' para ver ring buffer (last N hits: 128 em v5.0.6+, 16 em pre-v5.0.6)." -ForegroundColor DarkGray
         }
     }
 
     # v5.0.5 Phase 0: ring buffer sanity summary. Full decode em
     # track-d-arm.ps1 -Diagnose; aqui so contagem de slots ocupados
     # e breakdown gated vs non-rubi.
+    # v5.0.6 Phase 0: slot count derivado de ring.Length (era 16 hardcoded;
+    # v5.0.6 default e 128 slots / 12288 bytes; pre-v5.0.6 e 16/1536).
     $ring = (Get-ItemProperty -Path $rstflt -Name 'HitRingBuffer' `
                                -ErrorAction SilentlyContinue).HitRingBuffer
     if ($null -ne $ring -and $ring.Length -ge 96) {
         $recSize = 96
-        $slotCount = [Math]::Min(16, [int]($ring.Length / $recSize))
+        $maxSlots = 2048  # defensive cap
+        $totalSlots = [int]($ring.Length / $recSize)
+        if ($totalSlots -gt $maxSlots) { $totalSlots = $maxSlots }
         # v5.0.5 Phase 2: offset+25 is a kind byte, not a bool:
         #   0=enum non-rubi, 1=enum gated, 2=value gated, 3=value non-rubi.
         $filled = 0; $enumGated = 0; $valGated = 0; $nonrubi = 0
-        for ($i = 0; $i -lt $slotCount; $i++) {
+        for ($i = 0; $i -lt $totalSlots; $i++) {
             $off = $i * $recSize
             $ts = [System.BitConverter]::ToInt64($ring, $off)
             if ($ts -eq 0) { continue }
@@ -339,7 +343,43 @@ function Read-CallbackStatus {
                 default { $nonrubi++ }   # 0 (enum non-rubi) or 3 (value non-rubi)
             }
         }
-        Write-Host ("  [*]    Track D HitRingBuffer: {0}/16 slots ({1} enum-gated, {2} value-gated, {3} non-rubi)" -f $filled, $enumGated, $valGated, $nonrubi) -ForegroundColor DarkGray
+        Write-Host ("  [*]    Track D HitRingBuffer: {0}/{1} slots ({2} enum-gated, {3} value-gated, {4} non-rubi)" -f $filled, $totalSlots, $enumGated, $valGated, $nonrubi) -ForegroundColor DarkGray
+    }
+
+    # v5.0.6 Phase 0: synthesizer scaffolding gate + counters. SynthHit_*
+    # + Synth*Bail are all zero in Phase 0 (Phase 2 wires the bumps);
+    # measure-first (ValHit_LocationInfo/Paths/ContainerID) ARE wired now.
+    # Only shown if the value exists (backward-compat with pre-v5.0.6).
+    $evs = (Get-ItemProperty -Path $rstflt -Name 'EnableValueSynth' `
+                              -ErrorAction SilentlyContinue).EnableValueSynth
+    if ($null -ne $evs) {
+        $color = if ($evs -eq 1) { 'Cyan' } else { 'DarkGray' }
+        Write-Host ("  [*]    Track D EnableValueSynth: {0} (v5.0.6 Phase 0 scaffolding; sem reader ate Phase 2)" -f $evs) -ForegroundColor $color
+        $synthNames = @(
+            'CallbackSynthHit_SCSI_FriendlyName','CallbackSynthHit_SCSI_DeviceDesc','CallbackSynthHit_SCSI_Mfg',
+            'CallbackSynthHit_PCI_FriendlyName','CallbackSynthHit_PCI_DeviceDesc','CallbackSynthHit_PCI_Mfg',
+            'CallbackSynthHit_USB_FriendlyName','CallbackSynthHit_HID_FriendlyName','CallbackSynthHit_BTH_FriendlyName',
+            'CallbackSynthTypeMismatchBail','CallbackSynthOverflowBail',
+            'CallbackSynthSizeSanityBail','CallbackSynthInventoryMissBail'
+        )
+        foreach ($n in $synthNames) {
+            $v = (Get-ItemProperty -Path $rstflt -Name $n -ErrorAction SilentlyContinue).$n
+            if ($null -ne $v) {
+                $color = if ($v -gt 0) { 'Green' } else { 'DarkGray' }
+                Write-Host ("  [*]    Track D {0,-40}: {1}" -f $n, $v) -ForegroundColor $color
+            }
+        }
+        # Measure-first triplet - wired in Phase 0. Non-zero here is the
+        # signal for Phase 1 scope: EMAC is reading that value name on a
+        # classified parent.
+        $measureNames = @('CallbackValHit_LocationInfo','CallbackValHit_LocationPaths','CallbackValHit_ContainerID')
+        foreach ($n in $measureNames) {
+            $v = (Get-ItemProperty -Path $rstflt -Name $n -ErrorAction SilentlyContinue).$n
+            if ($null -ne $v) {
+                $color = if ($v -gt 0) { 'Yellow' } else { 'DarkGray' }
+                Write-Host ("  [*]    Track D {0,-40}: {1}" -f $n, $v) -ForegroundColor $color
+            }
+        }
     }
 }
 

@@ -132,7 +132,17 @@ incident-v505-phase1-implementation.md`. v5.0.5 Phase 2 (value-read
 handler `RegNtPostQueryValueKey`): kickoff §5, implementacao + review +
 racional de formato/EDID em `docs/postmortem-v5-track-d/
 incident-v505-phase2-implementation.md`; recipe value-side em
-`docs/track-d-name-recipe.md` §8.
+`docs/track-d-name-recipe.md` §8. **Bare-metal outcome (2026-09-02):**
+sessao RubinOT banida ~11min pos game client apesar do handler engajar
+em escala (214 rewrites, 0 BSOD). Root cause empirico via probe
+`rubinot_probe.exe`: `DeviceDesc`/`FriendlyName`/`Mfg` sao INF-derived
+OEM strings (`"NVIDIA GeForce RTX 3070"`, `"KINGSTON SA400S37480G"`,
+`"(ASMedia,3.20,1.10)"`) e passam cleartext porque substring-replace
+do handler so encontra tokens do parent path (VEN/DEV/SUBSYS/Prod hex)
+que essas strings nao contem. Postmortem: `docs/postmortem-v5-track-d/
+incident-v505-phase2-ban-cleartext-oem-strings.md`. Fix planejado v5.0.6
+(synthesizer independente por (class, value_name)): kickoff em
+`docs/track-d-v506-oem-string-synthesizer-kickoff.md`.
 
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
