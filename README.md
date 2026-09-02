@@ -160,7 +160,36 @@ FNV1a hash map com `TRACKD_PCI_CLASSHINT_*` (enum publica ja landed no
 header) - callback consulta O(1). Nenhuma nova flag de arm; nenhum
 callback wiring; nenhum sanity test - hot path idem Phase 0. Phase 2
 wira dispatch. Postmortem: `docs/postmortem-v5-track-d/incident-v506-
-phase1-implementation.md`.
+phase1-implementation.md`. **v5.0.6 Phase 2 (2026-09-02, PR pending)**
+wira o dispatch: `TRACKD_VALUE_DESCRIPTOR` estendido aditivamente com
+`SynthValueNames + Synthesizer` fields; 3 sintetizadores per-classe
+(SCSI + PCI + BTH; USB + HID **DEFERRED** para Phase 2.1 apos
+adversarial review 6-lens - inferencia parent-only de USB colapsava
+mouse em "Synaptics Fingerprint Reader" - fix precisa de class-code
+hash-map lendo `Enum\USB\...\CompatibleIDs`). Splice em
+`TrackDHandlePostQueryValue`: em gated `rubinot*` lendo DeviceDesc/
+FriendlyName/Mfg em parent SCSI/PCI/BTH classificado, sintetiza da
+MESMA row da MESMA pool (cross-value brand coherence garantida via
+`subSeed = FNV1a64(seed, className)`, NAO valueName) e grava no buffer
+do caller atualizando BOTH `DataLength` AND `*pre->ResultLength`. PCI
+synth adiciona **VenHex sub-filter**: real Nvidia PDO (VEN_10DE em
+HardwareID) so pode virar RTX A4000 ou Tesla T4 - previne o mismatch
+"Nvidia hardware, AMD DeviceDesc" que o review CRITICAL#3 pegou. PCI
+classmap usa `ExInitializeWorkItem + ExQueueWorkItem` (WORK_QUEUE_ITEM
+pattern, mesma forma do TrackDFlushWorker) porque `IoAllocateWorkItem`
+precisa `DEVICE_OBJECT` que fica NULL no BOOT_START DriverEntry. Todos
+os 9 `SynthHit_*` + 4 `Synth*Bail` counters do Phase 0 wirados;
+`SynthHit_*` ortogonal a `ValHit_*` (synth path bumpa apenas
+`SynthHit_<class>_<name>` + `g_TrackDHitCount`, NAO `desc->HitCounter`).
+Nova hitkind `TRACKD_HITKIND_VALUE_GATED_SYNTH=4` no ring buffer +
+decoders em `scripts\check-consistency.ps1` e `-Diagnose`. Sem novo arm
+flag - piggy-backs no `EnableValueSynth` do Phase 0 (arm via
+`.\scripts\track-d-arm.ps1 -EnableSynth`, hot-toggle sem reboot).
+Sanity harness `.\scripts\phase3-sanity-test.ps1` roda PS mirror da
+formula FNV + literal 19-row SCSI pool e prova byte-exato +
+cross-value-coherence + isolation (gated=synth, non-gated=real) +
+hive-non-persistence + hot-toggle round-trip. Postmortem:
+`docs/postmortem-v5-track-d/incident-v506-phase2-implementation.md`.
 
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):

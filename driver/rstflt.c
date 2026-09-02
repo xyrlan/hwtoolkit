@@ -153,6 +153,211 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v5.0.6 - Phase 2 - OEM string synthesizer dispatch wired.
+ *     Scope: wires the Phase 0 scaffolding (9 SynthHit_* + 4 Synth*Bail
+ *     counters, EnableValueSynth arm flag) and the Phase 1 inventory
+ *     (78 curated one-row-per-device rows across 6 prime-sized pools) to
+ *     an actual RegNtPostQueryValueKey dispatch. On a gated
+ *     `rubinot*` caller reading DeviceDesc / FriendlyName / Mfg on a
+ *     classified SCSI / PCI / BTH parent (USB + HID rows deferred to
+ *     Phase 2.1 - see post-review scope reduction below), the callback
+ *     now synthesizes the value from the same row of the same pool as
+ *     every other value-name read on that parent, then writes the synthesized
+ *     bytes into the caller's KEY_VALUE_*_INFORMATION buffer and updates
+ *     BOTH the info-class DataLength AND the REG_POST_OPERATION_INFOR
+ *     MATION->PreInformation->ResultLength. The one-row-per-device
+ *     invariant is the primary v5.0.6 design goal: DeviceDesc /
+ *     FriendlyName / Mfg for a given parent MUST resolve to the same
+ *     row of the same pool so no cross-value brand mismatch (the exact
+ *     detectable-inconsistency class the v5.0.5 Phase 2 ban #5 exposed
+ *     - HardwareID FNV-synthetic while DeviceDesc still cleartext
+ *     "NVIDIA GeForce RTX 3070") can occur.
+ *     - What LANDED (Phase 2):
+ *         * TRACKD_VALUE_DESCRIPTOR extended additively with two
+ *           trailing fields (SynthValueNames + Synthesizer) so the
+ *           existing 5 initializers survive with trailing NULL, NULL.
+ *           Two NEW descriptor rows added: TRACKD_PATH_USB_INSTANCE +
+ *           TRACKD_PATH_HID_INSTANCE (their substring Rewriter is NULL;
+ *           the value handler tolerates a NULL Rewriter for rows that
+ *           only carry a synth).
+ *         * TRACKD_VALUE_SYNTHESIZER typedef + 6 per-class synthesizer
+ *           bodies (SCSI / PCI / USB / HID / BTH; STORAGE not wired -
+ *           kickoff §10 Q7 deferred behind ValHit_Storage = 0 in Phase
+ *           0 / v5.0.5 Phase 2 telemetry). Each synthesizer reads its
+ *           per-class pool from driver/trackd_inventory.h, picks a row
+ *           via subSeed = FNV1a64(g_TrackDSeed, className) and rowIndex
+ *           = (ULONG)((FNV1a64(subSeed, parentPathHash) >> 32) %
+ *           rowCount), and emits the row's DeviceDesc / FriendlyName /
+ *           Mfg column verbatim as REG_SZ (single L'\0'). The row is a
+ *           deterministic function of (seed, className, parent), NOT of
+ *           valueName - so all three value reads land on the SAME row.
+ *         * PCI synthesizer sub-selects by TRACKD_PCI_CLASSHINT (GPU /
+ *           NIC / STORAGE_CTRL / AUDIO / USB_CTRL) via an O(1) 256-slot
+ *           FNV1a(VEN|DEV|SUBSYS|REV) hash map populated OUTSIDE the
+ *           Cm callback lock by TrackDPciClassmapWorker (IoAllocate
+ *           WorkItem on DelayedWorkQueue, scheduled from ArmTrackD).
+ *           Cold-start window (a few hundred ms) reads Ready == 0 ->
+ *           returns TRACKD_PCI_CLASSHINT_UNKNOWN -> synth falls to the
+ *           whole 13-row pool (same behavior as steady-state Option B
+ *           from kickoff §10 Q2, not worse). No Zw* calls inside the
+ *           callback body (contract preserved).
+ *         * HID FriendlyName is passthrough by contract - every HID row
+ *           has FriendlyName = NULL because input.inf does not surface
+ *           FriendlyName for HID collections; synthesizing one would be
+ *           itself a red flag. Dispatcher distinguishes HID passthrough
+ *           from an inventory-miss so SynthInventoryMissBail does not
+ *           fire spuriously.
+ *         * USB xHCI (PCI 0C03 controller) FriendlyName MUST be wrapped
+ *           in the Microsoft resource-frame syntax "@System32\drivers\
+ *           usbxhci.sys,#1073807361;%1 USB %2 eXtensible Host Controller
+ *           - %3 (VendorSynth,X.YZ,A.BC);(VendorSynth,X.YZ,A.BC)". The
+ *           USB pool ships two representative rows carrying both real
+ *           wire patterns (Intel Ice Lake xHCI + Renesas uPD720201)
+ *           verbatim in the FriendlyName column - the synth emits the
+ *           chosen row's FriendlyName without further wrapping.
+ *         * All 9 SynthHit_* counters wired inside the dispatcher on
+ *           the success path (via TrackDSynthHitCounterFor 9-entry
+ *           (PathType, TRACKD_SYNTH_VALUENAME) -> counter lookup).
+ *           All 4 Synth*Bail counters wired on the specific bail
+ *           branches (type mismatch / overflow / size sanity / inventory
+ *           miss). SynthHit_* is orthogonal to ValHit_* - the synth path
+ *           bumps only SynthHit_<class>_<valuename> + g_TrackDHitCount;
+ *           the pre-existing substring path continues to bump ValHit_<
+ *           surface> + g_TrackDHitCount.  A single value read never
+ *           bumps both.
+ *         * TRACKD_HITKIND_VALUE_GATED_SYNTH added (ring-buffer kind 4)
+ *           so post-mortem forensics can distinguish substring vs synth
+ *           engagements from the same ring blob.
+ *         * Variable-length write mechanics: unlike v5.0.5 Phase 2's
+ *           same-length in-place substring rewrite, synth output rarely
+ *           matches the real value's byte count. The dispatcher writes
+ *           into (KeyValueInformation + vDataOff) up to the caller's
+ *           residual capacity (pre->Length - vDataOff), then updates
+ *           BOTH the info-class DataLength field (offset varies per
+ *           info class - KeyValuePartialInformation/Align64 vs KeyValue
+ *           FullInformation/Align64) AND pre->ResultLength (vDataOff +
+ *           newDataBytes). On synth output larger than the residual
+ *           buffer -> SynthOverflowBail + passthrough (never partial
+ *           copy, never truncate).
+ *         * Substring stage still runs for HardwareID / CompatibleIDs
+ *           unchanged. Value names now in BOTH ValueNames (substring
+ *           allow-list) AND SynthValueNames (synth allow-list) resolve
+ *           to synth path first; on a synth bail the dispatcher falls
+ *           through to the substring Rewriter if any (currently BTH
+ *           DeviceDesc is the one overlap - substring path is inert on
+ *           that string, synth replaces it entirely).
+ *         * NO new arm flag - piggy-backs on Phase 0's EnableValueSynth
+ *           (REG_DWORD, hot-toggle already wired). Reader in this Phase.
+ *         * No DriverUnload registered (v3.6 lifecycle contract, filter
+ *           attachments prevent unload); classmap allocation lives for
+ *           the driver's lifetime. No teardown path needed.
+ *     - Safety invariants preserved:
+ *         * No Zw* inside RstRegistryCallback body OR any function
+ *           reachable from it (dispatcher, 6 synthesizers, classmap
+ *           lookup all Zw-free). The Zw* walk in TrackDPciClassmapWorker
+ *           runs on DelayedWorkQueue OUTSIDE the Cm callback lock.
+ *         * PASSIVE_LEVEL contract; PAGED_CODE + NT_ASSERT preserved.
+ *         * Pool tag scheme: existing 'tRsF' (generic) + 'FRDT' (flush
+ *           ringSnap) unchanged; new 'IDRT' for the 256 * sizeof(SLOT)
+ *           = 2048-byte NonPagedPoolNx classmap. On classmap alloc
+ *           failure the driver keeps running - callback returns
+ *           TRACKD_PCI_CLASSHINT_UNKNOWN forever, synth falls to whole
+ *           pool (soft degradation, no BSOD).
+ *         * Sub-seed determinism: FNV mixer ONLY, NO time inputs. Same
+ *           seed + same hardware -> same synth across boots.
+ *         * MachineGuid + ComputerName + CPU stay OUT of kernel scope
+ *           (Level A userland covers them; kernel double-spoof would
+ *           desync from userland).
+ *         * EDID stays behind its Phase 2 v5.0.5 double gate; the EDID
+ *           descriptor row is NOT extended with a synthesizer (existing
+ *           substring rewriter suffices; EDID synth is roadmap-v41
+ *           territory if any).
+ *         * @rstsyn INF-reference syntax stays absent from every value
+ *           string. Phase 1 review stripped it; Phase 2 does not
+ *           reintroduce.
+ *         * Prime-sized pool invariant preserved (Phase 2 dereferences,
+ *           does not add rows). Any Phase 1.5+ additions MUST keep
+ *           prime count OR mitigate modulo bias.
+ *     - Post-review scope reduction (6-lens adversarial pass, 2026-09-02):
+ *         * USB + HID descriptor rows DEFERRED to Phase 2.1 (CRITICAL#1
+ *           + CRITICAL#2).  Parent-only USB class inference collapsed
+ *           every single-interface USB peripheral into the 2-row
+ *           GENERIC bucket (mouse -> "Synaptics Fingerprint Reader");
+ *           and USB / HID HardwareID stays real by design (PnP binding)
+ *           while OEM strings would synth = trivial VID-vs-Mfg
+ *           mismatch pair.  Phase 2.1 will land a class-code hash-map
+ *           (mirror of the PCI classmap) reading Enum\USB\.../
+ *           CompatibleIDs before rewiring those rows.
+ *         * PCI CRITICAL#3 fix landed inline: TrackDValueSynthPci now
+ *           sub-filters the pool by VenHex == parent's real VEN_XXXX
+ *           after the ClassHint filter, so a real Nvidia PDO (VEN_10DE
+ *           in HardwareID) can only receive DeviceDesc/FriendlyName/
+ *           Mfg from an Nvidia-VenHex pool row (RTX A4000 / Tesla T4).
+ *           On VenHex miss, falls back to ClassHint subset then whole
+ *           pool (documented in TrackDValueSynthPci comment).
+ *         * PCI classmap workitem switched from IoAllocateWorkItem to
+ *           ExInitializeWorkItem + ExQueueWorkItem (HIGH#8): the
+ *           BOOT_START DiskDrive UpperFilter's DrvObj->DeviceObject is
+ *           NULL at ArmTrackD time (AddDevice hasn't run), so
+ *           IoAllocateWorkItem would fail silently.  Ex* pattern needs
+ *           no DEVICE_OBJECT and matches TrackDFlushWorker's shape.
+ *         * Pre-filter TrackDValueNameIsInteresting + non-rubi
+ *           diagnostic now NULL-guard ValueNames / SynthValueNames
+ *           before TrackDValueNameAllowed (HIGH pre-filter): the
+ *           "NULL == any" contract inside TrackDValueNameAllowed would
+ *           otherwise let a NULL-list descriptor mark every named read
+ *           interesting.
+ *         * Synth-success path skips desc->HitCounter increment
+ *           (MEDIUM ValHit double-count) so SynthHit_<class>_<name>
+ *           and ValHit_<class> stay orthogonal per the changelog
+ *           contract in the initial Phase 2 draft.
+ *         * Synth SEH widened to cover both dispatch AND *pre->Result
+ *           Length write (HIGH ResultLength): fault-safe against a
+ *           hostile caller with a bad out-pointer.
+ *     - What DEFERRED past Phase 2:
+ *         * STORAGE\Volume synthesizer wiring (Q7): defensive pool
+ *           exists in inventory.h (7 rows) but Phase 2 leaves STORAGE
+ *           descriptor row's Synthesizer = NULL. ValHit_Storage = 0
+ *           across 269M invocations in v5.0.5 Phase 2 telemetry. Flip
+ *           on in a one-line follow-up commit if future bare-metal
+ *           telemetry shows hits.
+ *         * USB + HID descriptor rows (see post-review block above).
+ *         * SCSI HardwareID token synthesis using SCSI inventory row's
+ *           VendorPadded / Product / Rev columns (kickoff §5): the
+ *           existing v5.0.5 Phase 2 substring TrackDValueRewriteScsi
+ *           already derives synthetic tokens byte-exact from the parent
+ *           path via FNV; cross-consistency (HardwareID inquiry-triple
+ *           vs DeviceDesc / FriendlyName) is preserved by the shared
+ *           FNV mixer inputs, NOT by pool row lookup. If future
+ *           telemetry shows a mismatch, defer to v5.0.7.
+ *         * USB device-class inference beyond parent-path token
+ *           heuristics (VID_/PID_/MI_/&BluetoothLE): reading the USB
+ *           descriptor from within the Cm callback would require Zw*
+ *           on the parent's Properties subkey or a USB stack IRP -
+ *           deferred; parent-only inference is the pragmatic choice.
+ *         * HID DeviceDesc / HID Mfg per-value counters (Q8): only
+ *           SynthHit_HID_FriendlyName exists in the counter set; HID
+ *           DeviceDesc / Mfg hits bucket into g_TrackDHitCount only.
+ *         * Descriptor value-side property-store cache invalidation
+ *           (kickoff §10 Q1 - if SetupDiGetDeviceRegistryProperty reads
+ *           from the property store cache, Phase 2 covers only the
+ *           registry path). Bare-metal ban outcome tree drives Q1
+ *           resolution after Phase 2 ship; see kickoff §8.
+ *     - Sanity harness: scripts/phase3-sanity-test.ps1 (NEW). Copies
+ *       rubinot_probe.exe to guest, runs gated + non-gated reads,
+ *       asserts synth output byte-exact against expected pool rows
+ *       from a known seed, asserts hive non-persistence (synth writes
+ *       to caller's buffer, not ZwSetValueKey), asserts hot-toggle
+ *       (EnableValueSynth -> tap -> engaged / disarm -> tap -> pass).
+ *     - Companion userland: scripts/track-d-arm.ps1 gained
+ *       -EnableSynth / -DisableSynth in Phase 0; no additional edits
+ *       needed - the arm flag reader landed in this Phase without a
+ *       schema change.  scripts/check-consistency.ps1 already decodes
+ *       the 9 SynthHit + 4 Bail counters (declared dormant in Phase 0);
+ *       Phase 2 makes their non-zero values reflect real engagements.
+ *     See docs/track-d-v506-oem-string-synthesizer-kickoff.md §5 for
+ *     the dispatch design + docs/postmortem-v5-track-d/incident-v506-
+ *     phase2-implementation.md for the Phase 2 writeup.
  * v5.0.6 - Phase 1 - OEM string synthesizer inventory curation.
  *     Scope: DATA + CONTRACTS only. No callback wiring, no synthesizer
  *     body, no reader on top of the Phase 0 measure-first hooks. Hot
@@ -1397,6 +1602,11 @@ const char RstFltVersion[] = "RstFlt-v5.0.6-BUILD-MARKER";
 #define TRACKD_HITKIND_ENUM_GATED    1u
 #define TRACKD_HITKIND_VALUE_GATED   2u
 #define TRACKD_HITKIND_VALUE_NONRUBI 3u
+/* v5.0.6 Phase 2 - a value-side engagement that landed via the OEM string
+ * synthesizer path (not the same-length substring rewriter). Distinct from
+ * TRACKD_HITKIND_VALUE_GATED so post-mortem forensics can bucket substring
+ * vs synth engagements from the same ring blob. */
+#define TRACKD_HITKIND_VALUE_GATED_SYNTH 4u
 
 /* Suffix on our OWN Parameters key path for the write-tap that lets
  * userland toggle RubinOtPid + EnableRegCallback without a rebooted
@@ -1469,6 +1679,15 @@ const char RstFltVersion[] = "RstFlt-v5.0.6-BUILD-MARKER";
 #define TRACKD_TAG_BUFFER_BAD     0x04u  /* KEY_INFORMATION malformed  */
 #define TRACKD_TAG_ALLOC_FAIL     0x05u  /* NonPagedPoolNx alloc fail  */
 #define TRACKD_TAG_SEH_FAULT      0x06u  /* __except caught fault      */
+/* v5.0.6 Phase 2 - separate SEH fault tag for the synth dispatch splice
+ * so a fault inside the synthesizer vs the substring Rewriter can be told
+ * apart from a single LastCallbackStatus decode. */
+#define TRACKD_TAG_SEH_FAULT_SYNTH 0x07u  /* __except in synth dispatch */
+/* v5.0.6 Phase 2 - classmap workitem couldn't allocate its 2048-byte slot
+ * table. Written to LastCallbackStatus from the workitem body (safe: work
+ * item runs outside the Cm callback stack). Callback then reads Ready == 0
+ * forever and synth falls to the whole PCI pool. Soft degradation. */
+#define TRACKD_TAG_CLASSMAP_ALLOC_FAIL 0x08u  /* PCI classmap alloc fail */
 
 /* v5.0.1 - path type classifier result for the intercepted parent
  * enumeration key. Returned by TrackDClassifyParent; used by
@@ -1506,14 +1725,49 @@ typedef BOOLEAN (*TRACKD_VALUE_PARENT_MATCHER)(PCUNICODE_STRING parent);
 typedef VOID    (*TRACKD_VALUE_REWRITER)(PCUNICODE_STRING parent, ULONG valueType,
                                          PUCHAR data, ULONG dataBytes);
 
+/* v5.0.6 Phase 2 - OEM string synthesizer function pointer.  Separate
+ * contract from TRACKD_VALUE_REWRITER (which mutates same-length in
+ * place):  a synthesizer PRODUCES a replacement value from the per-class
+ * inventory row for (parent, valueName), writes it into `outBuffer` up
+ * to `outBufferCbBytes` capacity, and reports the emitted byte count via
+ * `*outCbBytes`.  Returns TRUE on synthesized-into-outBuffer, FALSE on
+ * any bail (caller passes through the real value and bumps the specific
+ * Synth*Bail counter for the reason).  All byte counts are in BYTES, not
+ * WCHAR count.  Emits REG_SZ (single L'\0' terminator); REG_MULTI_SZ /
+ * REG_EXPAND_SZ are rejected as type-mismatch bails until Phase 2.5 adds
+ * multi-null preservation.  Runs at PASSIVE_LEVEL under the dispatcher's
+ * SEH block; MUST NOT call Zw*.
+ *
+ * The distinguished return `outCbBytes == 0 && retval == TRUE` signals
+ * "HID FriendlyName passthrough" (input.inf does not set FriendlyName
+ * for HID collections, and synthesizing one is itself a red flag); the
+ * dispatcher then leaves the caller's buffer untouched and does NOT
+ * bump SynthInventoryMissBail.  Any other synth that returns TRUE with
+ * outCbBytes == 0 is a bug (would tell the caller the value is empty),
+ * so ONLY the HID FriendlyName synth uses this convention. */
+typedef BOOLEAN (*TRACKD_VALUE_SYNTHESIZER)(PCUNICODE_STRING parent,
+                                            ULONG synthValueName, /* TRACKD_SYNTH_VALUENAME */
+                                            ULONG valueType,
+                                            PUCHAR outBuffer,
+                                            SIZE_T outBufferCbBytes,
+                                            PSIZE_T outCbBytes);
+
 typedef struct _TRACKD_VALUE_DESCRIPTOR {
     UCHAR                        PathType;    /* TRACKD_PATH_TYPE enum      */
     const char *                 Label;       /* ring-buffer label          */
     TRACKD_VALUE_PARENT_MATCHER  MatchParent;
     const WCHAR * const *        ValueNames;  /* NULL-terminated allow-list */
-    TRACKD_VALUE_REWRITER        Rewriter;
-    volatile LONG *              HitCounter;  /* per-surface value counter  */
+    TRACKD_VALUE_REWRITER        Rewriter;    /* may be NULL (synth-only)   */
+    volatile LONG *              HitCounter;  /* per-surface value counter; may be NULL */
     BOOLEAN                      NeedsEdidGate;/* TRUE => EnableEdidValueRewrite */
+    /* v5.0.6 Phase 2 - APPEND-ONLY extension.  Existing 5 initializers stay
+     * valid by trailing NULL, NULL for classes with no synthesizer.  A row
+     * whose Synthesizer is NULL is substring-only (v5.0.5 Phase 2
+     * behavior).  A row whose Rewriter is NULL is synth-only (new USB and
+     * HID rows).  A row with BOTH prefers Synth: on synth bail the
+     * dispatcher falls through to the substring Rewriter. */
+    const WCHAR * const *        SynthValueNames; /* NULL-terminated synth allow-list */
+    TRACKD_VALUE_SYNTHESIZER     Synthesizer;     /* NULL => no synth for this class */
 } TRACKD_VALUE_DESCRIPTOR;
 
 /* ================================================================
@@ -1639,6 +1893,44 @@ static UNICODE_STRING  g_TrackDEnableValSynthName; /* EnableValueSynth (tap) */
 static UNICODE_STRING  g_TrackDValNameLocationInfo;
 static UNICODE_STRING  g_TrackDValNameLocationPaths;
 static UNICODE_STRING  g_TrackDValNameContainerID;
+/* v5.0.6 Phase 2 - USB / HID parent-path markers were declared here in
+ * the initial Phase 2 draft.  Removed after the 5-lens review (see the
+ * v5.0.6 Phase 2 changelog block above): USB / HID synth rows deferred
+ * to Phase 2.1 pending class-code hash-map inference, so the markers
+ * have no consumer this phase.  When Phase 2.1 relands, restore
+ * g_TrackDUsbMarker + g_TrackDHidMarker here plus their ArmTrackD
+ * RtlInitUnicodeString + descriptor rows below. */
+/* v5.0.6 Phase 2 - PCI classmap.  256 open-addressed slots keyed by
+ * FNV1a32(VEN|DEV|SUBSYS|REV) of a PCI parent path.  Written ONCE by
+ * TrackDPciClassmapWorker (IoWorkItem on DelayedWorkQueue) OUTSIDE the
+ * Cm callback lock; then flipped ready via InterlockedExchange release
+ * semantics.  After ready, the callback reads slots as read-only with
+ * NO further synchronization.  Alloc failure = callback keeps returning
+ * TRACKD_PCI_CLASSHINT_UNKNOWN forever = synth falls to whole 13-row
+ * pool (soft degradation, documented; no BSOD).
+ *
+ * KeyHash == 0 sentinel means empty slot.  FNV1a32 over any 4+ non-zero
+ * input bytes is nonzero (FNV mixer's zero-input product is nonzero and
+ * our key input is always at least VEN_XXXX ~ 4+ ASCII characters), so
+ * the sentinel is safe.  Linear probing on collision; first-writer wins
+ * (workitem is the only writer). */
+typedef struct _TRACKD_PCI_CLASSMAP_SLOT {
+    ULONG   KeyHash;                    /* FNV1a32; 0 = empty              */
+    UCHAR   ClassHint;                  /* TRACKD_PCI_CLASSHINT_* value    */
+    UCHAR   Reserved[3];                /* pad to 8-byte alignment         */
+} TRACKD_PCI_CLASSMAP_SLOT;
+
+#define TRACKD_PCI_CLASSMAP_SLOTS 256u
+#define TRACKD_PCI_CLASSMAP_BYTES (TRACKD_PCI_CLASSMAP_SLOTS * sizeof(TRACKD_PCI_CLASSMAP_SLOT))
+
+static TRACKD_PCI_CLASSMAP_SLOT *g_TrackDPciClassmapSlots      = NULL;
+static volatile LONG              g_TrackDPciClassmapReady      = 0;
+static WORK_QUEUE_ITEM            g_TrackDPciClassmapWorkItem;   /* Ex* pattern, no DeviceObject dep */
+static volatile LONG              g_TrackDPciClassmapWorkQueued = 0;
+/* Diagnostic - how many slots the workitem successfully populated.  Read
+ * by check-consistency.ps1 to distinguish cold-start vs steady-state
+ * classmap semantics.  Written from the workitem body only. */
+static volatile LONG              g_TrackDPciClassmapSlotCount  = 0;
 
 /* Rewrite counter (incremented once per successful in-place mutation)
  * plus flush infrastructure. The Cm callback never opens registry
@@ -1929,6 +2221,52 @@ static BOOLEAN  TrackDValueMatchPci(PCUNICODE_STRING parent);
 static BOOLEAN  TrackDValueMatchBth(PCUNICODE_STRING parent);
 static BOOLEAN  TrackDValueMatchStorage(PCUNICODE_STRING parent);
 static BOOLEAN  TrackDValueMatchEdid(PCUNICODE_STRING parent);
+/* v5.0.6 Phase 2 - synth dispatch + per-class synthesizers + helpers.
+ * USB / HID rows DEFERRED after 5-lens review CRITICAL#1 + CRITICAL#2
+ * (see v5.0.6 Phase 2 changelog block above): USB parent-only inference
+ * collapses too many devices into 1-2 pool rows, and USB/HID HardwareID
+ * would stay real while OEM strings synth = trivially detectable brand
+ * mismatch (Logitech VID + Synaptics Mfg).  Phase 2.1 will add class-
+ * code-hashmap-based inference before rewiring those rows. */
+static ULONGLONG               TrackDParentPathHash(PCUNICODE_STRING parent);
+static ULONGLONG               TrackDMixWithSeed(const void *bytes, ULONG len);
+static ULONGLONG               TrackDMixTwo(ULONGLONG seed64, const void *bytes, ULONG len);
+static ULONG                   TrackDInvSelectRowIndex(const WCHAR *className,
+                                                       PCUNICODE_STRING parent,
+                                                       ULONG rowCount);
+static ULONG                   TrackDValueNameToSynthKey(PCUNICODE_STRING valueName);
+static volatile LONG *         TrackDSynthHitCounterFor(UCHAR pathType, ULONG synthKey);
+static TRACKD_PCI_CLASSHINT    TrackDPciClassmapLookup(PCUNICODE_STRING parent);
+static VOID                    TrackDPciClassmapInsert(ULONG keyHash, UCHAR hint);
+static ULONG                   TrackDPciExtractKeyHash(PCUNICODE_STRING parent);
+static BOOLEAN                 TrackDPciExtractVenHex(PCUNICODE_STRING parent, WCHAR outVen[5]);
+static VOID                    TrackDPciClassmapWorker(PVOID Ctx);
+static VOID                    TrackDPciClassmapScheduleFromArm(VOID);
+static BOOLEAN                 TrackDValueSynthDispatch(const TRACKD_VALUE_DESCRIPTOR *desc,
+                                                        PCUNICODE_STRING parent,
+                                                        PCUNICODE_STRING valueName,
+                                                        ULONG valueType,
+                                                        PVOID keyValueInformation,
+                                                        ULONG infoClass,
+                                                        ULONG bufferLen,
+                                                        ULONG dataOffset,
+                                                        ULONG originalDataLen,
+                                                        ULONG *outNewResultLength);
+static BOOLEAN                 TrackDValueSynthScsi(PCUNICODE_STRING parent,
+                                                    ULONG synthKey, ULONG valueType,
+                                                    PUCHAR outBuffer,
+                                                    SIZE_T outBufferCbBytes,
+                                                    PSIZE_T outCbBytes);
+static BOOLEAN                 TrackDValueSynthPci(PCUNICODE_STRING parent,
+                                                   ULONG synthKey, ULONG valueType,
+                                                   PUCHAR outBuffer,
+                                                   SIZE_T outBufferCbBytes,
+                                                   PSIZE_T outCbBytes);
+static BOOLEAN                 TrackDValueSynthBth(PCUNICODE_STRING parent,
+                                                   ULONG synthKey, ULONG valueType,
+                                                   PUCHAR outBuffer,
+                                                   SIZE_T outBufferCbBytes,
+                                                   PSIZE_T outCbBytes);
 static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
                                     PVOID Argument1,
                                     PVOID Argument2);
@@ -4767,6 +5105,871 @@ static VOID TrackDValueRewriteEdid(PCUNICODE_STRING parent, ULONG valueType,
     data[TRACKD_EDID_CHECKSUM_OFF] = (UCHAR)(0u - sum);
 }
 
+/* ================================================================
+ *  v5.0.6 Phase 2 - OEM string synthesizer implementation.
+ *
+ *  All helpers here run at PASSIVE_LEVEL under the Cm callback stack.
+ *  None call Zw* - the ONE Zw* consumer in Phase 2 is TrackDPciClassmap
+ *  Worker, an IoWorkItem body running on DelayedWorkQueue OUTSIDE the
+ *  Cm callback lock.
+ * ================================================================ */
+
+/* Small wrapper: FNV1a64 over a byte range, seeded with the driver's
+ * boot-time seed bytes first (so different hosts get different starts).
+ * Returns 0 when the seed hasn't loaded (mirrors the byte-mixer that
+ * TrackDFillTokenFnv uses on the name side). */
+static ULONGLONG TrackDMixWithSeed(const void *bytes, ULONG len)
+{
+    UCHAR   buf[192];
+    ULONG   bufLen = 0;
+    if (bytes == NULL || len == 0) return 0;
+    if (g_TrackDSeedLen > 0 && g_TrackDSeedLen <= sizeof(buf)) {
+        RtlCopyMemory(buf, g_TrackDSeed, g_TrackDSeedLen);
+        bufLen = g_TrackDSeedLen;
+    }
+    if (bufLen + 1 <= sizeof(buf)) buf[bufLen++] = (UCHAR)'|';
+    if (bufLen + len > sizeof(buf)) len = (ULONG)(sizeof(buf) - bufLen);
+    if (len > 0) {
+        RtlCopyMemory(buf + bufLen, bytes, len);
+        bufLen += len;
+    }
+    return TrackDFnvHash64(buf, bufLen);
+}
+
+/* Chained mixer: FNV1a64(seed64 || '|' || bytes).  Feeds the two-stage
+ * (subSeed, parentPathHash) row-select formula documented in
+ * driver/trackd_inventory.h prologue. */
+static ULONGLONG TrackDMixTwo(ULONGLONG seed64, const void *bytes, ULONG len)
+{
+    UCHAR   buf[192];
+    ULONG   bufLen = 0;
+    if (bufLen + sizeof(seed64) <= sizeof(buf)) {
+        RtlCopyMemory(buf + bufLen, &seed64, sizeof(seed64));
+        bufLen += sizeof(seed64);
+    }
+    if (bufLen + 1 <= sizeof(buf)) buf[bufLen++] = (UCHAR)'|';
+    if (bytes != NULL && len > 0) {
+        if (bufLen + len > sizeof(buf)) len = (ULONG)(sizeof(buf) - bufLen);
+        RtlCopyMemory(buf + bufLen, bytes, len);
+        bufLen += len;
+    }
+    return TrackDFnvHash64(buf, bufLen);
+}
+
+/* Hash of a parent registry-path UNICODE_STRING.  Raw UTF-16LE bytes fed
+ * to FNV so a userland reproducer can match by mirroring the byte layout
+ * (matches the same domain the name-side uses on parent paths). */
+static ULONGLONG TrackDParentPathHash(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL || parent->Length == 0)
+        return 0;
+    return TrackDFnvHash64((const UCHAR *)parent->Buffer, parent->Length);
+}
+
+/* Row-selection helper.  Kickoff §3.5 + trackd_inventory.h prologue:
+ *   subSeed  = FNV1a64(g_TrackDSeed, className)
+ *   rowIndex = (ULONG)((FNV1a64(subSeed, parentPathHash) >> 32) % rowCount)
+ * subSeed depends ONLY on (seed, className) - NOT on valueName - so all
+ * value-name reads on the same parent land on the SAME row.
+ * className is ALWAYS an uppercase ASCII literal ("SCSI", "PCI", "USB",
+ * "HID", "BTH", "STORAGE"); its raw bytes (const char*) feed the mixer
+ * verbatim so a userland reproducer needs no wide-string canonicalization. */
+static ULONG TrackDInvSelectRowIndex(const WCHAR *className,
+                                     PCUNICODE_STRING parent,
+                                     ULONG rowCount)
+{
+    ULONGLONG subSeed;
+    ULONGLONG parentHash;
+    ULONGLONG mixed;
+    ULONG     classChars = 0;
+
+    if (className == NULL || rowCount == 0 || parent == NULL) return 0;
+    while (className[classChars] != L'\0') classChars++;
+    subSeed    = TrackDMixWithSeed((const void *)className, classChars * sizeof(WCHAR));
+    parentHash = TrackDParentPathHash(parent);
+    mixed      = TrackDMixTwo(subSeed, &parentHash, sizeof(parentHash));
+    return (ULONG)((mixed >> 32) % rowCount);
+}
+
+/* WCHAR*-to-TRACKD_SYNTH_VALUENAME resolver.  Case-insensitive.  Returns
+ * TRACKD_SVN_UNKNOWN on miss.  A tiny if-ladder (5 comparisons) rather
+ * than a table because 5 comparisons stay in L1 during a hot registry
+ * read and dodge the pointer chase a wcslen+wcsicmp table would add. */
+static ULONG TrackDValueNameToSynthKey(PCUNICODE_STRING valueName)
+{
+    static const WCHAR NAME_DEVICEDESC[]    = L"DeviceDesc";
+    static const WCHAR NAME_FRIENDLYNAME[]  = L"FriendlyName";
+    static const WCHAR NAME_MFG[]           = L"Mfg";
+    static const WCHAR NAME_HARDWAREID[]    = L"HardwareID";
+    static const WCHAR NAME_COMPATIBLEIDS[] = L"CompatibleIDs";
+    UNICODE_STRING a;
+
+    if (valueName == NULL || valueName->Buffer == NULL || valueName->Length == 0)
+        return TRACKD_SVN_UNKNOWN;
+
+    RtlInitUnicodeString(&a, NAME_DEVICEDESC);
+    if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRACKD_SVN_DEVICEDESC;
+    RtlInitUnicodeString(&a, NAME_FRIENDLYNAME);
+    if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRACKD_SVN_FRIENDLYNAME;
+    RtlInitUnicodeString(&a, NAME_MFG);
+    if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRACKD_SVN_MFG;
+    RtlInitUnicodeString(&a, NAME_HARDWAREID);
+    if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRACKD_SVN_HARDWAREID;
+    RtlInitUnicodeString(&a, NAME_COMPATIBLEIDS);
+    if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRACKD_SVN_COMPATIBLEIDS;
+    return TRACKD_SVN_UNKNOWN;
+}
+
+/* (PathType, TRACKD_SYNTH_VALUENAME) -> counter pointer lookup for the 9
+ * declared SynthHit_* counters.  Returns NULL for combos with no counter
+ * (BTH DeviceDesc / BTH Mfg, HID DeviceDesc / HID Mfg, USB DeviceDesc /
+ * USB Mfg, STORAGE - Phase 0 shipped 9 counters, adding more requires a
+ * flush-worker + userland-decoder edit pass). Dispatcher checks NULL
+ * before InterlockedIncrement (no-op-safe). */
+static volatile LONG *TrackDSynthHitCounterFor(UCHAR pathType, ULONG synthKey)
+{
+    switch (pathType) {
+    case TRACKD_PATH_SCSI:
+        if (synthKey == TRACKD_SVN_FRIENDLYNAME) return &g_TrackDSynthHit_SCSI_FriendlyName;
+        if (synthKey == TRACKD_SVN_DEVICEDESC)   return &g_TrackDSynthHit_SCSI_DeviceDesc;
+        if (synthKey == TRACKD_SVN_MFG)          return &g_TrackDSynthHit_SCSI_Mfg;
+        break;
+    case TRACKD_PATH_PCI:
+        if (synthKey == TRACKD_SVN_FRIENDLYNAME) return &g_TrackDSynthHit_PCI_FriendlyName;
+        if (synthKey == TRACKD_SVN_DEVICEDESC)   return &g_TrackDSynthHit_PCI_DeviceDesc;
+        if (synthKey == TRACKD_SVN_MFG)          return &g_TrackDSynthHit_PCI_Mfg;
+        break;
+    /* v5.0.6 Phase 2 - USB / HID rows deferred; SynthHit_USB_FriendlyName +
+     * SynthHit_HID_FriendlyName counters stay declared (Phase 0 shipped
+     * them) so userland decoders keep the same schema when Phase 2.1
+     * relands.  Cases return NULL here in the meantime. */
+    case TRACKD_PATH_BTH:
+        if (synthKey == TRACKD_SVN_FRIENDLYNAME) return &g_TrackDSynthHit_BTH_FriendlyName;
+        break;
+    default:
+        break;
+    }
+    return NULL;
+}
+
+/* ----- PCI classmap ----- */
+
+/* FNV1a32 wrapper for the classmap key.  Reuses the 64-bit mixer then
+ * folds high/low halves; keeps the key small (4 bytes) so the 256-slot
+ * table stays 2048 bytes and the sentinel (0) collides on ~1/2^32 keys. */
+static ULONG TrackDClassmapKeyHash(const WCHAR *buf, ULONG bufChars)
+{
+    ULONGLONG h64;
+    ULONG    h32;
+    if (buf == NULL || bufChars == 0) return 0;
+    h64 = TrackDFnvHash64((const UCHAR *)buf, bufChars * sizeof(WCHAR));
+    h32 = (ULONG)((h64 >> 32) ^ (h64 & 0xFFFFFFFFu));
+    if (h32 == 0) h32 = 1u; /* keep sentinel free */
+    return h32;
+}
+
+/* Extract "VEN_XXXX&DEV_XXXX&SUBSYS_XXXXXXXX&REV_XX" (or the prefix that
+ * actually appears - PCI parents usually carry all four) from the parent
+ * path, uppercase-canonicalize the hex chars, and hash.  Returns 0 if no
+ * VEN_ token is found (sentinel = empty slot; caller falls through to
+ * UNKNOWN). */
+static ULONG TrackDPciExtractKeyHash(PCUNICODE_STRING parent)
+{
+    static const WCHAR VEN_MARKER[]    = L"VEN_";
+    static const WCHAR DEV_MARKER[]    = L"&DEV_";
+    static const WCHAR SUBSYS_MARKER[] = L"&SUBSYS_";
+    static const WCHAR REV_MARKER[]    = L"&REV_";
+    const WCHAR *p;
+    ULONG plen, idx, end;
+    WCHAR buf[64];  /* VEN_XXXX(4) + &DEV_XXXX(4) + &SUBSYS_XXXXXXXX(8) + &REV_XX(2) = 30+ hex, plus tokens */
+    ULONG bufLen = 0;
+    ULONG i;
+
+    if (parent == NULL || parent->Buffer == NULL || parent->Length == 0) return 0;
+    p = parent->Buffer;
+    plen = parent->Length / sizeof(WCHAR);
+    idx = TrackDFindSubstrI(p, plen, VEN_MARKER, 4);
+    if (idx == (ULONG)-1) return 0;
+
+    /* Copy VEN_ through end-of-tokens (stop at '\\' or end-of-path). */
+    end = idx;
+    while (end < plen && p[end] != L'\\' && bufLen < ARRAYSIZE(buf)) {
+        WCHAR c = p[end];
+        if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        buf[bufLen++] = c;
+        end++;
+    }
+    if (bufLen == 0) return 0;
+
+    /* Discard anything past &REV_XX (some parents append &REV_XX&CC_YYYYYY);
+     * REV_XX + 2 hex is enough to distinguish OEM revs, deeper suffixes
+     * would spread the hash across cosmetic variation and burn slots. */
+    for (i = 0; i + 4 <= bufLen; i++) {
+        if (buf[i] == L'&' && buf[i+1] == L'R' && buf[i+2] == L'E' && buf[i+3] == L'V') {
+            ULONG cap = i + 4 + 1 + 2; /* + '_' + 2 hex */
+            if (cap < bufLen) bufLen = cap;
+            break;
+        }
+    }
+    /* Silence potential unused-marker warnings in future refactors. */
+    UNREFERENCED_PARAMETER(DEV_MARKER);
+    UNREFERENCED_PARAMETER(SUBSYS_MARKER);
+    UNREFERENCED_PARAMETER(REV_MARKER);
+    return TrackDClassmapKeyHash(buf, bufLen);
+}
+
+/* v5.0.6 Phase 2 post-review fix (CRITICAL#3 + HIGH pool-row collision):
+ * Extract the 4-hex VEN_XXXX token from a PCI parent path, uppercase-
+ * canonicalized.  outVen is a 5-WCHAR buffer (4 hex + L'\0').  Returns
+ * FALSE if no valid VEN_XXXX token is found.  Used by TrackDValueSynthPci
+ * to sub-filter the PCI pool by VenHex-matches-real-VEN so a real
+ * Nvidia PDO cannot receive an AMD synth string (the brand-mismatch
+ * class the review confirmed). */
+static BOOLEAN TrackDPciExtractVenHex(PCUNICODE_STRING parent, WCHAR outVen[5])
+{
+    static const WCHAR VEN_MARKER[] = L"VEN_";
+    const WCHAR *p;
+    ULONG plen, idx, i;
+
+    if (outVen == NULL) return FALSE;
+    outVen[0] = L'\0';
+    if (parent == NULL || parent->Buffer == NULL || parent->Length == 0) return FALSE;
+    p = parent->Buffer;
+    plen = parent->Length / sizeof(WCHAR);
+    idx = TrackDFindSubstrI(p, plen, VEN_MARKER, 4);
+    if (idx == (ULONG)-1) return FALSE;
+    idx += 4;
+    if (idx + 4 > plen) return FALSE;
+    for (i = 0; i < 4; i++) {
+        WCHAR c = p[idx + i];
+        if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+        if (!((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F'))) return FALSE;
+        outVen[i] = c;
+    }
+    outVen[4] = L'\0';
+    return TRUE;
+}
+
+/* O(1) classmap read.  Callback path - MUST NOT touch g_TrackDPciClassmap
+ * Slots unless g_TrackDPciClassmapReady == 1.  Linear probing.  Zero Zw*.
+ * Barrier: InterlockedCompareExchange with (val, val) is a full acquire
+ * on x64 (KeMemoryBarrier equivalent) so the slot writes issued before
+ * the InterlockedExchange in the workitem are visible here. */
+static TRACKD_PCI_CLASSHINT TrackDPciClassmapLookup(PCUNICODE_STRING parent)
+{
+    ULONG keyHash, start, i, probes;
+    LONG  ready;
+
+    ready = InterlockedCompareExchange(&g_TrackDPciClassmapReady, 0, 0);
+    if (ready == 0 || g_TrackDPciClassmapSlots == NULL)
+        return TRACKD_PCI_CLASSHINT_UNKNOWN;
+
+    keyHash = TrackDPciExtractKeyHash(parent);
+    if (keyHash == 0) return TRACKD_PCI_CLASSHINT_UNKNOWN;
+    start = keyHash & (TRACKD_PCI_CLASSMAP_SLOTS - 1u);
+    for (probes = 0; probes < TRACKD_PCI_CLASSMAP_SLOTS; probes++) {
+        i = (start + probes) & (TRACKD_PCI_CLASSMAP_SLOTS - 1u);
+        if (g_TrackDPciClassmapSlots[i].KeyHash == 0)
+            return TRACKD_PCI_CLASSHINT_UNKNOWN; /* empty run = key absent */
+        if (g_TrackDPciClassmapSlots[i].KeyHash == keyHash)
+            return (TRACKD_PCI_CLASSHINT)g_TrackDPciClassmapSlots[i].ClassHint;
+    }
+    return TRACKD_PCI_CLASSHINT_UNKNOWN;
+}
+
+/* Workitem-time insert.  Single writer (workitem body); linear probe;
+ * drop on full-circle (256 open slots would require 256 distinct PCI
+ * VEN|DEV|SUBSYS|REV keys on one host, well beyond real PCI populations).
+ * No locking - the callback reader consults Ready flag first, and Ready
+ * flips only after every insert has completed. */
+static VOID TrackDPciClassmapInsert(ULONG keyHash, UCHAR hint)
+{
+    ULONG start, i, probes;
+    if (g_TrackDPciClassmapSlots == NULL || keyHash == 0) return;
+    start = keyHash & (TRACKD_PCI_CLASSMAP_SLOTS - 1u);
+    for (probes = 0; probes < TRACKD_PCI_CLASSMAP_SLOTS; probes++) {
+        i = (start + probes) & (TRACKD_PCI_CLASSMAP_SLOTS - 1u);
+        if (g_TrackDPciClassmapSlots[i].KeyHash == 0) {
+            g_TrackDPciClassmapSlots[i].KeyHash   = keyHash;
+            g_TrackDPciClassmapSlots[i].ClassHint = hint;
+            InterlockedIncrement(&g_TrackDPciClassmapSlotCount);
+            return;
+        }
+        if (g_TrackDPciClassmapSlots[i].KeyHash == keyHash) return; /* first-writer wins */
+    }
+    /* full-circle drop: no telemetry counter for this - a real PCI
+     * population of 256 distinct keys is not observed in the wild. */
+}
+
+/* Map a Windows PnP ClassGUID string (uppercase, {braces}) to our
+ * TRACKD_PCI_CLASSHINT.  The GUIDs below are stable Microsoft PnP class
+ * identifiers documented in the Windows SDK and don't churn across
+ * Windows 10/11.  Any unmatched GUID yields UNKNOWN. */
+static UCHAR TrackDClassGuidToHint(PCWSTR guidStr)
+{
+    /* Display */
+    static const WCHAR CLASS_DISPLAY[]   = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+    /* Net */
+    static const WCHAR CLASS_NET[]       = L"{4d36e972-e325-11ce-bfc1-08002be10318}";
+    /* USB host controllers */
+    static const WCHAR CLASS_USB_HOST[]  = L"{36fc9e60-c465-11cf-8056-444553540000}";
+    /* Media (audio) */
+    static const WCHAR CLASS_MEDIA[]     = L"{4d36e96c-e325-11ce-bfc1-08002be10318}";
+    /* HDAudio */
+    static const WCHAR CLASS_HDAUDIO[]   = L"{c166523c-fe0c-4a94-a586-f1a80cfbbf3e}";
+    /* HDC (IDE/AHCI/SATA storage controllers) */
+    static const WCHAR CLASS_HDC[]       = L"{4d36e96a-e325-11ce-bfc1-08002be10318}";
+    /* SCSIAdapter (SCSI/RAID/SAS/NVMe controllers) */
+    static const WCHAR CLASS_SCSIADAPT[] = L"{4d36e97b-e325-11ce-bfc1-08002be10318}";
+    UNICODE_STRING want, have;
+
+    if (guidStr == NULL) return TRACKD_PCI_CLASSHINT_UNKNOWN;
+    RtlInitUnicodeString(&have, guidStr);
+    RtlInitUnicodeString(&want, CLASS_DISPLAY);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_GPU;
+    RtlInitUnicodeString(&want, CLASS_NET);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_NIC;
+    RtlInitUnicodeString(&want, CLASS_USB_HOST);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_USB_CTRL;
+    RtlInitUnicodeString(&want, CLASS_HDAUDIO);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_AUDIO;
+    RtlInitUnicodeString(&want, CLASS_MEDIA);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_AUDIO;
+    RtlInitUnicodeString(&want, CLASS_HDC);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_STORAGE_CTRL;
+    RtlInitUnicodeString(&want, CLASS_SCSIADAPT);
+    if (RtlEqualUnicodeString(&want, &have, TRUE)) return TRACKD_PCI_CLASSHINT_STORAGE_CTRL;
+    return TRACKD_PCI_CLASSHINT_UNKNOWN;
+}
+
+/* Read a REG_SZ value into a WCHAR buffer, NUL-terminated.  Returns byte
+ * count of the data written (excluding the NUL) on success, 0 on failure.
+ * Runs at PASSIVE_LEVEL in the workitem body ONLY - Zw* usage is legal
+ * here. */
+static ULONG TrackDReadRegSz(HANDLE hKey, PCWSTR valueName,
+                             WCHAR *outBuf, ULONG outBufCbBytes)
+{
+    UNICODE_STRING vn;
+    UCHAR   stackBuf[512];
+    PKEY_VALUE_PARTIAL_INFORMATION info;
+    ULONG   resultLen = 0;
+    NTSTATUS st;
+    ULONG   dataBytes;
+
+    if (hKey == NULL || valueName == NULL || outBuf == NULL || outBufCbBytes < sizeof(WCHAR))
+        return 0;
+    RtlInitUnicodeString(&vn, valueName);
+    info = (PKEY_VALUE_PARTIAL_INFORMATION)stackBuf;
+    st = ZwQueryValueKey(hKey, &vn, KeyValuePartialInformation,
+                         info, sizeof(stackBuf), &resultLen);
+    if (!NT_SUCCESS(st) || info->Type != REG_SZ) return 0;
+    dataBytes = info->DataLength;
+    if (dataBytes == 0 || (dataBytes % sizeof(WCHAR)) != 0) return 0;
+    if (dataBytes > outBufCbBytes - sizeof(WCHAR)) dataBytes = outBufCbBytes - sizeof(WCHAR);
+    RtlCopyMemory(outBuf, info->Data, dataBytes);
+    outBuf[dataBytes / sizeof(WCHAR)] = L'\0';
+    return dataBytes;
+}
+
+/* PCI classmap worker body.  Runs on DelayedWorkQueue (PASSIVE, OUTSIDE
+ * Cm callback lock).  Walks \Registry\Machine\SYSTEM\CurrentControlSet\
+ * Enum\PCI \ VEN_...&DEV_... \ instance-child, reads ClassGUID, computes
+ * FNV1a32(canonicalized VEN|DEV|SUBSYS|REV token slice), inserts into the
+ * 256-slot classmap.  Alloc failure = degrade to UNKNOWN forever (no
+ * BSOD).  Errors on individual subkeys skip that subkey and continue.
+ *
+ * Uses the ExInitializeWorkItem / ExQueueWorkItem pattern (same as
+ * TrackDFlushWorker) rather than IoAllocateWorkItem so we don't need a
+ * DEVICE_OBJECT at arm time (the BOOT_START disk UpperFilter's
+ * DrvObj->DeviceObject list is empty until AddDevice/PnP surfaces
+ * arrive - long after ArmTrackD ran from DriverEntry). */
+static VOID TrackDPciClassmapWorker(PVOID Ctx)
+{
+    static const WCHAR PCI_KEY_PATH[] = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\PCI";
+    UNICODE_STRING     pciPath;
+    OBJECT_ATTRIBUTES  oa;
+    HANDLE             hPci = NULL;
+    NTSTATUS           st;
+    ULONG              vendorIndex, instanceIndex;
+
+    UNREFERENCED_PARAMETER(Ctx);
+
+    /* Alloc slot table.  Zero-init required for the sentinel semantics. */
+    if (g_TrackDPciClassmapSlots == NULL) {
+        g_TrackDPciClassmapSlots = (TRACKD_PCI_CLASSMAP_SLOT *)
+            ExAllocatePoolWithTag(NonPagedPoolNx,
+                                  TRACKD_PCI_CLASSMAP_BYTES, 'IDRT');
+        if (g_TrackDPciClassmapSlots == NULL) {
+            WriteLastCallbackStatus(TRACKD_TAG_CLASSMAP_ALLOC_FAIL,
+                                    STATUS_INSUFFICIENT_RESOURCES);
+            /* Leave Ready = 0 forever; the driver keeps running. */
+            InterlockedExchange(&g_TrackDPciClassmapWorkQueued, 0);
+            return;
+        }
+        RtlZeroMemory(g_TrackDPciClassmapSlots, TRACKD_PCI_CLASSMAP_BYTES);
+    }
+
+    RtlInitUnicodeString(&pciPath, PCI_KEY_PATH);
+    InitializeObjectAttributes(&oa, &pciPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwOpenKey(&hPci, KEY_READ, &oa);
+    if (!NT_SUCCESS(st)) {
+        /* Enum\PCI absent (guest with no PCI bus?) - still mark ready. */
+        InterlockedExchange(&g_TrackDPciClassmapReady, 1);
+        InterlockedExchange(&g_TrackDPciClassmapWorkQueued, 0);
+        return;
+    }
+
+    /* Walk each VEN_...&DEV_...&... child of Enum\PCI. */
+    for (vendorIndex = 0; ; vendorIndex++) {
+        UCHAR   vendorBuf[512];
+        ULONG   vendorResult = 0;
+        PKEY_BASIC_INFORMATION vinfo = (PKEY_BASIC_INFORMATION)vendorBuf;
+        UNICODE_STRING vendorName;
+        OBJECT_ATTRIBUTES voa;
+        HANDLE  hVendor = NULL;
+
+        st = ZwEnumerateKey(hPci, vendorIndex, KeyBasicInformation,
+                            vendorBuf, sizeof(vendorBuf), &vendorResult);
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        if (!NT_SUCCESS(st)) {
+            if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) continue;
+            break;
+        }
+        vendorName.Buffer        = vinfo->Name;
+        vendorName.Length        = (USHORT)vinfo->NameLength;
+        vendorName.MaximumLength = (USHORT)vinfo->NameLength;
+
+        InitializeObjectAttributes(&voa, &vendorName,
+                                   OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                                   hPci, NULL);
+        st = ZwOpenKey(&hVendor, KEY_READ, &voa);
+        if (!NT_SUCCESS(st)) continue;
+
+        /* Walk each instance subkey (e.g. "4&1234abcd&0&00080020"). */
+        for (instanceIndex = 0; ; instanceIndex++) {
+            UCHAR   instanceBuf[512];
+            ULONG   instanceResult = 0;
+            PKEY_BASIC_INFORMATION iinfo = (PKEY_BASIC_INFORMATION)instanceBuf;
+            UNICODE_STRING instanceName;
+            OBJECT_ATTRIBUTES ioa;
+            HANDLE  hInstance = NULL;
+            WCHAR   classGuid[64];
+            UCHAR   hint;
+            WCHAR   composed[128];
+            ULONG   composedLen = 0;
+            ULONG   k;
+
+            st = ZwEnumerateKey(hVendor, instanceIndex, KeyBasicInformation,
+                                instanceBuf, sizeof(instanceBuf), &instanceResult);
+            if (st == STATUS_NO_MORE_ENTRIES) break;
+            if (!NT_SUCCESS(st)) {
+                if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL) continue;
+                break;
+            }
+            instanceName.Buffer        = iinfo->Name;
+            instanceName.Length        = (USHORT)iinfo->NameLength;
+            instanceName.MaximumLength = (USHORT)iinfo->NameLength;
+
+            InitializeObjectAttributes(&ioa, &instanceName,
+                                       OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                                       hVendor, NULL);
+            st = ZwOpenKey(&hInstance, KEY_READ, &ioa);
+            if (!NT_SUCCESS(st)) continue;
+
+            if (TrackDReadRegSz(hInstance, L"ClassGUID",
+                                classGuid, sizeof(classGuid)) == 0) {
+                ZwClose(hInstance);
+                continue;
+            }
+            hint = TrackDClassGuidToHint(classGuid);
+            ZwClose(hInstance);
+
+            if (hint == TRACKD_PCI_CLASSHINT_UNKNOWN) continue;
+
+            /* Compose "VEN_XXXX..." from the vendor name (uppercase),
+             * matching TrackDPciExtractKeyHash's canonicalization. */
+            for (k = 0; k < vinfo->NameLength / sizeof(WCHAR) &&
+                        composedLen + 1 < ARRAYSIZE(composed); k++) {
+                WCHAR c = vinfo->Name[k];
+                if (c >= L'a' && c <= L'z') c = (WCHAR)(c - L'a' + L'A');
+                composed[composedLen++] = c;
+            }
+            /* Truncate past &REV_XX to match reader. */
+            for (k = 0; k + 4 <= composedLen; k++) {
+                if (composed[k] == L'&' && composed[k+1] == L'R' &&
+                    composed[k+2] == L'E' && composed[k+3] == L'V') {
+                    ULONG cap = k + 4 + 1 + 2;
+                    if (cap < composedLen) composedLen = cap;
+                    break;
+                }
+            }
+            if (composedLen > 0) {
+                ULONG keyHash = TrackDClassmapKeyHash(composed, composedLen);
+                if (keyHash != 0) TrackDPciClassmapInsert(keyHash, hint);
+            }
+        }
+        ZwClose(hVendor);
+    }
+    ZwClose(hPci);
+    InterlockedExchange(&g_TrackDPciClassmapReady, 1);
+    InterlockedExchange(&g_TrackDPciClassmapWorkQueued, 0);
+}
+
+/* Arm-side scheduler.  Single-shot CAS on WorkQueued guards against a
+ * double schedule if ArmTrackD is re-entered.
+ *
+ * Uses ExInitializeWorkItem + ExQueueWorkItem (WORK_QUEUE_ITEM) rather
+ * than IoAllocateWorkItem so we don't need a DEVICE_OBJECT.  For this
+ * BOOT_START DiskDrive UpperFilter, DriverEntry runs BEFORE any
+ * AddDevice/PnP surfaces so DrvObj->DeviceObject would be NULL at
+ * ArmTrackD time (5-lens review HIGH#8).  The Ex* path avoids that
+ * dependency entirely; MSDN's warning against Ex* for driver-lifetime
+ * work items applies to drivers that unload, and this driver has no
+ * DriverUnload (v3.6 lifecycle contract).
+ *
+ * On a hot-toggle-in via -EnableSynth after boot, the CAS lets the tap
+ * (TrackDHandlePreSetValue) schedule the walk without a reboot; ready
+ * flips ~few hundred ms later.  See v5.0.6 Phase 2 changelog block. */
+static VOID TrackDPciClassmapScheduleFromArm(VOID)
+{
+    if (InterlockedCompareExchange(&g_TrackDPciClassmapWorkQueued, 1, 0) != 0)
+        return; /* already scheduled */
+    ExInitializeWorkItem(&g_TrackDPciClassmapWorkItem,
+                         TrackDPciClassmapWorker, NULL);
+    ExQueueWorkItem(&g_TrackDPciClassmapWorkItem, DelayedWorkQueue);
+}
+
+/* ----- USB device-class parent-only inference -----
+ *
+ * Original Phase 2 draft added TrackDInferUsbDeviceClass + TrackDUsb
+ * ExtractKeyHash here.  Both were REMOVED after the 5-lens review's
+ * CRITICAL#1 finding: parent-only inference collapses every single-
+ * interface USB peripheral (mouse, keyboard, printer, mass storage,
+ * webcam, audio, CDC-ether, companion hub) into the GENERIC bucket,
+ * which only holds 2 rows (Smart Card + Fingerprint).  A Logitech USB
+ * mouse would surface as "Synaptics WBDI Fingerprint Reader" - the
+ * exact class of one-query-pair vendor mismatch v5.0.6 exists to
+ * prevent.  See the v5.0.6 Phase 2 changelog block for the deferral
+ * rationale; Phase 2.1 will land a class-code hash-map (mirror of the
+ * PCI classmap) inferring from Enum\USB\.../CompatibleIDs before USB
+ * rewiring. */
+
+/* ----- 3 per-class synthesizers -----
+ *
+ * All emit REG_SZ (single L'\0' terminator).  REG_MULTI_SZ + REG_EXPAND_SZ
+ * reject as type-mismatch bail (kept for a future extension that preserves
+ * multi-null; DeviceDesc/FriendlyName/Mfg on the surfaces we cover are
+ * always REG_SZ in practice).  Size sanity range = [2, 2048] BYTES for
+ * the real value (rejecting empty or absurdly-large values before
+ * synthesis).  Overflow bail fires when synth output exceeds the caller's
+ * residual buffer capacity - passthrough, never truncate. */
+
+#define TRACKD_SYNTH_REAL_MIN 2u
+#define TRACKD_SYNTH_REAL_MAX 8192u
+
+static BOOLEAN TrackDSynthEmitRegSz(const WCHAR *src,
+                                    PUCHAR outBuffer, SIZE_T outBufferCbBytes,
+                                    PSIZE_T outCbBytes)
+{
+    SIZE_T chars = 0, bytes;
+    if (src == NULL || outBuffer == NULL || outCbBytes == NULL) return FALSE;
+    while (src[chars] != L'\0') chars++;
+    bytes = (chars + 1) * sizeof(WCHAR);
+    if (bytes > outBufferCbBytes) {
+        InterlockedIncrement(&g_TrackDSynthOverflowBail);
+        return FALSE;
+    }
+    RtlCopyMemory(outBuffer, src, bytes);
+    *outCbBytes = bytes;
+    return TRUE;
+}
+
+static BOOLEAN TrackDValueSynthScsi(PCUNICODE_STRING parent,
+                                    ULONG synthKey, ULONG valueType,
+                                    PUCHAR outBuffer, SIZE_T outBufferCbBytes,
+                                    PSIZE_T outCbBytes)
+{
+    ULONG rowIndex;
+    const TRACKD_SCSI_ROW *row;
+    const WCHAR *col = NULL;
+
+    if (valueType != REG_SZ) {
+        InterlockedIncrement(&g_TrackDSynthTypeMismatchBail);
+        return FALSE;
+    }
+    if (g_TrackDSynthScsiCount == 0) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    rowIndex = TrackDInvSelectRowIndex(L"SCSI", parent, g_TrackDSynthScsiCount);
+    row = &g_TrackDSynthScsiRows[rowIndex];
+    switch (synthKey) {
+    case TRACKD_SVN_DEVICEDESC:   col = row->DeviceDesc;   break;
+    case TRACKD_SVN_FRIENDLYNAME: col = row->FriendlyName; break;
+    case TRACKD_SVN_MFG:          col = row->Mfg;          break;
+    default:
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    if (col == NULL) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    return TrackDSynthEmitRegSz(col, outBuffer, outBufferCbBytes, outCbBytes);
+}
+
+static BOOLEAN TrackDValueSynthPci(PCUNICODE_STRING parent,
+                                   ULONG synthKey, ULONG valueType,
+                                   PUCHAR outBuffer, SIZE_T outBufferCbBytes,
+                                   PSIZE_T outCbBytes)
+{
+    TRACKD_PCI_CLASSHINT hint;
+    ULONG    classFiltered[16];
+    ULONG    venFiltered[16];
+    ULONG    classCount = 0;
+    ULONG    venCount   = 0;
+    ULONG    i, rowIndex;
+    WCHAR    realVen[5];
+    BOOLEAN  gotVen;
+    const TRACKD_PCI_ROW *row;
+    const WCHAR *col = NULL;
+
+    if (valueType != REG_SZ) {
+        InterlockedIncrement(&g_TrackDSynthTypeMismatchBail);
+        return FALSE;
+    }
+    if (g_TrackDSynthPciCount == 0) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+
+    /* Step 1: ClassHint filter (from the classmap workitem's PCI walk).
+     * classFiltered array size (16) > g_TrackDSynthPciCount (13). */
+    hint = TrackDPciClassmapLookup(parent);
+    if (hint != TRACKD_PCI_CLASSHINT_UNKNOWN) {
+        for (i = 0; i < g_TrackDSynthPciCount &&
+                    classCount < ARRAYSIZE(classFiltered); i++) {
+            if (g_TrackDSynthPciRows[i].ClassHint == hint)
+                classFiltered[classCount++] = i;
+        }
+    }
+
+    /* Step 2 (Phase 2 post-review CRITICAL#3): VenHex sub-filter.  A real
+     * Nvidia PDO (VEN_10DE) MUST NOT get an AMD synth string, because the
+     * parent's HardwareID (which the substring rewriter leaves VEN_/DEV_
+     * REAL for PnP-binding reasons) still says 10DE - a "10DE Nvidia" +
+     * "AMD Radeon PRO W6800 DeviceDesc" pair is a one-query-pair vendor
+     * mismatch.  Sub-filter: keep only rows whose VenHex matches the
+     * parent's real VEN_XXXX.  If Step 1 produced a class-filtered
+     * subset, sub-filter that.  Otherwise sub-filter the whole pool
+     * (cold-start classmap + ArmTrackD-schedule window). */
+    gotVen = TrackDPciExtractVenHex(parent, realVen);
+    if (gotVen) {
+        if (classCount > 0) {
+            for (i = 0; i < classCount && venCount < ARRAYSIZE(venFiltered); i++) {
+                ULONG src = classFiltered[i];
+                UNICODE_STRING a, b;
+                if (g_TrackDSynthPciRows[src].VenHex == NULL) continue;
+                RtlInitUnicodeString(&a, g_TrackDSynthPciRows[src].VenHex);
+                RtlInitUnicodeString(&b, realVen);
+                if (RtlEqualUnicodeString(&a, &b, TRUE))
+                    venFiltered[venCount++] = src;
+            }
+        } else {
+            for (i = 0; i < g_TrackDSynthPciCount &&
+                        venCount < ARRAYSIZE(venFiltered); i++) {
+                UNICODE_STRING a, b;
+                if (g_TrackDSynthPciRows[i].VenHex == NULL) continue;
+                RtlInitUnicodeString(&a, g_TrackDSynthPciRows[i].VenHex);
+                RtlInitUnicodeString(&b, realVen);
+                if (RtlEqualUnicodeString(&a, &b, TRUE))
+                    venFiltered[venCount++] = i;
+            }
+        }
+    }
+
+    /* Step 3: pick the final row.  Priority: venFiltered > classFiltered
+     * > whole pool.  Falling back to the whole pool AFTER a VenHex-miss
+     * is deliberately conservative: it accepts a synthesized-brand-does-
+     * not-match-real-VEN write when neither the classmap nor the pool
+     * carries the real VEN's identity.  A stronger contract (bail to
+     * InventoryMiss and passthrough real OEM cleartext) is arguably
+     * safer against detection but sacrifices the entire coverage goal
+     * for VENs we did not curate.  Kickoff §5 explicitly accepts the
+     * "curated brand may substitute" trade-off; adjust in Phase 2.1 if
+     * telemetry shows it matters. */
+    if (venCount > 0) {
+        ULONG pick = TrackDInvSelectRowIndex(L"PCI", parent, venCount);
+        rowIndex   = venFiltered[pick];
+    } else if (classCount > 0) {
+        ULONG pick = TrackDInvSelectRowIndex(L"PCI", parent, classCount);
+        rowIndex   = classFiltered[pick];
+    } else {
+        rowIndex = TrackDInvSelectRowIndex(L"PCI", parent, g_TrackDSynthPciCount);
+    }
+
+    row = &g_TrackDSynthPciRows[rowIndex];
+    switch (synthKey) {
+    case TRACKD_SVN_DEVICEDESC:   col = row->DeviceDesc;   break;
+    case TRACKD_SVN_FRIENDLYNAME: col = row->FriendlyName; break;
+    case TRACKD_SVN_MFG:          col = row->Mfg;          break;
+    default:
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    if (col == NULL) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    return TrackDSynthEmitRegSz(col, outBuffer, outBufferCbBytes, outCbBytes);
+}
+
+/* v5.0.6 Phase 2 - TrackDValueSynthUsb + TrackDValueSynthHid deferred to
+ * Phase 2.1 (review CRITICAL#1 + CRITICAL#2).  See the v5.0.6 Phase 2
+ * changelog block above for the deferral rationale and the class-code
+ * hash-map plan.  SynthHit_USB_FriendlyName and SynthHit_HID_FriendlyName
+ * counters stay declared + persisted (Phase 0 shipped them) so the
+ * userland decoder needs no schema edit when Phase 2.1 lands. */
+
+static BOOLEAN TrackDValueSynthBth(PCUNICODE_STRING parent,
+                                   ULONG synthKey, ULONG valueType,
+                                   PUCHAR outBuffer, SIZE_T outBufferCbBytes,
+                                   PSIZE_T outCbBytes)
+{
+    ULONG rowIndex;
+    const TRACKD_BTH_ROW *row;
+    const WCHAR *col = NULL;
+
+    if (valueType != REG_SZ) {
+        InterlockedIncrement(&g_TrackDSynthTypeMismatchBail);
+        return FALSE;
+    }
+    if (g_TrackDSynthBthCount == 0) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    rowIndex = TrackDInvSelectRowIndex(L"BTH", parent, g_TrackDSynthBthCount);
+    row = &g_TrackDSynthBthRows[rowIndex];
+    switch (synthKey) {
+    case TRACKD_SVN_DEVICEDESC:   col = row->DeviceDesc;   break;
+    case TRACKD_SVN_FRIENDLYNAME: col = row->FriendlyName; break;
+    case TRACKD_SVN_MFG:          col = row->Mfg;          break;
+    default:
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    if (col == NULL) {
+        InterlockedIncrement(&g_TrackDSynthInventoryMissBail);
+        return FALSE;
+    }
+    return TrackDSynthEmitRegSz(col, outBuffer, outBufferCbBytes, outCbBytes);
+}
+
+/* v5.0.6 Phase 2 - TrackDValueMatchUsb + TrackDValueMatchHid deferred
+ * along with the USB / HID descriptor rows (review CRITICAL#1 +
+ * CRITICAL#2, changelog block above). */
+
+/* Update the DataLength field inside the caller's KEY_VALUE_*_INFORMATION
+ * buffer for a variable-length synth write.  Offset varies per info class
+ * so we can't just poke buf[8] - use the typed pointer per class. */
+static VOID TrackDPokeDataLength(ULONG infoClass, PVOID buf, ULONG newDataLen)
+{
+    switch (infoClass) {
+    case KeyValuePartialInformation:
+        ((PKEY_VALUE_PARTIAL_INFORMATION)buf)->DataLength = newDataLen;
+        break;
+    case KeyValuePartialInformationAlign64:
+        ((PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf)->DataLength = newDataLen;
+        break;
+    case KeyValueFullInformation:
+    case KeyValueFullInformationAlign64:
+        ((PKEY_VALUE_FULL_INFORMATION)buf)->DataLength = newDataLen;
+        break;
+    default:
+        break;
+    }
+}
+
+/* Central synth dispatch.  Called from TrackDHandlePostQueryValue after
+ * TrackDExtractValueData succeeds and BEFORE the substring Rewriter.
+ * Returns TRUE if the synth engaged (caller then updates ResultLength +
+ * returns SUCCESS); FALSE if the caller should fall through to the
+ * Rewriter (or return without change if no Rewriter). */
+static BOOLEAN TrackDValueSynthDispatch(const TRACKD_VALUE_DESCRIPTOR *desc,
+                                        PCUNICODE_STRING parent,
+                                        PCUNICODE_STRING valueName,
+                                        ULONG valueType,
+                                        PVOID keyValueInformation,
+                                        ULONG infoClass,
+                                        ULONG bufferLen,
+                                        ULONG dataOffset,
+                                        ULONG originalDataLen,
+                                        ULONG *outNewResultLength)
+{
+    ULONG    synthKey;
+    SIZE_T   residual;
+    SIZE_T   emitted = 0;
+    PUCHAR   writePtr;
+    BOOLEAN  ok;
+    volatile LONG *hitCounter;
+
+    if (desc == NULL || desc->Synthesizer == NULL || desc->SynthValueNames == NULL)
+        return FALSE;
+    if (!TrackDValueNameAllowed(valueName, desc->SynthValueNames)) return FALSE;
+    if (keyValueInformation == NULL || bufferLen == 0) return FALSE;
+    if (dataOffset > bufferLen) return FALSE;
+
+    synthKey = TrackDValueNameToSynthKey(valueName);
+    if (synthKey == TRACKD_SVN_UNKNOWN) return FALSE;
+
+    /* Size-sanity floor on the ORIGINAL value data.  Empty or absurdly
+     * large real values (probably a caller passing an oddly-sized query
+     * buffer) get passthrough - synth of a "value doesn't fit" state is
+     * indistinguishable from a real "value not present" state to the
+     * caller, safer to leave alone. */
+    if (originalDataLen < TRACKD_SYNTH_REAL_MIN ||
+        originalDataLen > TRACKD_SYNTH_REAL_MAX) {
+        InterlockedIncrement(&g_TrackDSynthSizeSanityBail);
+        return FALSE;
+    }
+
+    residual = (SIZE_T)bufferLen - (SIZE_T)dataOffset;
+    writePtr = (PUCHAR)keyValueInformation + dataOffset;
+
+    ok = desc->Synthesizer(parent, synthKey, valueType,
+                           writePtr, residual, &emitted);
+    if (!ok) {
+        /* Synth-side counter (Overflow / TypeMismatch / InventoryMiss)
+         * was bumped inside the synthesizer callback itself; nothing
+         * more to record here. */
+        return FALSE;
+    }
+
+    /* HID FriendlyName passthrough sentinel: emitted == 0 && ok.
+     * Dispatcher keeps caller buffer as-is, still bumps the SynthHit
+     * counter (this is a policy engagement even without a mutation),
+     * updates ResultLength to preserve the original layout. */
+    if (emitted == 0) {
+        *outNewResultLength = (ULONG)((SIZE_T)dataOffset + (SIZE_T)originalDataLen);
+        hitCounter = TrackDSynthHitCounterFor(desc->PathType, synthKey);
+        if (hitCounter != NULL) InterlockedIncrement(hitCounter);
+        return TRUE;
+    }
+
+    /* Update the info-class DataLength AND the ResultLength.  The
+     * synthesized bytes are already in the caller's buffer (writePtr
+     * points inside it).  Note: emitted <= residual by TrackDSynthEmit
+     * RegSz's overflow check, so the cast to ULONG here is safe. */
+    TrackDPokeDataLength(infoClass, keyValueInformation, (ULONG)emitted);
+    *outNewResultLength = (ULONG)((SIZE_T)dataOffset + emitted);
+
+    hitCounter = TrackDSynthHitCounterFor(desc->PathType, synthKey);
+    if (hitCounter != NULL) InterlockedIncrement(hitCounter);
+    return TRUE;
+}
+
 /* ---- value-descriptor table + classifier ---- */
 
 static const WCHAR * const g_TrackDScsiValueNames[] = {
@@ -4785,12 +5988,36 @@ static const WCHAR * const g_TrackDEdidValueNames[] = {
     L"EDID", NULL
 };
 
+/* v5.0.6 Phase 2 - SynthValueNames allow-lists.  Kept SEPARATE from
+ * ValueNames so the substring path (ValueNames + Rewriter + ValHit_*
+ * counter) and the synth path (SynthValueNames + Synthesizer +
+ * SynthHit_* counter keyed by (class, valueName)) bump orthogonally.
+ * A value name in BOTH lists (BTH DeviceDesc is the one overlap today)
+ * takes the synth path first; on synth bail the dispatcher falls through
+ * to the substring Rewriter. */
+static const WCHAR * const g_TrackDScsiSynthValueNames[] = {
+    L"DeviceDesc", L"FriendlyName", L"Mfg", NULL
+};
+static const WCHAR * const g_TrackDPciSynthValueNames[] = {
+    L"DeviceDesc", L"FriendlyName", L"Mfg", NULL
+};
+static const WCHAR * const g_TrackDBthSynthValueNames[] = {
+    L"DeviceDesc", L"FriendlyName", L"Mfg", NULL
+};
+/* v5.0.6 Phase 2 - g_TrackDUsbSynthValueNames + g_TrackDHidSynthValueNames
+ * deferred with the USB / HID descriptor rows (review CRITICAL#1 +
+ * CRITICAL#2). */
+
 static const TRACKD_VALUE_DESCRIPTOR g_TrackDValueDescriptors[] = {
-    { TRACKD_PATH_SCSI,           "vSCSI",  TrackDValueMatchScsi,    g_TrackDScsiValueNames,    TrackDValueRewriteScsi,    &g_TrackDValHitCount_SCSI,    FALSE },
-    { TRACKD_PATH_PCI,            "vPCI",   TrackDValueMatchPci,     g_TrackDPciValueNames,     TrackDValueRewritePci,     &g_TrackDValHitCount_PCI,     FALSE },
-    { TRACKD_PATH_BTH,            "vBTH",   TrackDValueMatchBth,     g_TrackDBthValueNames,     TrackDValueRewriteBth,     &g_TrackDValHitCount_BTH,     FALSE },
-    { TRACKD_PATH_STORAGE_VOLUME, "vStor",  TrackDValueMatchStorage, g_TrackDStorageValueNames, TrackDValueRewriteStorage, &g_TrackDValHitCount_Storage, FALSE },
-    { TRACKD_PATH_DISPLAY_EDID,   "vEDID",  TrackDValueMatchEdid,    g_TrackDEdidValueNames,    TrackDValueRewriteEdid,    &g_TrackDValHitCount_Edid,    TRUE  },
+    { TRACKD_PATH_SCSI,           "vSCSI",  TrackDValueMatchScsi,    g_TrackDScsiValueNames,    TrackDValueRewriteScsi,    &g_TrackDValHitCount_SCSI,    FALSE, g_TrackDScsiSynthValueNames, TrackDValueSynthScsi },
+    { TRACKD_PATH_PCI,            "vPCI",   TrackDValueMatchPci,     g_TrackDPciValueNames,     TrackDValueRewritePci,     &g_TrackDValHitCount_PCI,     FALSE, g_TrackDPciSynthValueNames,  TrackDValueSynthPci  },
+    { TRACKD_PATH_BTH,            "vBTH",   TrackDValueMatchBth,     g_TrackDBthValueNames,     TrackDValueRewriteBth,     &g_TrackDValHitCount_BTH,     FALSE, g_TrackDBthSynthValueNames,  TrackDValueSynthBth  },
+    { TRACKD_PATH_STORAGE_VOLUME, "vStor",  TrackDValueMatchStorage, g_TrackDStorageValueNames, TrackDValueRewriteStorage, &g_TrackDValHitCount_Storage, FALSE, NULL,                        NULL                 },
+    { TRACKD_PATH_DISPLAY_EDID,   "vEDID",  TrackDValueMatchEdid,    g_TrackDEdidValueNames,    TrackDValueRewriteEdid,    &g_TrackDValHitCount_Edid,    TRUE,  NULL,                        NULL                 },
+    /* v5.0.6 Phase 2 - USB / HID rows deferred to Phase 2.1 per the
+     * review CRITICAL#1 + CRITICAL#2 findings.  When Phase 2.1 relands,
+     * restore the two trailing rows here plus the SynthValueNames /
+     * matchers / synthesizers documented above. */
 };
 
 static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING parent)
@@ -4840,7 +6067,25 @@ static BOOLEAN TrackDValueNameIsInteresting(PCUNICODE_STRING valueName)
     if (valueName == NULL || valueName->Buffer == NULL || valueName->Length == 0)
         return FALSE;
     for (i = 0; i < ARRAYSIZE(g_TrackDValueDescriptors); ++i) {
-        if (TrackDValueNameAllowed(valueName, g_TrackDValueDescriptors[i].ValueNames))
+        /* v5.0.6 Phase 2 post-review (HIGH pre-filter NULL semantic):
+         * TrackDValueNameAllowed(name, NULL) returns TRUE by contract
+         * ("NULL allow-list == any name") - that made sense for the
+         * substring Rewriter's per-call use, but here in the pre-filter
+         * a descriptor whose ValueNames or SynthValueNames is NULL means
+         * "no names from this class" - not "any name matches".  Guard
+         * against NULL explicitly so a NULL-list row (e.g. STORAGE with
+         * SynthValueNames=NULL) can't turn the pre-filter into an
+         * always-TRUE gate. */
+        if (g_TrackDValueDescriptors[i].ValueNames != NULL &&
+            TrackDValueNameAllowed(valueName, g_TrackDValueDescriptors[i].ValueNames))
+            return TRUE;
+        /* v5.0.6 Phase 2 - names that only exist in a descriptor's synth
+         * allow-list (DeviceDesc / FriendlyName / Mfg on classes whose
+         * substring ValueNames list doesn't already carry them - PCI is
+         * the current case) must ALSO survive the cheap pre-filter, or
+         * the value handler short-circuits before calling synth dispatch. */
+        if (g_TrackDValueDescriptors[i].SynthValueNames != NULL &&
+            TrackDValueNameAllowed(valueName, g_TrackDValueDescriptors[i].SynthValueNames))
             return TRUE;
     }
     if (TrackDValueNameIsMeasureFirst(valueName))
@@ -4897,8 +6142,22 @@ static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2)
                                            &keyId, &keyName);
         if (NT_SUCCESS(keyIdSt) && keyName != NULL) {
             desc = TrackDClassifyValueParent(keyName);
+            /* v5.0.6 Phase 2 - non-rubi diagnostic parity: count reads
+             * on our SynthValueNames too, so post-mortem forensics can
+             * see how often non-rubi callers touch DeviceDesc /
+             * FriendlyName / Mfg on classified parents (a large ratio
+             * hints at Windows itself pumping these values through the
+             * hot path, which affects Q1 in the kickoff §10).  Post-
+             * review (HIGH pre-filter NULL semantic): explicitly guard
+             * against NULL ValueNames / SynthValueNames so a NULL-list
+             * row cannot mark every named read as "non-rubi matched"
+             * via the TrackDValueNameAllowed(name, NULL) == TRUE
+             * contract. */
             if (desc != NULL &&
-                TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) {
+                ((desc->ValueNames != NULL &&
+                  TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) ||
+                 (desc->SynthValueNames != NULL &&
+                  TrackDValueNameAllowed(pre->ValueName, desc->SynthValueNames)))) {
                 InterlockedIncrement(&g_TrackDNonRubiValueMatchCount);
                 TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_NONRUBI,
                                 keyName, pre->ValueName->Buffer,
@@ -4935,33 +6194,102 @@ static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2)
         return STATUS_SUCCESS;
     }
 
-    if (!TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) return STATUS_SUCCESS;
+    /* v5.0.6 Phase 2 - decide substring vs synth path.  The name may
+     * appear in ValueNames (substring), SynthValueNames (synth), or
+     * both (BTH DeviceDesc is the one overlap today).  We take synth
+     * first when armed and the class ships one; on synth bail (return
+     * FALSE from dispatch) fall through to the substring Rewriter if the
+     * name is also allowed there. */
+    {
+        BOOLEAN nameInSynth = (desc->SynthValueNames != NULL) &&
+                              TrackDValueNameAllowed(pre->ValueName, desc->SynthValueNames);
+        BOOLEAN nameInSubst = (desc->ValueNames != NULL) &&
+                              TrackDValueNameAllowed(pre->ValueName, desc->ValueNames);
+        if (!nameInSynth && !nameInSubst) return STATUS_SUCCESS;
 
-    /* EDID row requires its own opt-in on TOP of the master value gate. */
-    if (desc->NeedsEdidGate && !g_TrackDEdidRewriteEnabled) return STATUS_SUCCESS;
+        /* EDID row requires its own opt-in on TOP of the master value gate. */
+        if (desc->NeedsEdidGate && !g_TrackDEdidRewriteEnabled) return STATUS_SUCCESS;
 
-    if (!TrackDExtractValueData(pre->KeyValueInformationClass, pre->KeyValueInformation,
-                                pre->Length, &vtype, &vDataOff, &vDataLen))
-        return STATUS_SUCCESS;
+        if (!TrackDExtractValueData(pre->KeyValueInformationClass, pre->KeyValueInformation,
+                                    pre->Length, &vtype, &vDataOff, &vDataLen))
+            return STATUS_SUCCESS;
 
-    dataPtr = (PUCHAR)pre->KeyValueInformation + vDataOff;
+        dataPtr = (PUCHAR)pre->KeyValueInformation + vDataOff;
 
-    __try {
-        desc->Rewriter(keyName, vtype, dataPtr, vDataLen);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT, GetExceptionCode());
-        return STATUS_SUCCESS;
+        /* SYNTH PATH.  Gated on g_TrackDValueSynthEnabled (independent of
+         * g_TrackDValueRewriteEnabled which gates the whole handler entry
+         * from RstRegistryCallback).  Also gated on desc->Synthesizer !=
+         * NULL (STORAGE + EDID rows currently synth-null, Phase 2 defers). */
+        if (nameInSynth && g_TrackDValueSynthEnabled &&
+            desc->Synthesizer != NULL) {
+            BOOLEAN synthTaken = FALSE;
+            ULONG   newResultLen = pre->Length; /* fallback if untouched */
+            /* v5.0.6 Phase 2 post-review (HIGH ResultLength SEH): widened
+             * to cover BOTH the dispatch call AND the *pre->ResultLength
+             * write.  Cm gives us a kernel-verified out-pointer at PASSIVE
+             * so a fault there is not expected on real callers, but SEH
+             * costs nothing on the fast path and prevents a hostile-caller
+             * BSOD if ResultLength ever pointed to unmapped memory. */
+            __try {
+                synthTaken = TrackDValueSynthDispatch(desc, keyName, pre->ValueName,
+                                                      vtype, pre->KeyValueInformation,
+                                                      pre->KeyValueInformationClass,
+                                                      pre->Length, vDataOff, vDataLen,
+                                                      &newResultLen);
+                if (synthTaken && pre->ResultLength != NULL) {
+                    /* pre->ResultLength is PULONG (out-pointer supplied by
+                     * the caller of NtQueryValueKey); we update the pointee
+                     * so the caller sees the correct byte count for the
+                     * grown value. */
+                    *pre->ResultLength = newResultLen;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT_SYNTH, GetExceptionCode());
+                synthTaken = FALSE;
+            }
+            if (synthTaken) {
+                /* v5.0.6 Phase 2 post-review (MEDIUM ValHit double-count):
+                 * synth path bumps g_TrackDHitCount (global engagement
+                 * counter) and the SynthHit_<class>_<valuename> counter
+                 * (already bumped INSIDE TrackDValueSynthDispatch via
+                 * TrackDSynthHitCounterFor).  It does NOT bump
+                 * desc->HitCounter (ValHit_<class>) - that counter is
+                 * reserved for substring-path engagements so the two
+                 * paths stay orthogonally observable. */
+                InterlockedIncrement(&g_TrackDHitCount);
+                TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_GATED_SYNTH, keyName,
+                                pre->ValueName->Buffer,
+                                pre->ValueName->Length / sizeof(WCHAR));
+                WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+                return STATUS_SUCCESS;
+            }
+            /* fall through to substring Rewriter if name is also there */
+        }
+
+        /* SUBSTRING PATH.  Same-length in-place rewrite (v5.0.5 Phase 2
+         * semantics unchanged).  Only fires when the name is in the
+         * substring allow-list and the row has a Rewriter (USB / HID
+         * synth-only rows have Rewriter == NULL, so this block is
+         * skipped for them). */
+        if (nameInSubst && desc->Rewriter != NULL) {
+            __try {
+                desc->Rewriter(keyName, vtype, dataPtr, vDataLen);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT, GetExceptionCode());
+                return STATUS_SUCCESS;
+            }
+            /* Count an engagement (parent + value name matched, rewriter ran).
+             * The rewriter is a no-op when the value doesn't actually carry
+             * the token, so this counts "value handler engaged for
+             * <surface>" - the metric the kickoff §6.3 outcome tree keys on. */
+            InterlockedIncrement(&g_TrackDHitCount);
+            if (desc->HitCounter != NULL) InterlockedIncrement(desc->HitCounter);
+            TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_GATED, keyName,
+                            pre->ValueName->Buffer, pre->ValueName->Length / sizeof(WCHAR));
+            WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+            return STATUS_SUCCESS;
+        }
     }
-
-    /* Count an engagement (parent + value name matched, rewriter ran).
-     * The rewriter is a no-op when the value doesn't actually carry the
-     * token, so this counts "value handler engaged for <surface>" - the
-     * metric the kickoff §6.3 outcome tree keys on. */
-    InterlockedIncrement(&g_TrackDHitCount);
-    InterlockedIncrement(desc->HitCounter);
-    TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_GATED, keyName,
-                    pre->ValueName->Buffer, pre->ValueName->Length / sizeof(WCHAR));
-    WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -5598,6 +6926,8 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     RtlInitUnicodeString(&g_TrackDValNameLocationInfo,  TRACKD_VALNAME_LOCATIONINFO_STR);
     RtlInitUnicodeString(&g_TrackDValNameLocationPaths, TRACKD_VALNAME_LOCATIONPATHS_STR);
     RtlInitUnicodeString(&g_TrackDValNameContainerID,   TRACKD_VALNAME_CONTAINERID_STR);
+    /* v5.0.6 Phase 2 - USB / HID markers deferred to Phase 2.1 (see
+     * globals block for rationale). */
 
     ExInitializeWorkItem(&g_TrackDFlushWorkItem, TrackDFlushWorker, NULL);
 
@@ -5648,6 +6978,19 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* v5.0.4: arm-success breadcrumb goes to LastArmStatus. LastCallback-
      * Status is reserved for hot-path callback events after the split. */
     WriteLastArmStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+
+    /* v5.0.6 Phase 2 - schedule the PCI classmap workitem (walk Enum\PCI
+     * OUTSIDE the Cm callback lock; populate the 256-slot classmap).  We
+     * schedule unconditionally regardless of g_TrackDValueSynthEnabled so
+     * a hot-toggle-in arm via the RegNtPreSetValueKey tap gets a warm
+     * classmap without a reboot.  The one-shot CAS inside the schedule
+     * function suppresses a double schedule if ArmTrackD is re-entered.
+     * Cold-start window before Ready flips = TRACKD_PCI_CLASSHINT_UNKNOWN
+     * = synth still filters by VenHex match, so the window at worst
+     * spreads a real Nvidia PDO across the 4 pool rows whose VenHex is
+     * also 10DE (currently 2 rows) instead of the 1 row after ClassHint
+     * filtering. */
+    TrackDPciClassmapScheduleFromArm();
     return STATUS_SUCCESS;
 }
 

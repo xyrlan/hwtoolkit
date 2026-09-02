@@ -331,7 +331,9 @@ function Read-CallbackStatus {
         if ($totalSlots -gt $maxSlots) { $totalSlots = $maxSlots }
         # v5.0.5 Phase 2: offset+25 is a kind byte, not a bool:
         #   0=enum non-rubi, 1=enum gated, 2=value gated, 3=value non-rubi.
-        $filled = 0; $enumGated = 0; $valGated = 0; $nonrubi = 0
+        # v5.0.6 Phase 2 add: 4=value gated via synth (OEM string
+        # synthesizer path, distinct from substring rewriter).
+        $filled = 0; $enumGated = 0; $valGated = 0; $valSynth = 0; $nonrubi = 0
         for ($i = 0; $i -lt $totalSlots; $i++) {
             $off = $i * $recSize
             $ts = [System.BitConverter]::ToInt64($ring, $off)
@@ -340,10 +342,11 @@ function Read-CallbackStatus {
             switch ([int]$ring[$off + 25]) {
                 1 { $enumGated++ }
                 2 { $valGated++ }
+                4 { $valSynth++ }        # v5.0.6 Phase 2 synth engagement
                 default { $nonrubi++ }   # 0 (enum non-rubi) or 3 (value non-rubi)
             }
         }
-        Write-Host ("  [*]    Track D HitRingBuffer: {0}/{1} slots ({2} enum-gated, {3} value-gated, {4} non-rubi)" -f $filled, $totalSlots, $enumGated, $valGated, $nonrubi) -ForegroundColor DarkGray
+        Write-Host ("  [*]    Track D HitRingBuffer: {0}/{1} slots ({2} enum-gated, {3} value-gated, {4} value-synth, {5} non-rubi)" -f $filled, $totalSlots, $enumGated, $valGated, $valSynth, $nonrubi) -ForegroundColor DarkGray
     }
 
     # v5.0.6 Phase 0: synthesizer scaffolding gate + counters. SynthHit_*
@@ -354,7 +357,9 @@ function Read-CallbackStatus {
                               -ErrorAction SilentlyContinue).EnableValueSynth
     if ($null -ne $evs) {
         $color = if ($evs -eq 1) { 'Cyan' } else { 'DarkGray' }
-        Write-Host ("  [*]    Track D EnableValueSynth: {0} (v5.0.6 Phase 0 scaffolding; sem reader ate Phase 2)" -f $evs) -ForegroundColor $color
+        # v5.0.6 Phase 2 wired the reader (SCSI + PCI + BTH synth); USB + HID
+        # deferred to Phase 2.1 per post-review CRITICAL#1/#2 scope reduction.
+        Write-Host ("  [*]    Track D EnableValueSynth: {0} (v5.0.6 Phase 2 reader: SCSI/PCI/BTH; USB+HID Phase 2.1)" -f $evs) -ForegroundColor $color
         $synthNames = @(
             'CallbackSynthHit_SCSI_FriendlyName','CallbackSynthHit_SCSI_DeviceDesc','CallbackSynthHit_SCSI_Mfg',
             'CallbackSynthHit_PCI_FriendlyName','CallbackSynthHit_PCI_DeviceDesc','CallbackSynthHit_PCI_Mfg',
