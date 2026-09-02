@@ -345,27 +345,40 @@ Nao iterar bare-metal ate VM validation pass. Single-ship flow:
 
 ## 9. Deliverables checklist
 
-- [ ] `driver/rstflt.c`: changelog block `v5.0.6 - OEM string synthesizer` no topo.
-- [ ] `driver/rstflt.c`: `TRACKD_SYNTH_ROW` + extended `TRACKD_VALUE_DESCRIPTOR` + 15 synthesizer functions.
-- [ ] `driver/trackd_inventory.h`: novo header, 6 classes x ~12 entries + PCI sub-class table.
-- [ ] `driver/rstflt.c`: 9 hit counters + 4 bail counters + 3 measure-first counters + ring buffer 128 + `LastRingBufferSnapshot` flush workitem.
-- [ ] `driver/rstflt.c`: EnableValueSynth gate + hot-toggle via tap in RegNtPreSetValueKey (Phase 2 recipe Â§7 pattern).
-- [ ] `scripts/track-d-arm.ps1`: `-EnableSynth` / `-DisableSynth` flags.
-- [ ] `scripts/check-consistency.ps1`: exibir novos counters + flush snapshot decode.
-- [ ] `scripts/phase3-sanity-test.ps1`: harness completo (novo).
+Phase 0 (2026-09-02, PR #22 landed):
+- [x] `driver/rstflt.c`: changelog block `v5.0.6 - Phase 0 - OEM string synthesizer scaffolding + measure-first counters` no topo.
+- [x] `driver/rstflt.c`: 9 SynthHit_* + 4 Synth*Bail counters DECLARADOS (nao WIRED) + 3 measure-first counters WIRED (LocationInformation/LocationPaths/ContainerID) + ring buffer 128 slots + `NonPagedPoolNx` heap allocation do `TrackDFlushWorker` ringSnap.
+- [x] `driver/rstflt.c`: EnableValueSynth gate + hot-toggle via tap in RegNtPreSetValueKey (Phase 2 recipe Â§7 pattern). NO READER em Phase 0.
+- [x] `scripts/track-d-arm.ps1`: `-EnableSynth` / `-DisableSynth` flags.
+- [x] `scripts/check-consistency.ps1`: exibir novos counters + flush snapshot decode.
+
+Phase 1 (2026-09-02, PR pending landed):
+- [x] `driver/trackd_inventory.h`: novo header, 6 classes x prime-sized inventory (SCSI 19 / PCI 13 / USB 13 / HID 13 / BTH 13 / STORAGE 7 = 78 rows totais). Uma-row-por-device shape com (Vendor / Product / Rev / DeviceDesc / FriendlyName / Mfg) agrupados; PCI classHint enum publica reservando GPU/NIC/STORAGE_CTRL/AUDIO/USB_CTRL slots + HDA_AUDIO/NVME/RAID_SATA reservados pra Phase 1.5.
+- [x] `driver/rstflt.c`: changelog `v5.0.6 - Phase 1 - OEM string synthesizer inventory curation` acima do bloco Phase 0.
+- [x] `driver/rstflt.c`: `#define TRACKD_INVENTORY_IMPL` + `#include "trackd_inventory.h"` (valida sintaxe do header no Phase 1 build; linker inclui .rdata literals, inert ate Phase 2 dereferenciar).
+- [x] `driver/makefile.mak`: dependency line `rstflt.obj: rstflt.c trackd_inventory.h`.
+- [x] Kickoff Â§10 Q2 RESOLVIDA -> Option A (workitem hash-map). Header reserva enum + ClassHint field pra Phase 2 wirar workitem body sem schema break.
+- [x] `README.md`: v5.0.6 Phase 1 subblock (curation summary + Q2 resolution).
+- [x] `CLAUDE.md`: bullet v5.0.6 Phase 1 no Standard commands (nenhum novo arm flag - o EnableValueSynth do Phase 0 continua sendo o gate).
+- [x] `docs/postmortem-v5-track-d/incident-v506-phase1-implementation.md`: findings + fixes + Q2 rationale.
+
+Phase 2 (pending):
+- [ ] `driver/rstflt.c`: `TRACKD_VALUE_DESCRIPTOR` extension com Synthesizer field.
+- [ ] `driver/rstflt.c`: per-(class, value-name) synthesizer callbacks (9 SynthHit_* wire increment + 4 Synth*Bail wire increment).
+- [ ] `driver/rstflt.c`: PCI class-code workitem body (IoAllocateWorkItem + ZwEnumerateKey walk + 256-slot FNV1a hash map build + callback lookup).
+- [ ] `driver/rstflt.c`: USB xHCI wrapper preservation per Â§4.2 (format-string substitution mantendo `@System32\drivers\usbxhci.sys,#...;(VendorSynth,X.YZ,A.BC)` frame).
+- [ ] `scripts/phase3-sanity-test.ps1`: harness completo (novo, mirroring phase2-sanity-test.ps1 pattern).
 - [ ] `docs/track-d-name-recipe.md`: Â§9 nova para OEM-string synth.
-- [ ] `docs/postmortem-v5-track-d/incident-v506-implementation.md`: findings + fixes.
+- [ ] `docs/postmortem-v5-track-d/incident-v506-phase2-implementation.md`: findings + fixes.
 - [ ] `docs/postmortem-v5-track-d/incident-v506-vm-validation.md`: pass evidence + checkpoint name.
 - [ ] `docs/postmortem-v5-track-d/incident-v506-baremetal-outcome.md`: OUTCOME conforme Â§8 tree.
-- [ ] `README.md`: Standard commands + Gotchas atualizados; changelog v5.0.6 block.
-- [ ] `CLAUDE.md`: bullet `Arm Track D v5.0.6 synth` no bloco de comandos standard.
 
 ---
 
 ## 10. Open questions
 
 - **Q1 (crytico, para Phase 0)**: SetupDiGetDeviceRegistryProperty(SPDRP_FRIENDLYNAME) le do property store cacheado ou do registry live? Test: no VM antes de Phase 2 impl, gated `rubinot_probe.exe` chama `SetupDiGetClassDevs(GUID_DEVCLASS_DISKDRIVE)` + `SetupDiGetDeviceRegistryProperty` e compara com `reg query` do mesmo path. Se retornar valores diferentes -> property store live, Phase 2 rewriter cobre. Se retornar iguais -> ambos leem registry -> nada especial. Se retornar iguais mas AMBOS = real com gate ativo -> property store CACHEADO, hook e insuficiente, escalar para IRP-level.
-- **Q2 (Phase 1)**: Sub-classificacao PCI por class-code funciona no callback context? `PCI\VEN_XXXX&DEV_YYYY&SUBSYS_...&REV_... `parent nao inclui class-code no subkey name. Extrair via `ZwQueryValueKey(parent, "ClassGUID")` DENTRO do callback = deadlock (Zw* forbidden). Solucao: workitem pre-populate class-code -> parent hash map em DriverEntry? Ou aceitar generic pool cross-class?
+- **Q2 (Phase 1) - RESOLVIDA (2026-09-02, v5.0.6 Phase 1)**: Sub-classificacao PCI por class-code funciona no callback context? `PCI\VEN_XXXX&DEV_YYYY&SUBSYS_...&REV_... `parent nao inclui class-code no subkey name. Extrair via `ZwQueryValueKey(parent, "ClassGUID")` DENTRO do callback = deadlock (Zw* forbidden). Solucao: workitem pre-populate class-code -> parent hash map em DriverEntry? Ou aceitar generic pool cross-class? **DECISAO: Option A (workitem hash-map).** Phase 2 vai schedular `IoAllocateWorkItem` de `DriverEntry` (mesmo padrao que `TrackDFlushWorker` v5.0.5 Phase 0) que abre `\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI` via `ZwOpenKey` FORA do Cm callback lock, walk cada `VEN_XXXX&DEV_YYYY&SUBSYS_...&REV_...` subkey, walk cada instance child, chama `ZwQueryValueKey` no `ClassGUID`, e popula um 256-slot static FNV1a(VEN|DEV|SUBSYS|REV) hash map com o `TRACKD_PCI_CLASSHINT_*` correspondente. O Cm callback consulta O(1) por parent path sem nenhum `Zw*`. Cold-start window (~few hundred ms entre DriverEntry e worker completion) cai safe no generic pool + generic DeviceDesc row (equivalente ao steady-state de Option B durante essa janela, nao pior). Option B foi rejeitada porque recria a **exata vulnerabilidade** que motivou v5.0.6 - uma Realtek NIC parent (VEN_10EC) recebendo "NVIDIA GeForce RTX 3070" de generic pool e o trivial semantic mismatch que EMAC ja demonstrou catch. Option C (~100 LOC premium) resolve hot-plug PCI enumeration que e essencialmente inexistente em desktops (target audience) - over-engineering. Header `driver/trackd_inventory.h` (landed em v5.0.6 Phase 1) ja reserva `TRACKD_PCI_CLASSHINT` enum publica + `ClassHint` field em cada `TRACKD_PCI_ROW`, pra Phase 2 wirar o workitem body sem header schema break. Ver Phase 1 postmortem `docs/postmortem-v5-track-d/incident-v506-phase1-implementation.md` §4 pra rationale completa + LOC estimate.
 - **Q3 (Phase 1)**: Como excluir modelos comuns do target audience (RubinOT playerbase) do inventory pool? RubinOT nao publica stats mas o game e Steam PC-centric brasileiro; inventario deve enviesar para modelos empresariais/Latam-uncommon. Curation manual required.
 - **Q4 (v5.0.7 stub)**: se v5.0.6 nao dropar ban rate, qual next vector? Ranking atual pos-v5.0.6: (a) instance-ID leaf rewriter (LOW-MED weight, ALTO risco quebrar PnP), (b) WMI in-proc via wbemprox.dll IAT hook (MED weight, MED complexidade), (c) cpuid hypervisor interception (2-5% ceiling, MUITO alta complexidade). Decisao final aguarda outcome Â§8.
 - **Q5 (Phase 1)**: Inventory freshness policy - por quanto tempo mesmo pool antes de rotate? Se rotate a cada boot, ban lift mais rapido mas EMAC ML pode detectar high-cardinality-per-machine flapping. Se rotate a cada semana, mais estavel mas ban trace longa. Recomendado: rotate mensal + subSeed inclui `(currentMonth || year)` hash component.
