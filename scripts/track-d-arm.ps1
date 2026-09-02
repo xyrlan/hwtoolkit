@@ -33,8 +33,8 @@
       CallbackHit_HID            REG_DWORD  idem
       CallbackHit_AudioR         REG_DWORD  idem
       CallbackHit_AudioC         REG_DWORD  idem
-      CallbackHit_BTH            REG_DWORD  reservado; Phase 1 wire-up
-      CallbackHit_Storage        REG_DWORD  reservado; Phase 1 wire-up
+      CallbackHit_BTH            REG_DWORD  v5.0.5 Phase 1: Enum\BTH Dev_ rewrites
+      CallbackHit_Storage        REG_DWORD  v5.0.5 Phase 1: Enum\STORAGE\Volume GUID rewrites
       CallbackNonRubiParentMatch REG_DWORD  invokes onde parent classificou como
                                             um dos targets MAS image name nao
                                             bateu com "rubinot" - triage para
@@ -208,8 +208,8 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Val 'CallbackHit_HID'             '(nenhum HID rewrite)'
         Show-Val 'CallbackHit_AudioR'          '(nenhum Audio Render rewrite)'
         Show-Val 'CallbackHit_AudioC'          '(nenhum Audio Capture rewrite)'
-        Show-Val 'CallbackHit_BTH'             '(reservado Phase 1)'
-        Show-Val 'CallbackHit_Storage'         '(reservado Phase 1)'
+        Show-Val 'CallbackHit_BTH'             '(nenhum BTH rewrite)'
+        Show-Val 'CallbackHit_Storage'         '(nenhum STORAGE\Volume rewrite)'
         Show-Val 'CallbackNonRubiParentMatch'  '(nenhum non-rubi processo tocou nossos parents)'
         Show-Val 'CallbackHitRingIndex'        '(ring buffer nunca escrito)'
 
@@ -246,7 +246,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $pathNames = @{
                 0 = 'NONE   '; 1 = 'SCSI   '; 2 = 'PCI    ';
                 3 = 'USB    '; 4 = 'HID    '; 5 = 'AudioR '; 6 = 'AudioC ';
-                7 = 'BTH    '; 8 = 'Storage'   # reserved Phase 1
+                7 = 'BTH    '; 8 = 'Storage'   # v5.0.5 Phase 1 (wired)
             }
             # Windows-1252 preserves bytes >= 0x80 as printable characters
             # (matching how EPROCESS.ImageFileName renders in Windows tooling);

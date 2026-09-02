@@ -239,6 +239,84 @@
  *             image names). DateTime formatted `yyyy-MM-dd HH:mm:ss.fff`
  *             UTC to match kernel-side KeQuerySystemTime and disambiguate
  *             records spanning midnight or across sessions.
+ *     v5.0.5 Phase 1 (same version marker; kickoff §4) - two net-new
+ *       enum-name rewriters + a descriptor-table refactor that is the
+ *       structural pre-requisite for the Phase 2 value-read handler:
+ *       - Descriptor table g_TrackDDescriptors[]: the v5.0.1 if/else
+ *         TrackDClassifyParent + the two per-type switches in
+ *         TrackDHandlePostEnumerate (child gate + per-path counter) are
+ *         replaced by one row per path type - {PathType, Label, parent
+ *         MatchParent, ChildGate, SynthName, ValueRows/Count (Phase 2,
+ *         NULL now), HitCounter}. Classify walks the table; the handler
+ *         dispatches via desc->ChildGate / desc->SynthName and bumps
+ *         desc->HitCounter. Parent matchers and child gates are thin
+ *         wrappers preserving the EXACT v5.0.1 predicates (suffix / USB-
+ *         HID structural match; RtlPrefixUnicodeString for SCSI/PCI;
+ *         GUID-shape for Audio; always-true for USB/HID). No behavior
+ *         change for the six v5.0.1 path types.
+ *       - BTH (TRACKD_PATH_BTH=7, counter CallbackHit_BTH): parent
+ *         suffix `\Enum\BTH`; leaf `Dev_XXXXXXXXXXXX` (Dev_ + 12 hex =
+ *         6-byte BD_ADDR). Rewrites the 12 hex via FNV(seed + real
+ *         hex bytes, "BTH_DEV|"), `Dev_` preserved, same wchar count.
+ *       - STORAGE\Volume (TRACKD_PATH_STORAGE_VOLUME=8, counter
+ *         CallbackHit_Storage): parent suffix `\Enum\STORAGE\Volume`;
+ *         leaf `{GUID}#offset`. Rewrites ONLY the 32 GUID nibbles via
+ *         FNV(seed + real 38-GUID bytes, "STORAGE_VOL|"); braces,
+ *         dashes, `#`, and offset preserved byte-exact.
+ *         EMPIRICAL SHAPE NOTES (verified against a real Win10 host
+ *         registry 2026-09-01, correcting the kickoff's assumptions):
+ *           * Fixed-disk volumes DO use `{38-GUID}#<hexoffset>` (e.g.
+ *             `{21c67967-...}#0000000000100000`) - the gate matches
+ *             these. Removable/USBSTOR volumes instead use
+ *             `_??_USBSTOR#...#{GUID}` with the GUID at the END; the
+ *             gate requires the GUID at index 0 so those are a SAFE
+ *             no-op pass-through (removable storage left unrewritten).
+ *           * The kickoff premise "boot volume == offset zero" is
+ *             empirically FALSE: the system/boot partition sits at
+ *             offset 0x100000 (1 MB), not 0. So the offset-zero bail
+ *             (`#0`, `#0x0`, all-zero) does NOT single out the boot
+ *             volume - on real hardware every front-GUID fixed volume,
+ *             including the system volume, is rewritten. This is SAFE:
+ *             the rewrite mutates ONLY the gated caller's NtEnumerateKey
+ *             RESULT BUFFER, never the on-disk hive, so `\SystemRoot`
+ *             resolution and real boot are untouched (Track D's whole
+ *             design is "rewrite what the AC reads, not what is stored").
+ *             The offset-zero bail is retained as a harmless conservative
+ *             skip (it fires only for a genuinely zero-offset entry, if
+ *             any exists). Residual consideration for the maintainer: the
+ *             synthetic STORAGE\Volume GUID here uses its own FNV domain
+ *             and will NOT match the userland volume-GUID spoof
+ *             (spoof-volume-guid.ps1 / MountedDevices); if EMAC cross-
+ *             checks the two, reconcile in a follow-up. Phase 1 pre-
+ *             validation (scripts/phase1-sanity-test.ps1) prints this
+ *             classification against the live VM registry.
+ *       - Shared TrackDRewriteGuid32InPlace extracted from the v5.0.1
+ *         Audio synth (byte-for-byte identical FNV recipe; only the
+ *         domain tag varies) and reused by STORAGE\Volume so there is
+ *         one GUID-rewrite implementation.
+ *       - Latent-bug hardening: every synth now RtlCopyMemory's real
+ *         -> out as its FIRST act, before any shape bail. The v5.0.1
+ *         Audio synth returned early (pre-copy) on a bad dash, which -
+ *         had a gated 38-wchar braces-but-dashless leaf ever reached it
+ *         - would have written an uninitialized stack buffer back to the
+ *         caller. Unreachable in practice (MMDevices leaves are always
+ *         canonical GUIDs) but now impossible by construction.
+ *       - Counters CallbackHit_BTH / CallbackHit_Storage (declared +
+ *         persisted in Phase 0) are now wired via their table rows; the
+ *         userland decoders (track-d-arm.ps1 / check-consistency.ps1)
+ *         already read + label them (Phase 0 pre-wire), so no on-disk
+ *         schema or decoder change is needed.
+ *       - No new notify classes (Phase 2 territory). No image-name gate
+ *         change. Empirical caveat carried from Phase 0: `reg query /s`
+ *         over these parents may not generate observable NtEnumerateKey
+ *         traffic (kernel Cm-view cache serves hot parents), so a VM
+ *         probe may show CallbackHit_BTH/Storage=0 even though the code
+ *         path is structurally identical to the SCSI path validated
+ *         end-to-end - real exercise comes from a RubinOT session or the
+ *         Phase 2 value handler.
+ *       - Implementation writeup + 5-lens adversarial review outcome +
+ *         the empirical STORAGE\Volume shape findings:
+ *         docs/postmortem-v5-track-d/incident-v505-phase1-implementation.md
  * v5.0.4 - Simplify PID matching to per-callback image-name check
  *       (Kickoff sec 3.3 Option A). Remove PsSetCreateProcessNotifyRoutineEx
  *       + g_TrackDTrackedPids[] + KSPIN_LOCK + g_TrackDOverridePid +
@@ -828,6 +906,27 @@ const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
 #define TRACKD_ENUM_USB_MARKER_STR  L"\\Enum\\USB\\"
 #define TRACKD_ENUM_HID_MARKER_STR  L"\\Enum\\HID\\"
 
+/* v5.0.5 Phase 1 - BTH + STORAGE\Volume enum-name rewriters.
+ *
+ * BTH:  parent path suffix `\Enum\BTH`; child leaf shape
+ *       `Dev_XXXXXXXXXXXX` (literal `Dev_` + 12 hex = 6-byte BD_ADDR).
+ *       Only the 12 hex are rewritten; the `Dev_` prefix stays literal.
+ * STORAGE\Volume: parent path suffix `\Enum\STORAGE\Volume`; child leaf
+ *       shape `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}#offset` (38-wchar
+ *       canonical GUID + `#` + partition byte offset, for fixed disks).
+ *       Only the 32 GUID nibbles are rewritten; the braces, dashes, `#`,
+ *       and offset are preserved byte-exact. Removable/USBSTOR volumes
+ *       use a different `_??_USBSTOR#...#{GUID}` shape (GUID at the end)
+ *       and are a safe no-op pass-through. A zero offset (`#0`, `#0x0`,
+ *       all-zero) is left UNMODIFIED as a conservative skip - NOTE the
+ *       real system/boot volume sits at offset 0x100000, NOT 0, so this
+ *       does not single it out; rewriting it is harmless because the
+ *       mutation touches only the gated caller's enumerate result buffer,
+ *       never the on-disk hive (see the v5.0.5 Phase 1 changelog block). */
+#define TRACKD_BTH_SUFFIX_STR         L"\\Enum\\BTH"
+#define TRACKD_BTH_CHILD_PREFIX_STR   L"Dev_"
+#define TRACKD_STORAGE_VOL_SUFFIX_STR L"\\Enum\\STORAGE\\Volume"
+
 /* Suffix on our OWN Parameters key path for the write-tap that lets
  * userland toggle RubinOtPid + EnableRegCallback without a rebooted
  * driver having to re-read Parameters (which would deadlock under the
@@ -904,8 +1003,56 @@ typedef enum _TRACKD_PATH_TYPE {
     TRACKD_PATH_USB_INSTANCE   = 3,
     TRACKD_PATH_HID_INSTANCE   = 4,
     TRACKD_PATH_AUDIO_RENDER   = 5,
-    TRACKD_PATH_AUDIO_CAPTURE  = 6
+    TRACKD_PATH_AUDIO_CAPTURE  = 6,
+    TRACKD_PATH_BTH            = 7,  /* v5.0.5 Phase 1 */
+    TRACKD_PATH_STORAGE_VOLUME = 8   /* v5.0.5 Phase 1 */
 } TRACKD_PATH_TYPE;
+
+/* ================================================================
+ *  v5.0.5 Phase 1 - path descriptor table.
+ *
+ *  Converts the v5.0.1 if/else classifier + per-type dispatch switch
+ *  into a single data-driven table. Each intercepted parent path is
+ *  one row: a parent matcher, a child-name gate, a name synthesizer,
+ *  and the per-path hit counter to bump on a landed rewrite. Adding a
+ *  path type is now one table row + its three small callbacks, instead
+ *  of edits scattered across TrackDClassifyParent and the two switches
+ *  in TrackDHandlePostEnumerate.
+ *
+ *  The ValueRows / ValueRowCount slots are reserved for the Phase 2
+ *  value-read handler (kickoff §5.2) and are NULL / 0 until then; the
+ *  struct is laid out now so Phase 2 fills rows without re-touching the
+ *  descriptor definition or the dispatch loop.
+ *
+ *  Contract for the callbacks (identical reentrancy rules as the rest
+ *  of Track D - PASSIVE_LEVEL, no Zw*, memory-only):
+ *    MatchParent(parent)              -> TRUE iff this row owns `parent`.
+ *    ChildGate(realName, realWchars)  -> TRUE iff the enumerated leaf is
+ *                                        a rewrite candidate for this row.
+ *    SynthName(realName, realWchars,
+ *              outName)               -> fill outName (same wchar count).
+ *                                        MUST copy realName -> outName as
+ *                                        its first act so a shape bail
+ *                                        leaves a valid pass-through (no
+ *                                        uninitialized stack write-back).
+ * ================================================================ */
+struct _TRACKD_VALUE_ROW;   /* Phase 2 defines the body (kickoff §5.2) */
+
+typedef BOOLEAN (*TRACKD_PARENT_MATCHER)(PCUNICODE_STRING parent);
+typedef BOOLEAN (*TRACKD_CHILD_GATE)(const WCHAR *realName, ULONG realWchars);
+typedef VOID    (*TRACKD_NAME_SYNTH)(const WCHAR *realName, ULONG realWchars,
+                                     WCHAR *outName);
+
+typedef struct _TRACKD_PATH_DESCRIPTOR {
+    UCHAR                    PathType;      /* TRACKD_PATH_TYPE enum      */
+    const char *             Label;         /* "SCSI", "PCI", ... (ring)  */
+    TRACKD_PARENT_MATCHER    MatchParent;
+    TRACKD_CHILD_GATE        ChildGate;     /* name-side gate             */
+    TRACKD_NAME_SYNTH        SynthName;     /* name-side synthesizer      */
+    const struct _TRACKD_VALUE_ROW *ValueRows;   /* Phase 2; NULL now     */
+    ULONG                    ValueRowCount;       /* Phase 2; 0 now        */
+    volatile LONG *          HitCounter;    /* per-type counter (Phase 0) */
+} TRACKD_PATH_DESCRIPTOR;
 
 /* ================================================================
  *  v5.0.0 Track D globals (BSS-resident; retained for driver's
@@ -962,6 +1109,9 @@ static UNICODE_STRING  g_TrackDPciChildPrefix;     /* VEN_ */
 static UNICODE_STRING  g_TrackDMMDevRender;        /* \MMDevices\Audio\Render */
 static UNICODE_STRING  g_TrackDMMDevCapture;       /* \MMDevices\Audio\Capture */
 static UNICODE_STRING  g_TrackDEnableValueName;    /* EnableRegCallback */
+/* v5.0.5 Phase 1 additional parent-path views */
+static UNICODE_STRING  g_TrackDBthSuffix;          /* \Enum\BTH */
+static UNICODE_STRING  g_TrackDStorageVolSuffix;   /* \Enum\STORAGE\Volume */
 
 /* Rewrite counter (incremented once per successful in-place mutation)
  * plus flush infrastructure. The Cm callback never opens registry
@@ -995,7 +1145,8 @@ static volatile LONG   g_TrackDHitCount_BTH     = 0;
 static volatile LONG   g_TrackDHitCount_Storage = 0;
 
 /* v5.0.5 Phase 0 - callback invocations where parent path classifies
- * as one of our 6 target types (SCSI/PCI/USB/HID/AudioR/AudioC) but
+ * as one of our target types (SCSI/PCI/USB/HID/AudioR/AudioC in Phase 0;
+ * + BTH/Storage in Phase 1 = 8 total) but
  * caller's image name did NOT pass the "rubinot" prefix + delimiter
  * gate. Non-zero identifies OTHER processes enumerating HW-fingerprint
  * parents - useful to spot injected helpers or launcher-adjacent
@@ -1117,12 +1268,37 @@ static VOID     TrackDBuildSyntheticUsbHidInstance(const WCHAR *realName, ULONG 
                                                    WCHAR *outName);
 static VOID     TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchars,
                                               WCHAR *outName);
+/* v5.0.5 Phase 1: shared GUID-hex rewriter + BTH/STORAGE synthesizers. */
+static VOID     TrackDRewriteGuid32InPlace(WCHAR *outName, const WCHAR *realName,
+                                           const UCHAR *domain, ULONG domainLen);
+static VOID     TrackDBuildSyntheticBthDev(const WCHAR *realName, ULONG realWchars,
+                                           WCHAR *outName);
+static VOID     TrackDBuildSyntheticStorageVol(const WCHAR *realName, ULONG realWchars,
+                                               WCHAR *outName);
+static BOOLEAN  TrackDStorageOffsetIsZero(const WCHAR *realName, ULONG realWchars);
 static BOOLEAN  TrackDStartsWithI(const WCHAR *text, ULONG textLen,
                                   const WCHAR *prefix, ULONG prefixLen);
 static BOOLEAN  TrackDIsHexWchar(WCHAR c);
 static BOOLEAN  TrackDMatchUsbHidInstanceParent(PCUNICODE_STRING parent,
                                                 BOOLEAN wantUsb);
-static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent);
+/* v5.0.5 Phase 1: descriptor-table parent matchers + child gates. */
+static BOOLEAN  TrackDMatchScsiParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchPciParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchAudioRParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchAudioCParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchUsbParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchHidParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchBthParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDMatchStorageParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDGateScsiPrefix(const WCHAR *realName, ULONG realWchars);
+static BOOLEAN  TrackDGatePciPrefix(const WCHAR *realName, ULONG realWchars);
+static BOOLEAN  TrackDGateAny(const WCHAR *realName, ULONG realWchars);
+static BOOLEAN  TrackDGateAudioGuid(const WCHAR *realName, ULONG realWchars);
+static BOOLEAN  TrackDGateBthDev(const WCHAR *realName, ULONG realWchars);
+static BOOLEAN  TrackDGateStorageVol(const WCHAR *realName, ULONG realWchars);
+/* v5.0.5 Phase 1: classifier now yields the owning descriptor too. */
+static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent,
+                                             const TRACKD_PATH_DESCRIPTOR **outDesc);
 /* v5.0.4: image-name filter + miss recorder + arm-status writer.
  * Replaces the v5.0.2 PID-array + Ps notify helpers (all removed). */
 static BOOLEAN  TrackDCurrentCallerNameMatches(VOID);
@@ -2542,19 +2718,131 @@ static BOOLEAN TrackDMatchUsbHidInstanceParent(PCUNICODE_STRING parent,
     return TRUE;
 }
 
-/* Classify the parent path for intercept dispatch. Returns
- * TRACKD_PATH_NONE if no filter matches (fall through to pass-through). */
-static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent)
+/* ================================================================
+ *  v5.0.5 Phase 1 - descriptor-table parent matchers + child gates.
+ *
+ *  Thin wrappers so the g_TrackDDescriptors[] table can dispatch by
+ *  function pointer. Parent matchers preserve the exact predicates of
+ *  the v5.0.1 if/else classifier (suffix match, or the USB/HID VID_&PID_
+ *  structural match). Child gates preserve the exact per-type predicates
+ *  the v5.0.1 dispatch switch applied inline before calling a synth.
+ * ================================================================ */
+static BOOLEAN TrackDMatchScsiParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDEnumSuffix, parent, TRUE); }
+static BOOLEAN TrackDMatchPciParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDPciSuffix, parent, TRUE); }
+static BOOLEAN TrackDMatchAudioRParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDMMDevRender, parent, TRUE); }
+static BOOLEAN TrackDMatchAudioCParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDMMDevCapture, parent, TRUE); }
+static BOOLEAN TrackDMatchUsbParent(PCUNICODE_STRING parent)
+{ return TrackDMatchUsbHidInstanceParent(parent, TRUE); }
+static BOOLEAN TrackDMatchHidParent(PCUNICODE_STRING parent)
+{ return TrackDMatchUsbHidInstanceParent(parent, FALSE); }
+static BOOLEAN TrackDMatchBthParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDBthSuffix, parent, TRUE); }
+static BOOLEAN TrackDMatchStorageParent(PCUNICODE_STRING parent)
+{ return RtlSuffixUnicodeString(&g_TrackDStorageVolSuffix, parent, TRUE); }
+
+/* SCSI/PCI child gate: case-insensitive required leaf prefix. Builds a
+ * transient UNICODE_STRING over the stack-local real name so the exact
+ * RtlPrefixUnicodeString predicate of the v5.0.1 switch is preserved.
+ * realWchars <= TRACKD_MAX_NAME_WCHARS (256) is enforced by the caller,
+ * so realWchars * 2 never overflows the USHORT Length field. */
+static BOOLEAN TrackDGateScsiPrefix(const WCHAR *realName, ULONG realWchars)
 {
+    UNICODE_STRING us;
+    us.Buffer = (PWCH)realName;
+    us.Length = (USHORT)(realWchars * sizeof(WCHAR));
+    us.MaximumLength = us.Length;
+    return RtlPrefixUnicodeString(&g_TrackDSubkeyPrefix, &us, TRUE);
+}
+static BOOLEAN TrackDGatePciPrefix(const WCHAR *realName, ULONG realWchars)
+{
+    UNICODE_STRING us;
+    us.Buffer = (PWCH)realName;
+    us.Length = (USHORT)(realWchars * sizeof(WCHAR));
+    us.MaximumLength = us.Length;
+    return RtlPrefixUnicodeString(&g_TrackDPciChildPrefix, &us, TRUE);
+}
+/* USB/HID gate: none - a validated VID_&PID_ parent means every child is
+ * an instance-serial candidate (the synth is a no-op on odd shapes). */
+static BOOLEAN TrackDGateAny(const WCHAR *realName, ULONG realWchars)
+{ UNREFERENCED_PARAMETER(realName); UNREFERENCED_PARAMETER(realWchars); return TRUE; }
+/* Audio gate: canonical GUID shape (braces + 38 wchars). Matches the
+ * v5.0.1 switch guard exactly; the synth double-checks the dashes. */
+static BOOLEAN TrackDGateAudioGuid(const WCHAR *realName, ULONG realWchars)
+{ return (realWchars == 38 && realName[0] == L'{' && realName[37] == L'}'); }
+/* BTH gate: `Dev_` + exactly 12 hex (6-byte BD_ADDR). */
+static BOOLEAN TrackDGateBthDev(const WCHAR *realName, ULONG realWchars)
+{
+    ULONG i;
+    if (realWchars != 16) return FALSE;
+    if (!TrackDStartsWithI(realName, realWchars, TRACKD_BTH_CHILD_PREFIX_STR, 4)) return FALSE;
+    for (i = 4; i < 16; i++) {
+        if (!TrackDIsHexWchar(realName[i])) return FALSE;
+    }
+    return TRUE;
+}
+/* STORAGE\Volume gate: canonical `{GUID}#offset` shape (GUID at index 0)
+ * with a NON-zero offset. The zero-offset refusal is a conservative skip;
+ * it does NOT reliably identify the boot volume (which is at offset
+ * 0x100000 on real hardware) - safe either way since the rewrite is
+ * non-persistent. USBSTOR `_??_...#{GUID}` (GUID at end) fails the index-0
+ * brace check and passes through. See TrackDBuildSyntheticStorageVol. */
+static BOOLEAN TrackDGateStorageVol(const WCHAR *realName, ULONG realWchars)
+{
+    ULONG i;
+    if (realWchars < 40) return FALSE;
+    if (realName[0]  != L'{') return FALSE;
+    if (realName[37] != L'}') return FALSE;
+    if (realName[9]  != L'-' || realName[14] != L'-' ||
+        realName[19] != L'-' || realName[24] != L'-') return FALSE;
+    if (realName[38] != L'#') return FALSE;
+    /* All 32 GUID nibble positions must be hex (a braces+dashes leaf with
+     * a non-hex body is left untouched). */
+    for (i = 1; i < 37; i++) {
+        if (i == 9 || i == 14 || i == 19 || i == 24) continue;
+        if (!TrackDIsHexWchar(realName[i])) return FALSE;
+    }
+    if (TrackDStorageOffsetIsZero(realName, realWchars)) return FALSE;
+    return TRUE;
+}
+
+/* v5.0.5 Phase 1: the descriptor table. Order is priority order; the
+ * suffixes / structural matchers are mutually exclusive so order only
+ * affects which is tested first (SCSI first = hottest path). ValueRows/
+ * ValueRowCount are Phase 2 (kickoff §5.2), NULL/0 for now. */
+static const TRACKD_PATH_DESCRIPTOR g_TrackDDescriptors[] = {
+    { TRACKD_PATH_SCSI,           "SCSI",    TrackDMatchScsiParent,    TrackDGateScsiPrefix, TrackDBuildSyntheticName,           NULL, 0, &g_TrackDHitCount_SCSI    },
+    { TRACKD_PATH_PCI,            "PCI",     TrackDMatchPciParent,     TrackDGatePciPrefix,  TrackDBuildSyntheticPciName,        NULL, 0, &g_TrackDHitCount_PCI     },
+    { TRACKD_PATH_AUDIO_RENDER,   "AudioR",  TrackDMatchAudioRParent,  TrackDGateAudioGuid,  TrackDBuildSyntheticAudioGuid,      NULL, 0, &g_TrackDHitCount_AudioR  },
+    { TRACKD_PATH_AUDIO_CAPTURE,  "AudioC",  TrackDMatchAudioCParent,  TrackDGateAudioGuid,  TrackDBuildSyntheticAudioGuid,      NULL, 0, &g_TrackDHitCount_AudioC  },
+    { TRACKD_PATH_USB_INSTANCE,   "USB",     TrackDMatchUsbParent,     TrackDGateAny,        TrackDBuildSyntheticUsbHidInstance, NULL, 0, &g_TrackDHitCount_USB     },
+    { TRACKD_PATH_HID_INSTANCE,   "HID",     TrackDMatchHidParent,     TrackDGateAny,        TrackDBuildSyntheticUsbHidInstance, NULL, 0, &g_TrackDHitCount_HID     },
+    { TRACKD_PATH_BTH,            "BTH",     TrackDMatchBthParent,     TrackDGateBthDev,     TrackDBuildSyntheticBthDev,         NULL, 0, &g_TrackDHitCount_BTH     },
+    { TRACKD_PATH_STORAGE_VOLUME, "Storage", TrackDMatchStorageParent, TrackDGateStorageVol, TrackDBuildSyntheticStorageVol,     NULL, 0, &g_TrackDHitCount_Storage },
+};
+
+/* Classify the parent path for intercept dispatch. Returns
+ * TRACKD_PATH_NONE if no filter matches (fall through to pass-through).
+ * On a match, `*outDesc` (when non-NULL) is set to the owning row so the
+ * caller reaches the child gate / synth / hit counter without a second
+ * lookup. Preserves the v5.0.1 predicate set via the table matchers. */
+static TRACKD_PATH_TYPE TrackDClassifyParent(PCUNICODE_STRING parent,
+                                             const TRACKD_PATH_DESCRIPTOR **outDesc)
+{
+    ULONG i;
+    if (outDesc) *outDesc = NULL;
     if (parent == NULL || parent->Buffer == NULL || parent->Length == 0) {
         return TRACKD_PATH_NONE;
     }
-    if (RtlSuffixUnicodeString(&g_TrackDEnumSuffix,   parent, TRUE)) return TRACKD_PATH_SCSI;
-    if (RtlSuffixUnicodeString(&g_TrackDPciSuffix,    parent, TRUE)) return TRACKD_PATH_PCI;
-    if (RtlSuffixUnicodeString(&g_TrackDMMDevRender,  parent, TRUE)) return TRACKD_PATH_AUDIO_RENDER;
-    if (RtlSuffixUnicodeString(&g_TrackDMMDevCapture, parent, TRUE)) return TRACKD_PATH_AUDIO_CAPTURE;
-    if (TrackDMatchUsbHidInstanceParent(parent, TRUE))  return TRACKD_PATH_USB_INSTANCE;
-    if (TrackDMatchUsbHidInstanceParent(parent, FALSE)) return TRACKD_PATH_HID_INSTANCE;
+    for (i = 0; i < ARRAYSIZE(g_TrackDDescriptors); ++i) {
+        if (g_TrackDDescriptors[i].MatchParent(parent)) {
+            if (outDesc) *outDesc = &g_TrackDDescriptors[i];
+            return (TRACKD_PATH_TYPE)g_TrackDDescriptors[i].PathType;
+        }
+    }
     return TRACKD_PATH_NONE;
 }
 
@@ -2693,23 +2981,27 @@ static VOID TrackDBuildSyntheticUsbHidInstance(const WCHAR *realName, ULONG real
     }
 }
 
-/* MMDevices Audio endpoint GUID rewriter. Input is the leaf subkey
- * name shape `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (38 wchars,
- * including braces). Rewrites the 32 hex nibbles preserving the
- * enclosing `{`, `}`, and 4 dashes at fixed offsets.
+/* v5.0.5 Phase 1: shared 32-nibble GUID rewriter. `outName` MUST already
+ * contain the real leaf (caller RtlCopyMemory's it first); this overwrites
+ * ONLY the 32 hex nibble positions of a canonical GUID located at index 0
+ * (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`), preserving the braces at 0/37,
+ * the dashes at 9/14/19/24, and ANYTHING at index 38 and beyond (e.g. the
+ * STORAGE\Volume `#offset` tail). The FNV input is the 38 canonical GUID
+ * wchars at realName[0..37] (76 bytes) - so the synthetic GUID depends only
+ * on the real GUID and seed, NOT on any trailing bytes: two STORAGE\Volume
+ * partitions of the same disk (same GUID, different `#offset`) map to the
+ * SAME synthetic GUID, keeping cross-partition consistency intact.
  *
- * If input doesn't match the exact GUID shape, pass-through unchanged. */
-static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchars,
-                                          WCHAR *outName)
+ * Extracted verbatim from the v5.0.1 Audio synthesizer so its byte-for-byte
+ * output is unchanged; only the domain tag varies per caller. */
+static VOID TrackDRewriteGuid32InPlace(WCHAR *outName, const WCHAR *realName,
+                                       const UCHAR *domain, ULONG domainLen)
 {
-    static const UCHAR DOMAIN_AUDIO[] = "AUDIO_GUID|";
-    static const ULONG DOMAIN_AUDIO_LEN = sizeof(DOMAIN_AUDIO) - 1;
     static const WCHAR HEX_UPPER[16] =
         { L'0', L'1', L'2', L'3', L'4', L'5', L'6', L'7',
           L'8', L'9', L'A', L'B', L'C', L'D', L'E', L'F' };
-    /* Structural positions (0-indexed) in a 38-wchar canonical GUID
-     * `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` : dashes at 9, 14, 19,
-     * 24; braces at 0, 37. */
+    /* GUID input is always the 38 canonical wchars (76 bytes) at index 0. */
+    static const ULONG GUID_INPUT_BYTES = 38u * sizeof(WCHAR);
     UCHAR buf[192];
     ULONG bufLen;
     ULONGLONG h1;
@@ -2718,21 +3010,13 @@ static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchar
     ULONG cursor;
     ULONG i;
 
-    if (realWchars != 38) return;    /* not a canonical GUID */
-    if (realName[0]  != L'{') return;
-    if (realName[37] != L'}') return;
-    if (realName[9]  != L'-' || realName[14] != L'-' ||
-        realName[19] != L'-' || realName[24] != L'-') return;
-
-    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
-
     /* Produce 32 hex chars from FNV rounds, skipping dash positions. */
     cursor = 1;    /* first hex slot inside `{` */
     while (produced < 32) {
         bufLen = 0;
-        if (bufLen + DOMAIN_AUDIO_LEN > sizeof(buf)) break;
-        RtlCopyMemory(buf + bufLen, DOMAIN_AUDIO, DOMAIN_AUDIO_LEN);
-        bufLen += DOMAIN_AUDIO_LEN;
+        if (bufLen + domainLen > sizeof(buf)) break;
+        RtlCopyMemory(buf + bufLen, domain, domainLen);
+        bufLen += domainLen;
         if (g_TrackDSeedLen > 0) {
             if (bufLen + g_TrackDSeedLen > sizeof(buf)) break;
             RtlCopyMemory(buf + bufLen, g_TrackDSeed, g_TrackDSeedLen);
@@ -2741,7 +3025,7 @@ static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchar
         if (bufLen + 1 > sizeof(buf)) break;
         buf[bufLen++] = (UCHAR)'|';
         {
-            ULONG realBytes = realWchars * sizeof(WCHAR);
+            ULONG realBytes = GUID_INPUT_BYTES;
             if (bufLen + realBytes > sizeof(buf)) realBytes = sizeof(buf) - bufLen;
             if (realBytes > 0) {
                 RtlCopyMemory(buf + bufLen, (const UCHAR *)realName, realBytes);
@@ -2765,6 +3049,123 @@ static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchar
         }
         round++;
     }
+}
+
+/* MMDevices Audio endpoint GUID rewriter. Input is the leaf subkey
+ * name shape `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}` (38 wchars,
+ * including braces). Rewrites the 32 hex nibbles preserving the
+ * enclosing `{`, `}`, and 4 dashes at fixed offsets.
+ *
+ * If input doesn't match the exact GUID shape, pass-through unchanged.
+ *
+ * v5.0.5 Phase 1: copy-FIRST hardening - outName is populated with the
+ * real name before ANY shape bail, so a gated-but-malformed leaf (e.g.
+ * 38 wchars with braces but a non-dash at a separator slot) writes the
+ * real name back unchanged instead of leaking an uninitialized stack
+ * buffer to the caller. Byte-for-byte output for valid GUIDs is
+ * unchanged (same FNV recipe via TrackDRewriteGuid32InPlace). */
+static VOID TrackDBuildSyntheticAudioGuid(const WCHAR *realName, ULONG realWchars,
+                                          WCHAR *outName)
+{
+    static const UCHAR DOMAIN_AUDIO[] = "AUDIO_GUID|";
+    static const ULONG DOMAIN_AUDIO_LEN = sizeof(DOMAIN_AUDIO) - 1;
+
+    if (realWchars == 0) return;
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    if (realWchars != 38) return;    /* not a canonical GUID */
+    if (realName[0]  != L'{') return;
+    if (realName[37] != L'}') return;
+    if (realName[9]  != L'-' || realName[14] != L'-' ||
+        realName[19] != L'-' || realName[24] != L'-') return;
+
+    TrackDRewriteGuid32InPlace(outName, realName, DOMAIN_AUDIO, DOMAIN_AUDIO_LEN);
+}
+
+/* v5.0.5 Phase 1: BTH device-address rewriter. Leaf shape
+ * `Dev_XXXXXXXXXXXX` (literal `Dev_` + 12 uppercase hex = 6-byte
+ * BD_ADDR). Preserves the `Dev_` prefix literally; regenerates the 12
+ * hex via FNV(seed + real 12-hex bytes, domain "BTH_DEV|") - same
+ * token-in-place recipe as SCSI/PCI, same wchar count. Copy-first so a
+ * malformed leaf passes through unchanged. */
+static VOID TrackDBuildSyntheticBthDev(const WCHAR *realName, ULONG realWchars,
+                                       WCHAR *outName)
+{
+    static const UCHAR DOMAIN_BTH[] = "BTH_DEV|";
+    static const ULONG DOMAIN_BTH_LEN = sizeof(DOMAIN_BTH) - 1;
+    ULONG i;
+
+    if (realWchars == 0) return;
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    /* Only the canonical `Dev_` + 12 hex shape is rewritten. */
+    if (realWchars != 16) return;
+    if (!TrackDStartsWithI(realName, realWchars, TRACKD_BTH_CHILD_PREFIX_STR, 4)) return;
+    for (i = 4; i < 16; i++) {
+        if (!TrackDIsHexWchar(realName[i])) return;
+    }
+
+    /* FNV over the 12 real hex wchars; write 12 hex back at offset 4. */
+    TrackDFillTokenFnv(outName, 4, 12, realName, 4, 12,
+                       DOMAIN_BTH, DOMAIN_BTH_LEN);
+}
+
+/* v5.0.5 Phase 1: TRUE iff the STORAGE\Volume `#offset` tail encodes a
+ * ZERO byte offset (a conservative skip - NOT a reliable boot-volume
+ * marker; the real system volume is at offset 0x100000, not 0).
+ * realName[38] is the `#`; the
+ * offset is realName[39..realWchars). An optional `0x`/`0X` radix prefix
+ * is stripped, then TRUE iff every remaining digit is '0' - or if there
+ * are no digits at all (malformed `#` / `#0x`), which we conservatively
+ * treat as zero so a weird leaf is protected rather than rewritten. */
+static BOOLEAN TrackDStorageOffsetIsZero(const WCHAR *realName, ULONG realWchars)
+{
+    ULONG i = 39;   /* first offset char (past `{GUID}` + `#`) */
+
+    if (i >= realWchars) return TRUE;              /* nothing after `#`  */
+    if (i + 1 < realWchars &&
+        realName[i] == L'0' &&
+        (realName[i + 1] == L'x' || realName[i + 1] == L'X')) {
+        i += 2;                                    /* strip 0x / 0X      */
+    }
+    if (i >= realWchars) return TRUE;              /* `#0x` with no body */
+    for (; i < realWchars; i++) {
+        if (realName[i] != L'0') return FALSE;     /* a non-zero digit   */
+    }
+    return TRUE;                                   /* all zeros          */
+}
+
+/* v5.0.5 Phase 1: STORAGE\Volume GUID rewriter. Leaf shape
+ * `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}#offset` (38-wchar canonical
+ * GUID + `#` + partition byte offset). Rewrites ONLY the 32 GUID nibbles
+ * via FNV(seed + real 38-GUID bytes, domain "STORAGE_VOL|"), preserving
+ * braces, dashes, `#`, and the offset byte-exact. Copy-first so a
+ * malformed leaf passes through unchanged.
+ *
+ * A zero offset is left UNMODIFIED (conservative skip; see
+ * TrackDStorageOffsetIsZero + the changelog rationale - note it does NOT
+ * reliably mark the boot volume). Mirrors the ChildGate; re-checked here
+ * as defense in depth in case a future caller invokes the synth without
+ * the gate. */
+static VOID TrackDBuildSyntheticStorageVol(const WCHAR *realName, ULONG realWchars,
+                                           WCHAR *outName)
+{
+    static const UCHAR DOMAIN_STOR[] = "STORAGE_VOL|";
+    static const ULONG DOMAIN_STOR_LEN = sizeof(DOMAIN_STOR) - 1;
+
+    if (realWchars == 0) return;
+    RtlCopyMemory(outName, realName, realWchars * sizeof(WCHAR));
+
+    /* Shape: {38-wchar GUID}#>=1-char-offset. */
+    if (realWchars < 40) return;
+    if (realName[0]  != L'{') return;
+    if (realName[37] != L'}') return;
+    if (realName[9]  != L'-' || realName[14] != L'-' ||
+        realName[19] != L'-' || realName[24] != L'-') return;
+    if (realName[38] != L'#') return;
+    if (TrackDStorageOffsetIsZero(realName, realWchars)) return;   /* boot vol */
+
+    TrackDRewriteGuid32InPlace(outName, realName, DOMAIN_STOR, DOMAIN_STOR_LEN);
 }
 
 /* v5.0.4: in-band image-name filter. Called synchronously from the Cm
@@ -2951,9 +3352,8 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
     WCHAR real[TRACKD_MAX_NAME_WCHARS];
     WCHAR synth[TRACKD_MAX_NAME_WCHARS];
     ULONG realWchars;
-    UNICODE_STRING realUs;
     TRACKD_PATH_TYPE pathType;
-    BOOLEAN childOk = FALSE;
+    const TRACKD_PATH_DESCRIPTOR *desc = NULL;
 
     post = (PREG_POST_OPERATION_INFORMATION)Argument2;
     if (post == NULL) return STATUS_SUCCESS;
@@ -2964,8 +3364,9 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
      * get-key-object-id call. Rejected callers bump the name-miss
      * counter and stash their leaf into g_TrackDLastMissName for
      * userland diagnostics - see TrackDRecordNameMiss.
-     * v5.0.5 Phase 0: on miss, ALSO classify the parent - if it matches
-     * one of our 6 target types, bump g_TrackDNonRubiParentMatchCount and
+     * v5.0.5 Phase 0/1: on miss, ALSO classify the parent - if it matches
+     * one of our target types (8 as of Phase 1), bump
+     * g_TrackDNonRubiParentMatchCount and
      * ring-buffer the event with WasGated=0. Non-zero counter identifies
      * OTHER processes (helpers/injected workers) touching HW-fingerprint
      * parents - would invalidate the "gate covers everything relevant"
@@ -2979,7 +3380,7 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
             keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object,
                                                &keyId, &keyName);
             if (NT_SUCCESS(keyIdSt) && keyName != NULL) {
-                pathType = TrackDClassifyParent(keyName);
+                pathType = TrackDClassifyParent(keyName, NULL);
                 if (pathType != TRACKD_PATH_NONE) {
                     InterlockedIncrement(&g_TrackDNonRubiParentMatchCount);
                     TrackDRecordHit((UCHAR)pathType, 0, keyName, NULL, 0);
@@ -2999,8 +3400,8 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
         WriteLastCallbackStatus(TRACKD_TAG_PATH_GET_FAIL, keyIdSt);
         return STATUS_SUCCESS;
     }
-    pathType = TrackDClassifyParent(keyName);
-    if (pathType == TRACKD_PATH_NONE) return STATUS_SUCCESS;
+    pathType = TrackDClassifyParent(keyName, &desc);
+    if (pathType == TRACKD_PATH_NONE || desc == NULL) return STATUS_SUCCESS;
 
     /* Extract subkey name from caller's buffer per KeyInformationClass. */
     switch (pre->KeyInformationClass) {
@@ -3054,47 +3455,13 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
         return STATUS_SUCCESS;
     }
 
-    realUs.Buffer = real;
-    realUs.Length = (USHORT)nameLenBytes;
-    realUs.MaximumLength = (USHORT)nameLenBytes;
-
-    /* Per-type child-name prefix gate + synthesizer dispatch. */
-    switch (pathType) {
-    case TRACKD_PATH_SCSI:
-        if (RtlPrefixUnicodeString(&g_TrackDSubkeyPrefix, &realUs, TRUE)) {
-            TrackDBuildSyntheticName(real, realWchars, synth);
-            childOk = TRUE;
-        }
-        break;
-    case TRACKD_PATH_PCI:
-        if (RtlPrefixUnicodeString(&g_TrackDPciChildPrefix, &realUs, TRUE)) {
-            TrackDBuildSyntheticPciName(real, realWchars, synth);
-            childOk = TRUE;
-        }
-        break;
-    case TRACKD_PATH_USB_INSTANCE:
-    case TRACKD_PATH_HID_INSTANCE:
-        /* No child-name prefix gate: enumerating under a validated
-         * VID_&PID_ parent means every child is an instance-serial
-         * candidate. Empty or malformed names are handled by the
-         * synthesizer itself (no-op copy). */
-        TrackDBuildSyntheticUsbHidInstance(real, realWchars, synth);
-        childOk = TRUE;
-        break;
-    case TRACKD_PATH_AUDIO_RENDER:
-    case TRACKD_PATH_AUDIO_CAPTURE:
-        /* GUID synthesizer bails internally if shape !=
-         * `{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`. */
-        if (realWchars == 38 && real[0] == L'{' && real[37] == L'}') {
-            TrackDBuildSyntheticAudioGuid(real, realWchars, synth);
-            childOk = TRUE;
-        }
-        break;
-    default:
-        break;
-    }
-
-    if (!childOk) return STATUS_SUCCESS;
+    /* v5.0.5 Phase 1: descriptor-driven child gate + synthesizer. The
+     * gate is the per-type predicate the v5.0.1 switch applied inline;
+     * on a pass, the synth fills `synth` (same wchar count, copy-first so
+     * an odd shape yields a valid pass-through). Non-candidate leaves
+     * return here without touching the caller's buffer. */
+    if (!desc->ChildGate(real, realWchars)) return STATUS_SUCCESS;
+    desc->SynthName(real, realWchars, synth);
 
     /* Write back. Same wchar count -> NameLength unchanged. */
     __try {
@@ -3105,21 +3472,14 @@ static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2)
     }
 
     InterlockedIncrement(&g_TrackDHitCount);
-    /* v5.0.5 Phase 0: per-path-type breakdown + ring buffer append
-     * for the just-landed rewrite. Uses pathType classified above +
-     * `real` snapshot of the pre-rewrite leaf (more useful for triage
-     * than the synthetic post-rewrite name). keyName from CmCallback-
-     * GetKeyObjectID is still valid at this point (Cm docs guarantee
-     * for callback lifetime). */
-    switch (pathType) {
-    case TRACKD_PATH_SCSI:          InterlockedIncrement(&g_TrackDHitCount_SCSI);   break;
-    case TRACKD_PATH_PCI:           InterlockedIncrement(&g_TrackDHitCount_PCI);    break;
-    case TRACKD_PATH_USB_INSTANCE:  InterlockedIncrement(&g_TrackDHitCount_USB);    break;
-    case TRACKD_PATH_HID_INSTANCE:  InterlockedIncrement(&g_TrackDHitCount_HID);    break;
-    case TRACKD_PATH_AUDIO_RENDER:  InterlockedIncrement(&g_TrackDHitCount_AudioR); break;
-    case TRACKD_PATH_AUDIO_CAPTURE: InterlockedIncrement(&g_TrackDHitCount_AudioC); break;
-    default: break;
-    }
+    /* v5.0.5 Phase 0/1: per-path-type breakdown + ring buffer append for
+     * the just-landed rewrite. The per-type counter now lives in the
+     * descriptor (desc->HitCounter), so BTH + STORAGE\Volume are wired by
+     * the table row alone - no switch edit. `real` is the pre-rewrite
+     * leaf snapshot (more useful for triage than the synthetic name);
+     * keyName from CmCallbackGetKeyObjectID is still valid here (Cm docs
+     * guarantee for the callback lifetime). */
+    InterlockedIncrement(desc->HitCounter);
     TrackDRecordHit((UCHAR)pathType, 1, keyName, real, realWchars);
     WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
     return STATUS_SUCCESS;
@@ -3574,6 +3934,9 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     RtlInitUnicodeString(&g_TrackDMMDevRender,     TRACKD_MMDEV_RENDER_STR);
     RtlInitUnicodeString(&g_TrackDMMDevCapture,    TRACKD_MMDEV_CAPTURE_STR);
     RtlInitUnicodeString(&g_TrackDEnableValueName, TRACKD_ENABLE_VAL_STR);
+    /* v5.0.5 Phase 1 additional parent-path suffixes. */
+    RtlInitUnicodeString(&g_TrackDBthSuffix,        TRACKD_BTH_SUFFIX_STR);
+    RtlInitUnicodeString(&g_TrackDStorageVolSuffix, TRACKD_STORAGE_VOL_SUFFIX_STR);
 
     ExInitializeWorkItem(&g_TrackDFlushWorkItem, TrackDFlushWorker, NULL);
 
