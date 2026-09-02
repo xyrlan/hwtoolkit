@@ -270,9 +270,10 @@ function Read-CallbackStatus {
 
     # v5.0.5 Phase 0: non-rubi parent match counter.
     # >0 = algum processo NAO matchando "rubinot" prefix + delimiter
-    # enumerou um dos nossos 6 target parents (SCSI/PCI/USB/HID/AudioR/
-    # AudioC). Indica que o gate _strnicmp("rubinot", 7) esta cego pra
-    # esse processo - candidato pra broadening do gate em v5.0.6.
+    # enumerou um dos nossos target parents (SCSI/PCI/USB/HID/AudioR/
+    # AudioC + BTH/Storage em Phase 1 = 8). Indica que o gate
+    # _strnicmp("rubinot", 7) esta cego pra esse processo - candidato
+    # pra broadening do gate em v5.0.6.
     $nrp = (Get-ItemProperty -Path $rstflt -Name 'CallbackNonRubiParentMatch' `
                               -ErrorAction SilentlyContinue).CallbackNonRubiParentMatch
     if ($null -ne $nrp) {

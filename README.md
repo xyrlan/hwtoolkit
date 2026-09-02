@@ -125,6 +125,10 @@ Kickoff completo: `docs/track-d-kernel-registry-callback-kickoff.md`.
 Design decisions e trade-offs: `docs/postmortem-v5-track-d/incident-
 v500-mvp-integration.md`. Especificacao byte-a-byte do sintetizador
 de nome (para portar validador userland): `docs/track-d-name-recipe.md`.
+v5.0.5 Phase 1 (BTH + STORAGE\Volume + descriptor-table refactor):
+kickoff `docs/track-d-v505-value-handler-kickoff.md` §4, implementacao +
+review + descobertas empiricas de shape em `docs/postmortem-v5-track-d/
+incident-v505-phase1-implementation.md`.
 
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
@@ -140,6 +144,30 @@ Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
   * `\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\
     Render\{GUID}` and `\Capture\{GUID}` - endpoint GUID rewritten
     inside the enclosing braces.
+
+Escopo `v5.0.5 Phase 1` (kickoff `docs/track-d-v505-value-handler-
+kickoff.md` sec 4): descriptor-table refactor (o if/else classifier +
+os dois switches per-type viraram uma tabela `g_TrackDDescriptors[]`,
+pre-requisito estrutural pro Phase 2 value handler) + dois novos
+enum-name rewriters:
+
+  * `\Enum\BTH\Dev_XXXXXXXXXXXX` - os 12 hex do BD_ADDR reescritos via
+    FNV; prefixo `Dev_` preservado. Counter `CallbackHit_BTH`.
+  * `\Enum\STORAGE\Volume\{GUID}#offset` (discos fixos) - so os 32
+    nibbles do GUID reescritos; chaves `{`, `}`, dashes, `#` e offset
+    preservados byte-exato. Counter `CallbackHit_Storage`. O rewrite e
+    NAO-PERSISTENTE: muta so o buffer de enumerate do processo gated,
+    nunca o hive em disco - logo `\SystemRoot` e o boot real ficam
+    intactos. Skip conservador de offset-zero (`#0`, `#0x0`, tudo-zero);
+    NOTA empirica (host real 2026-09-01): o volume de sistema fica em
+    offset 0x100000, NAO zero - o skip nao marca o boot volume, mas
+    reescreve-lo e inofensivo pelo motivo acima. Volumes removiveis
+    (`_??_USBSTOR#...#{GUID}`, GUID no fim) sao pass-through no-op.
+    `scripts\phase1-sanity-test.ps1` inspeciona os filhos reais da VM e
+    classifica cada um. Consideracao: o GUID sintetico aqui usa dominio
+    FNV proprio e NAO casa com o spoof userland de volume-GUID
+    (`spoof-volume-guid.ps1` / MountedDevices) - reconciliar se EMAC
+    cruzar os dois.
 
 Ativacao (pipeline recomendado):
 
@@ -166,7 +194,13 @@ Le `Parameters\LastCallbackStatus` decoded (tag + NTSTATUS),
 (entradas no callback body, v5.0.4+), `CallbackNameMissCount`
 (invocacoes rejeitadas pelo image-name gate, v5.0.4+), e
 `LastMissImageName` (primeiros 15 bytes do image name do ultimo
-caller rejeitado, v5.0.4+).
+caller rejeitado, v5.0.4+). Alem disso (v5.0.5 Phase 0+1): os 8
+counters per-path `CallbackHit_{SCSI,PCI,USB,HID,AudioR,AudioC,BTH,
+Storage}`, o `CallbackNonRubiParentMatch` (parent classificou mas
+image-name gate rejeitou - deteccao de "quem mais enumera nossos
+targets"), e o ring buffer `HitRingBuffer` (ultimos 16 hits decodados
+como timestamp/image/tipo/gated/leaf). BTH e Storage passam de
+reservados a WIRED em Phase 1.
 
 Tags (v5.0.4): 0x00 OK, 0x01 NAME-MISS, 0x02 RESERVED, 0x03
 PATH-GET-FAIL, 0x04 BUFFER-BAD, 0x05 ALLOC-FAIL, 0x06 SEH-FAULT.
