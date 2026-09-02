@@ -435,9 +435,12 @@ switch ($PSCmdlet.ParameterSetName) {
             # v5.0.5 Phase 2: WasGated is now a kind byte, not a bool:
             #   0 = enum-side non-rubi parent match
             #   1 = enum-side gated rewrite landed
-            #   2 = value-side gated engage
+            #   2 = value-side gated engage (substring rewriter)
             #   3 = value-side non-rubi match
-            $kindNames = @{ 0 = 'e/no '; 1 = 'e/YES'; 2 = 'v/YES'; 3 = 'v/no ' }
+            #   4 = value-side gated engage via SYNTH (v5.0.6 Phase 2 OEM
+            #       string synthesizer path; distinct from substring so
+            #       ring forensics can bucket which path landed)
+            $kindNames = @{ 0 = 'e/no '; 1 = 'e/YES'; 2 = 'v/YES'; 3 = 'v/no '; 4 = 'v/SYN' }
             # Windows-1252 preserves bytes >= 0x80 as printable characters
             # (matching how EPROCESS.ImageFileName renders in Windows tooling);
             # ASCII would substitute '?' for those bytes, defeating triage of
