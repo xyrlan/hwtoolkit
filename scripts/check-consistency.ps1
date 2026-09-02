@@ -268,6 +268,38 @@ function Read-CallbackStatus {
         Write-Host "  [!]    Track D CallbackHit_* per-path counters ausentes: driver pre-v5.0.5 carregado" -ForegroundColor Yellow
     }
 
+    # v5.0.5 Phase 2: value-read handler state + per-surface counters.
+    # EnableValueReadRewrite=1 arma o RegNtPostQueryValueKey handler (o fix
+    # dominante: EMAC le por nome via RegQueryValueEx). CallbackValHit_*>0
+    # confirma que o handler engajou nos values daquela superficie. Se
+    # ValHit_SCSI>0 & CallbackHit_SCSI=0, e a confirmacao do padrao by-name.
+    $evr = (Get-ItemProperty -Path $rstflt -Name 'EnableValueReadRewrite' `
+                              -ErrorAction SilentlyContinue).EnableValueReadRewrite
+    if ($null -ne $evr) {
+        $color = if ($evr -eq 1) { 'Green' } else { 'DarkGray' }
+        Write-Host ("  [*]    Track D EnableValueReadRewrite: {0}" -f $evr) -ForegroundColor $color
+        $eer = (Get-ItemProperty -Path $rstflt -Name 'EnableEdidValueRewrite' `
+                                  -ErrorAction SilentlyContinue).EnableEdidValueRewrite
+        if ($null -ne $eer) {
+            Write-Host ("  [*]    Track D EnableEdidValueRewrite: {0}" -f $eer) -ForegroundColor DarkGray
+        }
+        $valNames = @('CallbackValHit_SCSI','CallbackValHit_PCI','CallbackValHit_BTH',
+                      'CallbackValHit_Storage','CallbackValHit_Edid')
+        foreach ($n in $valNames) {
+            $v = (Get-ItemProperty -Path $rstflt -Name $n -ErrorAction SilentlyContinue).$n
+            if ($null -ne $v) {
+                $color = if ($v -gt 0) { 'Green' } else { 'DarkGray' }
+                Write-Host ("  [*]    Track D {0,-24}: {1}" -f $n, $v) -ForegroundColor $color
+            }
+        }
+        $nrv = (Get-ItemProperty -Path $rstflt -Name 'CallbackNonRubiValueMatch' `
+                                  -ErrorAction SilentlyContinue).CallbackNonRubiValueMatch
+        if ($null -ne $nrv) {
+            $color = if ($nrv -gt 0) { 'Yellow' } else { 'DarkGray' }
+            Write-Host ("  [*]    Track D CallbackNonRubiValueMatch: {0}" -f $nrv) -ForegroundColor $color
+        }
+    }
+
     # v5.0.5 Phase 0: non-rubi parent match counter.
     # >0 = algum processo NAO matchando "rubinot" prefix + delimiter
     # enumerou um dos nossos target parents (SCSI/PCI/USB/HID/AudioR/
@@ -293,15 +325,21 @@ function Read-CallbackStatus {
     if ($null -ne $ring -and $ring.Length -ge 96) {
         $recSize = 96
         $slotCount = [Math]::Min(16, [int]($ring.Length / $recSize))
-        $filled = 0; $gated = 0; $nonrubi = 0
+        # v5.0.5 Phase 2: offset+25 is a kind byte, not a bool:
+        #   0=enum non-rubi, 1=enum gated, 2=value gated, 3=value non-rubi.
+        $filled = 0; $enumGated = 0; $valGated = 0; $nonrubi = 0
         for ($i = 0; $i -lt $slotCount; $i++) {
             $off = $i * $recSize
             $ts = [System.BitConverter]::ToInt64($ring, $off)
             if ($ts -eq 0) { continue }
             $filled++
-            if ($ring[$off + 25] -eq 1) { $gated++ } else { $nonrubi++ }
+            switch ([int]$ring[$off + 25]) {
+                1 { $enumGated++ }
+                2 { $valGated++ }
+                default { $nonrubi++ }   # 0 (enum non-rubi) or 3 (value non-rubi)
+            }
         }
-        Write-Host ("  [*]    Track D HitRingBuffer: {0}/16 slots preenchidos ({1} gated, {2} non-rubi)" -f $filled, $gated, $nonrubi) -ForegroundColor DarkGray
+        Write-Host ("  [*]    Track D HitRingBuffer: {0}/16 slots ({1} enum-gated, {2} value-gated, {3} non-rubi)" -f $filled, $enumGated, $valGated, $nonrubi) -ForegroundColor DarkGray
     }
 }
 

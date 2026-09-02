@@ -128,7 +128,11 @@ de nome (para portar validador userland): `docs/track-d-name-recipe.md`.
 v5.0.5 Phase 1 (BTH + STORAGE\Volume + descriptor-table refactor):
 kickoff `docs/track-d-v505-value-handler-kickoff.md` §4, implementacao +
 review + descobertas empiricas de shape em `docs/postmortem-v5-track-d/
-incident-v505-phase1-implementation.md`.
+incident-v505-phase1-implementation.md`. v5.0.5 Phase 2 (value-read
+handler `RegNtPostQueryValueKey`): kickoff §5, implementacao + review +
+racional de formato/EDID em `docs/postmortem-v5-track-d/
+incident-v505-phase2-implementation.md`; recipe value-side em
+`docs/track-d-name-recipe.md` §8.
 
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
@@ -169,18 +173,58 @@ enum-name rewriters:
     (`spoof-volume-guid.ps1` / MountedDevices) - reconciliar se EMAC
     cruzar os dois.
 
+Escopo `v5.0.5 Phase 2` (kickoff `docs/track-d-v505-value-handler-
+kickoff.md` sec 5) - o **fix aritmeticamente dominante**: o handler
+`RegNtPostQueryValueKey`. Phase 0/1 reescreviam so NOMES de subchave em
+`RegNtPostEnumerateKey`, mas o triage pos-ban provou que EMAC NUNCA
+enumera - abre cada chave por nome exato (via SetupDi/CM_*) e le os
+VALORES com `RegQueryValueEx`. Um nome de subchave sintetico ao lado de
+um `HardwareID` real e um tell de ban MAIS forte que a fingerprint crua.
+Phase 2 reescreve o DATA do valor pra casar com os sinteticos do
+name-side, byte-a-byte (mesmos dominios FNV -> consistencia por
+construcao). Superficies cobertas (as que o kernel POSSUI - userland roda
+`--skip-disk/--skip-volume/--skip-usb/--skip-hid`):
+
+  * SCSI: `HardwareID`, `CompatibleIDs`, `DeviceDesc`, `FriendlyName`,
+    `Mfg` - neutraliza as strings Ven/Prod/Rev (parseadas do parent
+    `Disk&Ven_...`) onde quer que aparecam no valor. Counter
+    `CallbackValHit_SCSI`.
+  * PCI: `HardwareID`, `CompatibleIDs` - reescreve os campos
+    `SUBSYS_`/`REV_` (marker-anchored), preserva `VEN_`/`DEV_`. Counter
+    `CallbackValHit_PCI`.
+  * BTH / STORAGE\Volume: neutralizam o BD_ADDR / GUID se presente no
+    valor (frequentemente no-op - esses vazam via instance-ID, nao via
+    valor; o counter revela empiricamente). Counters `CallbackValHit_BTH`
+    / `CallbackValHit_Storage`.
+  * EDID (`\Enum\DISPLAY\...\Device Parameters`, `REG_BINARY` 128):
+    reescreve o serial numerico (bytes 12-15) + descriptor 0xFF (serial
+    ASCII) + recomputa o checksum (byte 127). NAO toca o nome 0xFC nem
+    DTDs (preserva modelo/timing). Superficie value-only, atras de flag
+    SEPARADA `EnableEdidValueRewrite` (default off) - NAO usar junto com
+    `spoof-edid-full.ps1` (double-spoof). Counter `CallbackValHit_Edid`.
+
+FORA de escopo (deliberado): MachineGuid/ComputerName/CPU (userland Level
+A ja spoofa esses no registry; kernel double-spoofaria) e USB/HID value
+(o `HardwareID` `USB\VID_&PID_&REV_` nao carrega serial - so o
+instance-ID vaza, superficie CM_Get_Device_ID). Detalhes:
+`docs/postmortem-v5-track-d/incident-v505-phase2-implementation.md`.
+
 Ativacao (pipeline recomendado):
 
 ```
-.\02-compilar-driver.bat                  # gera rstflt.sys v5.0.0 assinado
+.\02-compilar-driver.bat                  # gera rstflt.sys v5.0.5 assinado
 .\03-instalar-driver.bat                  # instala + registra + reboot
 .\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume --skip-usb --skip-hid   # Level A userland (defense in depth)
-.\scripts\track-d-arm.ps1 -Enable         # seta EnableRegCallback=1 + seed
+.\scripts\track-d-arm.ps1 -Enable         # seta EnableRegCallback=1 + seed (name-side)
 # reboot para o Cm callback armar
+.\scripts\track-d-arm.ps1 -EnableValueRewrite   # v5.0.5 Phase 2: seta EnableValueReadRewrite=1 (value-side)
+# (hot-toggle via tap, sem reboot; precisa EnableRegCallback ja armado)
 ```
 
-Track D e ORTOGONAL a Level A e Level C: pode conviver com ambos.
-Level A cobre read-VALUE (userland), Track D cobre read-NAME (kernel).
+Track D name-side (Phase 0/1) cobre read-NAME (`RegEnumKeyEx`); Track D
+value-side (Phase 2) cobre read-VALUE (`RegQueryValueEx`) - o padrao que
+EMAC realmente usa. Level A userland fica como defense-in-depth para as
+superficies que o kernel nao possui (MachineGuid/ComputerName/CPU/EDID).
 
 Diagnostico:
 
@@ -199,8 +243,16 @@ counters per-path `CallbackHit_{SCSI,PCI,USB,HID,AudioR,AudioC,BTH,
 Storage}`, o `CallbackNonRubiParentMatch` (parent classificou mas
 image-name gate rejeitou - deteccao de "quem mais enumera nossos
 targets"), e o ring buffer `HitRingBuffer` (ultimos 16 hits decodados
-como timestamp/image/tipo/gated/leaf). BTH e Storage passam de
-reservados a WIRED em Phase 1.
+como timestamp/image/tipo/kind/leaf). BTH e Storage passam de
+reservados a WIRED em Phase 1. Em `v5.0.5 Phase 2`: `EnableValueRead
+Rewrite`/`EnableEdidValueRewrite` (estado), os counters value-side
+`CallbackValHit_{SCSI,PCI,BTH,Storage,Edid}` (engagement do value
+handler por superficie - no-op contado como engage quando o valor nao
+carrega o token), o `CallbackNonRubiValueMatch`, e o campo `kind` do
+ring buffer que agora distingue `e/YES` (enum-gated), `v/YES` (value-
+gated), `e/no`/`v/no` (non-rubi). Padrao esperado de sucesso:
+`CallbackValHit_SCSI` > 0 com `CallbackHit_SCSI` = 0 (confirma o padrao
+by-name que motivou o Phase 2).
 
 Tags (v5.0.4): 0x00 OK, 0x01 NAME-MISS, 0x02 RESERVED, 0x03
 PATH-GET-FAIL, 0x04 BUFFER-BAD, 0x05 ALLOC-FAIL, 0x06 SEH-FAULT.
@@ -227,7 +279,8 @@ manual via `-SetPid`. Removido em v5.0.4 - motivos e evidencia em
 Desativacao (sem uninstall do driver):
 
 ```
-.\scripts\track-d-arm.ps1 -Disable        # EnableRegCallback=0, efeito imediato v5.0.1+
+.\scripts\track-d-arm.ps1 -Disable             # EnableRegCallback=0 (name+value), efeito imediato v5.0.1+
+.\scripts\track-d-arm.ps1 -DisableValueRewrite # so o value-side (Phase 2): EnableValueReadRewrite=0 + EnableEdidValueRewrite=0
 ```
 
 Em `v5.0.1+` o `-Disable` toma efeito imediatamente: o tap

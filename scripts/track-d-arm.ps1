@@ -42,6 +42,19 @@
       CallbackHitRingIndex       REG_DWORD  proximo slot a ser escrito (%16)
       HitRingBuffer              REG_BINARY 16 * 96 bytes; ver decoder em -Diagnose
 
+    v5.0.5 Phase 2 additions:
+      EnableValueReadRewrite     REG_DWORD  gate do value-read handler
+                                            (RegNtPostQueryValueKey); 0=off default,
+                                            1=on. Independente de EnableRegCallback.
+      EnableEdidValueRewrite     REG_DWORD  gate SEPARADO do EDID binary rewriter;
+                                            0=off default (userland ja spoofa EDID).
+      CallbackValHit_SCSI        REG_DWORD  value reads onde o handler SCSI engajou
+      CallbackValHit_PCI         REG_DWORD  idem PCI
+      CallbackValHit_BTH         REG_DWORD  idem BTH (no-op se valor nao carrega addr)
+      CallbackValHit_Storage     REG_DWORD  idem STORAGE\Volume
+      CallbackValHit_Edid        REG_DWORD  idem EDID (requer EnableEdidValueRewrite)
+      CallbackNonRubiValueMatch  REG_DWORD  processo non-rubi leu um value alvo
+
     v5.0.4: RubinOtPid + -SetPid removidos. O gate agora e image-name
     inline (PsGetProcessImageFileName + _strnicmp "rubinot") em vez de
     PID array populado por PsSetCreateProcessNotifyRoutineEx.
@@ -58,6 +71,17 @@
         registrado no kernel, mas a hot path g_TrackDEnabled=FALSE
         transforma tudo em pass-through).
 
+      .\track-d-arm.ps1 -EnableValueRewrite [-Edid]
+        Escreve EnableValueReadRewrite=1 (arma o value-read handler
+        RegNtPostQueryValueKey). Requer EnableRegCallback ja =1 (o callback
+        precisa estar registrado). Efeito imediato via tap. Com -Edid,
+        tambem escreve EnableEdidValueRewrite=1 (so em deployment kernel-
+        EDID-only; senao double-spoofa com spoof-edid-full.ps1).
+
+      .\track-d-arm.ps1 -DisableValueRewrite
+        Escreve EnableValueReadRewrite=0 e EnableEdidValueRewrite=0. Efeito
+        imediato; name-side (EnableRegCallback) permanece como estava.
+
       .\track-d-arm.ps1 -Diagnose
         Le todos os valores Parameters + decoded LastCallbackStatus/
         LastArmStatus (tag/status), CallbackHitCount, CallbackInvokeCount,
@@ -71,6 +95,21 @@ param(
 
     [Parameter(ParameterSetName = 'Disable')]
     [switch]$Disable,
+
+    # v5.0.5 Phase 2: arm/disarm the value-read handler (RegNtPostQueryValueKey).
+    [Parameter(ParameterSetName = 'EnableValue')]
+    [switch]$EnableValueRewrite,
+
+    # Optional companion to -EnableValueRewrite: also arm the EDID binary
+    # rewriter (EnableEdidValueRewrite). OFF by default because the
+    # recommended deployment spoofs EDID from userland (spoof-edid-full.ps1);
+    # enabling both would double-spoof. Only pass -Edid in a kernel-EDID-only
+    # deployment.
+    [Parameter(ParameterSetName = 'EnableValue')]
+    [switch]$Edid,
+
+    [Parameter(ParameterSetName = 'DisableValue')]
+    [switch]$DisableValueRewrite,
 
     [Parameter(ParameterSetName = 'Diagnose')]
     [switch]$Diagnose
@@ -174,6 +213,37 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Info 'kernel; hot path vira pass-through para todos os PIDs.'
     }
 
+    'EnableValue' {
+        Write-Section 'Track D - Enable value-read handler (Phase 2)'
+        Assert-DriverInstalled
+        $cur = Get-ItemProperty -Path $paramsKey -ErrorAction SilentlyContinue
+        $regCb = if ($cur -and $cur.PSObject.Properties.Name -contains 'EnableRegCallback') { [int]$cur.EnableRegCallback } else { 0 }
+        if ($regCb -ne 1) {
+            Write-Warn 'EnableRegCallback != 1 - o callback nao esta armado; o value handler nao dispara.'
+            Write-Warn 'Rode primeiro: .\track-d-arm.ps1 -Enable (+ reboot se o driver carregou antes do arm).'
+        }
+        Set-ItemProperty -Path $paramsKey -Name 'EnableValueReadRewrite' -Value 1 -Type DWord -Force
+        Write-OK 'EnableValueReadRewrite = 1 (RegNtPostQueryValueKey armado)'
+        if ($Edid) {
+            Set-ItemProperty -Path $paramsKey -Name 'EnableEdidValueRewrite' -Value 1 -Type DWord -Force
+            Write-OK 'EnableEdidValueRewrite = 1'
+            Write-Warn 'EDID kernel rewrite ativo: NAO rode spoof-edid-full.ps1 no mesmo deployment (double-spoof).'
+        } else {
+            Write-Info 'EnableEdidValueRewrite inalterado (default 0). Use -Edid so em deployment kernel-EDID-only.'
+        }
+        Write-Info 'Efeito imediato via tap RegNtPreSetValueKey (sem reboot). Gate por image name (rubinot*) vale.'
+    }
+
+    'DisableValue' {
+        Write-Section 'Track D - Disable value-read handler (Phase 2)'
+        Assert-DriverInstalled
+        Set-ItemProperty -Path $paramsKey -Name 'EnableValueReadRewrite' -Value 0 -Type DWord -Force
+        Set-ItemProperty -Path $paramsKey -Name 'EnableEdidValueRewrite' -Value 0 -Type DWord -Force
+        Write-OK 'EnableValueReadRewrite = 0'
+        Write-OK 'EnableEdidValueRewrite = 0'
+        Write-Info 'Efeito imediato. Name-side (EnableRegCallback) permanece inalterado.'
+    }
+
     'Diagnose' {
         Write-Section 'Track D - Diagnose'
         Assert-DriverInstalled
@@ -193,15 +263,17 @@ switch ($PSCmdlet.ParameterSetName) {
         }
 
         Show-Val 'EnableRegCallback'
+        Show-Val 'EnableValueReadRewrite'  '(0 ou ausente = value handler off)'
+        Show-Val 'EnableEdidValueRewrite'  '(0 ou ausente = EDID rewrite off)'
         Show-Val 'RegCallbackSeed'
         Show-Val 'CallbackHitCount'      '(0 ou nenhum rewrite landou)'
         Show-Val 'CallbackInvokeCount'   '(0 ou callback nunca entrou)'
         Show-Val 'CallbackNameMissCount' '(0 ou nenhum invoke rejeitado)'
         Show-Val 'LastMissImageName'     '(nenhum miss registrado)'
 
-        # v5.0.5 Phase 0: per-path-type breakdown
+        # v5.0.5 Phase 0/1: per-path-type breakdown (enum-name side)
         Write-Host ''
-        Write-Host '  --- Per-path-type hit counters (v5.0.5) ---' -ForegroundColor DarkGray
+        Write-Host '  --- Enum-name hit counters (v5.0.5 Phase 0/1) ---' -ForegroundColor DarkGray
         Show-Val 'CallbackHit_SCSI'            '(nenhum SCSI rewrite)'
         Show-Val 'CallbackHit_PCI'             '(nenhum PCI rewrite)'
         Show-Val 'CallbackHit_USB'             '(nenhum USB rewrite)'
@@ -211,6 +283,16 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Val 'CallbackHit_BTH'             '(nenhum BTH rewrite)'
         Show-Val 'CallbackHit_Storage'         '(nenhum STORAGE\Volume rewrite)'
         Show-Val 'CallbackNonRubiParentMatch'  '(nenhum non-rubi processo tocou nossos parents)'
+
+        # v5.0.5 Phase 2: per-surface VALUE-read counters
+        Write-Host ''
+        Write-Host '  --- Value-read hit counters (v5.0.5 Phase 2) ---' -ForegroundColor DarkGray
+        Show-Val 'CallbackValHit_SCSI'         '(nenhum value read SCSI engajado)'
+        Show-Val 'CallbackValHit_PCI'          '(nenhum value read PCI engajado)'
+        Show-Val 'CallbackValHit_BTH'          '(nenhum value read BTH engajado)'
+        Show-Val 'CallbackValHit_Storage'      '(nenhum value read STORAGE engajado)'
+        Show-Val 'CallbackValHit_Edid'         '(nenhum value read EDID engajado)'
+        Show-Val 'CallbackNonRubiValueMatch'   '(nenhum non-rubi leu um value alvo)'
         Show-Val 'CallbackHitRingIndex'        '(ring buffer nunca escrito)'
 
         # LastCallbackStatus decoded (hot path breadcrumb)
@@ -246,8 +328,15 @@ switch ($PSCmdlet.ParameterSetName) {
             $pathNames = @{
                 0 = 'NONE   '; 1 = 'SCSI   '; 2 = 'PCI    ';
                 3 = 'USB    '; 4 = 'HID    '; 5 = 'AudioR '; 6 = 'AudioC ';
-                7 = 'BTH    '; 8 = 'Storage'   # v5.0.5 Phase 1 (wired)
+                7 = 'BTH    '; 8 = 'Storage';  # v5.0.5 Phase 1 (wired)
+                9 = 'EDID   '                  # v5.0.5 Phase 2 (value-only)
             }
+            # v5.0.5 Phase 2: WasGated is now a kind byte, not a bool:
+            #   0 = enum-side non-rubi parent match
+            #   1 = enum-side gated rewrite landed
+            #   2 = value-side gated engage
+            #   3 = value-side non-rubi match
+            $kindNames = @{ 0 = 'e/no '; 1 = 'e/YES'; 2 = 'v/YES'; 3 = 'v/no ' }
             # Windows-1252 preserves bytes >= 0x80 as printable characters
             # (matching how EPROCESS.ImageFileName renders in Windows tooling);
             # ASCII would substitute '?' for those bytes, defeating triage of
@@ -255,7 +344,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $ansiEnc = [Text.Encoding]::GetEncoding(1252)
             Write-Host ''
             Write-Host '  --- Ring buffer (last 16 hits, physical slot order) ---' -ForegroundColor DarkGray
-            Write-Host '  slot  timestamp                    image             type     gated  hash    child' -ForegroundColor DarkGray
+            Write-Host '  slot  timestamp                    image             type     kind   hash    child' -ForegroundColor DarkGray
             $anyValid = $false
             for ($i = 0; $i -lt $slotCount; $i++) {
                 $off = $i * $recSize
@@ -273,7 +362,8 @@ switch ($PSCmdlet.ParameterSetName) {
                 $child = [Text.Encoding]::Unicode.GetString($ring, $off + 28, 64).TrimEnd([char]0)
                 $ptStr = $pathNames[$pt]
                 if (-not $ptStr) { $ptStr = ('   ' + $pt + '   ') }
-                $gStr = if ($wg -eq 1) { ' YES ' } else { '  no ' }
+                $gStr = $kindNames[$wg]
+                if (-not $gStr) { $gStr = ('  ' + $wg + '  ') }
                 Write-Host ('   {0,2}  {1}   {2,-16}  {3}  {4}  0x{5:X4}  {6}' -f $i, $tsStr, $img, $ptStr, $gStr, $hash, $child) -ForegroundColor Cyan
             }
             if (-not $anyValid) {
@@ -300,6 +390,13 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host '    NonRubiParentMatch>0 & ring mostra imgs nao-rubi  -> algum helper/service enumera HW; gate precisa broaden' -ForegroundColor DarkGray
         Write-Host '    Todos CallbackHit_XXX=0 & InvokeCount alto        -> EMAC usa RegOpenKey+RegQueryValueEx (nao RegEnumKeyEx);' -ForegroundColor DarkGray
         Write-Host '                                                         Phase 2 value handler resolve. Padrao esperado v5.0.5.' -ForegroundColor DarkGray
+        Write-Host '  v5.0.5 Phase 2 diagnostics (value-read handler):' -ForegroundColor DarkGray
+        Write-Host '    EnableValueReadRewrite=0                          -> value handler nao armado; rode -EnableValueRewrite' -ForegroundColor DarkGray
+        Write-Host '    CallbackValHit_SCSI>0 (kind v/YES no ring)        -> rubinot leu HardwareID/etc SCSI; value rewrite engajou' -ForegroundColor DarkGray
+        Write-Host '    ValHit_SCSI>0 & CallbackHit_SCSI=0                -> confirma o padrao by-name (o objetivo do Phase 2)' -ForegroundColor DarkGray
+        Write-Host '    ValHit_BTH/Storage=0 apos sessao real            -> esses values nao carregam o token (esperado; addr/GUID' -ForegroundColor DarkGray
+        Write-Host '                                                         vazam via instance-ID, nao via value)' -ForegroundColor DarkGray
+        Write-Host '    NonRubiValueMatch>0                              -> processo non-rubi leu um value alvo; considerar gate' -ForegroundColor DarkGray
     }
 }
 
