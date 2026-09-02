@@ -60,7 +60,7 @@ RSTFLT_LIBS = wdmsec.lib
 all: rstflt.sys
 
 # ---------------- rstflt ----------------
-rstflt.obj: rstflt.c
+rstflt.obj: rstflt.c trackd_inventory.h
 	$(CC) $(CFLAGS_COMMON) /Fo"rstflt.obj" /c rstflt.c
 
 rstflt.sys: rstflt.obj

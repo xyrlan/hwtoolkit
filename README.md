@@ -142,7 +142,25 @@ do handler so encontra tokens do parent path (VEN/DEV/SUBSYS/Prod hex)
 que essas strings nao contem. Postmortem: `docs/postmortem-v5-track-d/
 incident-v505-phase2-ban-cleartext-oem-strings.md`. Fix planejado v5.0.6
 (synthesizer independente por (class, value_name)): kickoff em
-`docs/track-d-v506-oem-string-synthesizer-kickoff.md`.
+`docs/track-d-v506-oem-string-synthesizer-kickoff.md`. **v5.0.6 Phase 1
+(2026-09-02, PR pending)** landa o inventario curado: `driver/trackd_
+inventory.h` novo com 78 rows enterprise-plausiveis + LATAM-uncommon +
+anti-colisao INF distribuidas em 6 pools (SCSI 19 / PCI 13 / USB 13 /
+HID 13 / BTH 13 / STORAGE 7, tamanhos todos primos pra reduzir bias no
+`FNV % rowCount`). Estrutura de linha e uma-row-por-device (vendor +
+produto + rev + DeviceDesc + FriendlyName + Mfg agrupados) selecionada
+via `subSeed = FNV1a64(seed, className); rowIndex = ((FNV1a64(subSeed,
+parentPathHash) >> 32) % rowCount)` - todos os value-name reads no mesmo
+parent voltam com colunas da MESMA row, garantindo coerencia cross-value
+(o gap exato que EMAC pegou no ban de v5.0.5 Phase 2). PCI Q2 resolvida
+em favor de **Option A (workitem hash-map)**: Phase 2 vai schedular um
+`IoAllocateWorkItem` de `DriverEntry` que walk `Enum\PCI` OUTSIDE o Cm
+callback lock, le `ClassGUID` de cada child, e popula uma 256-slot
+FNV1a hash map com `TRACKD_PCI_CLASSHINT_*` (enum publica ja landed no
+header) - callback consulta O(1). Nenhuma nova flag de arm; nenhum
+callback wiring; nenhum sanity test - hot path idem Phase 0. Phase 2
+wira dispatch. Postmortem: `docs/postmortem-v5-track-d/incident-v506-
+phase1-implementation.md`.
 
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):

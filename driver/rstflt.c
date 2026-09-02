@@ -153,6 +153,131 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v5.0.6 - Phase 1 - OEM string synthesizer inventory curation.
+ *     Scope: DATA + CONTRACTS only. No callback wiring, no synthesizer
+ *     body, no reader on top of the Phase 0 measure-first hooks. Hot
+ *     path is byte-identical to the Phase 0 build; the new header only
+ *     contributes .rdata literals + typedefs. Phase 1 does not
+ *     reference the pool arrays from any code path, but MSVC + link.exe
+ *     under /INTEGRITYCHECK on this WDK toolchain keep .rdata alive
+ *     even when its symbols are unreferenced (verified empirically:
+ *     rstflt.sys grew 61712 -> 79632 bytes = +17920, which matches the
+ *     header's aggregate literal + struct-array footprint). That is
+ *     the intended landing shape: the pool data ships once here and
+ *     is available for Phase 2's synthesizer callbacks with no
+ *     additional linker touch. The signed binary is loadable and
+ *     boots identically to the Phase 0 build - the extra data is
+ *     inert until Phase 2 dereferences it.
+ *     - What LANDED (Phase 1):
+ *         * driver/trackd_inventory.h (NEW, 832 lines): per-class
+ *           inventory pools for the OEM string synthesizer. Six pools -
+ *           SCSI 19 rows, PCI 13 rows, USB 13 rows, HID 13 rows, BTH
+ *           13 rows, STORAGE 7 rows (78 rows total, every pool sized
+ *           to a prime to reduce FNV % rowCount modulo bias). Row
+ *           shape is one struct per device class with (Vendor* /
+ *           Product / Rev / DeviceDesc / FriendlyName / Mfg) grouped
+ *           on the row - selection picks ONE row per parent, and all
+ *           value-name reads on that parent return columns off the
+ *           SAME row, guaranteeing brand coherence across DeviceDesc,
+ *           FriendlyName, Mfg (the exact cross-value inconsistency
+ *           EMAC caught in the v5.0.5 Phase 2 ban - "NVIDIA GeForce
+ *           RTX 3070" DeviceDesc while HardwareID was FNV synthetic).
+ *         * Curation bias enforced: enterprise-plausible (Micron 5300/
+ *           7400/9300, Samsung PM/MZ datacenter, Kioxia CD/CM, Intel
+ *           D-series, HGST/WD Ultrastar, Seagate Exos, Toshiba MG,
+ *           HP LOGICAL VOLUME / DELL PERC H755 array-controller
+ *           presentations; Mellanox ConnectX-6 Dx, Intel X710/E810,
+ *           Broadcom BCM57504; NVIDIA RTX A4000, AMD Radeon PRO
+ *           W6800, Intel DC GPU Flex 170, NVIDIA Tesla T4). Consumer
+ *           bans applied: NO Kingston SA400/A400, ADATA XPG, Sandisk
+ *           Ultra, Crucial BX/MX, WD Blue/Black, Samsung 970/980,
+ *           ASMedia USB, Realtek consumer ALC audio, NVIDIA GeForce
+ *           GTX/RTX consumer, AMD Radeon RX consumer. LATAM-uncommon
+ *           swap: Realtek USB-Ethernet -> ASIX AX88179A (Lenovo/Dell
+ *           enterprise dock), Chicony webcam dropped (Brazilian
+ *           consumer laptop mainstay), USB Root Hub dropped (wrong
+ *           enumeration shape - Enum\USB\ROOT_HUB30 has no VID_/PID_
+ *           pair).
+ *         * Contract enum TRACKD_SYNTH_VALUENAME (DEVICEDESC /
+ *           FRIENDLYNAME / MFG / HARDWAREID / COMPATIBLEIDS) so Phase
+ *           2's callback front-end resolves the incoming wide-string
+ *           value name ONCE and dispatches by enum (typo-proof; a
+ *           silent _wcsicmp miss cannot fall through to passthrough,
+ *           which is the failure class v5.0.6 exists to prevent).
+ *         * Contract enums TRACKD_PCI_CLASSHINT (UNKNOWN / GPU / NIC /
+ *           STORAGE_CTRL / AUDIO / USB_CTRL + reserved HDA_AUDIO / NVME
+ *           / RAID_SATA slots for Phase 1.5) and TRACKD_USB_DEVICECLASS
+ *           (13 device-class hints). Every PCI/USB row carries its
+ *           hint typed as the enum (was UCHAR in the draft), so MSVC
+ *           /W4 catches cross-class typos at row-init time.
+ *         * Contract SELECTION FORMULA documented in the header prologue
+ *           (Phase 1 REVISED vs the kickoff sketch): subSeed = FNV1a64
+ *           (g_TrackDSeed, className) - NO XOR on valueName. rowIndex
+ *           = (ULONG)((FNV1a64(subSeed, parentPathHash) >> 32) % rowCount).
+ *           The >>32 shift removes FNV1a64 low-bit modulo bias when
+ *           rowCount is small (13, 7, 19), leaving the full 64-bit
+ *           mixing product to drive selection. Because subSeed depends
+ *           on className ONLY, all value-name queries against a given
+ *           parent land on the SAME row; this is the property Phase 2
+ *           needs for cross-value brand coherence.
+ *         * PCI Q2 resolution (kickoff §10 Q2, Option A - HASHMAP +
+ *           WORKITEM): Phase 2 will schedule an IoAllocateWorkItem
+ *           from DriverEntry that walks Enum\PCI subkeys OUTSIDE the
+ *           Cm callback lock, reads each child's ClassGUID, and
+ *           populates a private 256-slot FNV1a(VEN|DEV|SUBSYS|REV)
+ *           hash map with the resolved TRACKD_PCI_CLASSHINT_* tag.
+ *           The Cm callback consults that map O(1) per parent. Cold-
+ *           start window (a few hundred ms before the worker completes)
+ *           falls through safely to the class-generic pool. Header
+ *           reserves the enum + ClassHint field NOW so Phase 2 wires
+ *           the workitem body without a header schema break; no
+ *           additional arm flag is added (EnableValueSynth from Phase
+ *           0 gates both the classmap build kickoff and the
+ *           synthesizer dispatch).
+ *         * rstflt.c gains #define TRACKD_INVENTORY_IMPL + #include
+ *           "trackd_inventory.h" (after PsGetProcessImageFileName
+ *           prototype). This forces the Phase 1 build to fully parse +
+ *           type-check the header and its data literals, so a header
+ *           typo cannot slip past Phase 1 and surface only when Phase
+ *           2 references an array. On this WDK toolchain the .rdata
+ *           literals ship in the signed binary even without callers
+ *           (rstflt.sys 61712 -> 79632 bytes = +17920, matching the
+ *           header's aggregate footprint). That is intentional: the
+ *           data is available for Phase 2's synthesizer callbacks with
+ *           no additional linker touch, and the extra bytes are inert
+ *           until Phase 2 dereferences them - the driver boots and
+ *           runs identically to the Phase 0 build. Also updated
+ *           driver/makefile.mak so rstflt.obj lists trackd_inventory.h
+ *           as a dependency; incremental rebuilds now trigger on
+ *           header edits (single-file build was rebuilding anyway,
+ *           but the explicit dependency is correct + documents intent).
+ *     - What DEFERRED (Phase 2):
+ *         * The synthesizer callbacks themselves (per-class formatters
+ *           that pick a row via the selection formula, look up the
+ *           column via TRACKD_SYNTH_VALUENAME, and RtlStringCbCopyW
+ *           into the caller's buffer).
+ *         * TRACKD_VALUE_DESCRIPTOR extension with a Synthesizer field
+ *           (drives the dispatch from TrackDHandlePostQueryValue).
+ *         * 9 SynthHit_* + 4 Synth*Bail counter increments (counters
+ *           declared in Phase 0; Phase 2 bumps them on the synth path).
+ *         * IoAllocateWorkItem body that populates the PCI classmap +
+ *           its cancel path if driver unload races enumeration.
+ *         * USB xHCI FriendlyName format-string handling per kickoff
+ *           §4.2 (preserve the "@System32\drivers\usbxhci.sys,#...;
+ *           (VendorSynth,X.YZ,A.BC)" Microsoft wrapper - the header
+ *           has two representative rows spanning both real wire
+ *           patterns; Phase 2 wraps the pool string into the
+ *           usbxhci.sys resource frame at emit time).
+ *         * VM sanity + bare-metal test (Phase 1 has no callback
+ *           surface change to measure).
+ *     - Companion userland: NONE in Phase 1. EnableValueSynth /
+ *       -Diagnose / SynthHit_* counter names all landed in Phase 0
+ *       and continue to work; no arm-script edits required.
+ *     See docs/track-d-v506-oem-string-synthesizer-kickoff.md §2/§4/
+ *     §10-Q2 for the design + docs/postmortem-v5-track-d/incident-
+ *     v506-phase1-implementation.md for the Phase 1 writeup + review
+ *     outcome (30 findings across 6 lenses, all CRITICAL + HIGH
+ *     applied inline before landing).
  * v5.0.6 - Phase 0 - OEM string synthesizer scaffolding + measure-first
  *     counters.
  *     Motivation: bare-metal RubinOT ban #5 (2026-09-02, driver v5.0.5
@@ -1044,6 +1169,20 @@
  * by the per-callback image-name filter that replaced the v5.0.0-v5.0.3
  * PID-array gate. */
 NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
+/* v5.0.6 Phase 1: OEM string synthesizer inventory header. Instantiated
+ * once in this translation unit via TRACKD_INVENTORY_IMPL. Phase 1 lands
+ * the data + type contract only; Phase 2 wires the synthesizer callbacks
+ * that consume the row pools. All Phase-1 references to the pool arrays
+ * are zero (linker DCE strips the .rdata), so the signed rstflt.sys size
+ * stays byte-idem to the Phase 0 build - but the compiler still validates
+ * every literal + struct init at build time, so a header typo cannot slip
+ * past Phase 1 unnoticed and surface only when Phase 2 first dereferences
+ * the arrays. See docs/track-d-v506-oem-string-synthesizer-kickoff.md
+ * §2/§4 + docs/postmortem-v5-track-d/incident-v506-phase1-implementation.md
+ * for the pool curation + selection contract. */
+#define TRACKD_INVENTORY_IMPL
+#include "trackd_inventory.h"
 
 /* ================================================================
  *  Constants
