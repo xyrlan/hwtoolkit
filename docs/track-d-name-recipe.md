@@ -34,12 +34,23 @@ the marker; the field VALUE is preserved case as read):
 Only fields whose marker is present in the real name get rewritten;
 missing markers cause the field to stay as-is.
 
+**Minimum token length (v5.0.5 Phase 2).** A field whose value is shorter
+than `TRACKD_MIN_TOKEN_WCHARS` (3 wchars) is left REAL and NOT rewritten,
+on BOTH the name side and the value side. This floor exists because the
+value-read handler neutralizes the same token by same-length substring
+replacement in `HardwareID`/`CompatibleIDs`/etc., and a blind 1-2 char
+substring replace would collide with unrelated bytes; flooring both sides
+keeps the enumerated subkey name and the by-name value read in lockstep
+(a 1-2 char Ven/Prod/Rev - low entropy anyway - stays real in both). A
+userland reproducer MUST apply the same `>= 3` floor per field.
+
 ---
 
 ## 2. Per-field mixer input
 
 For each field `F` in `{Ven, Prod, Rev}` that is present and has
-length `L` (in wchars, `L > 0`), the kernel emits `L` uppercase-hex
+length `L` (in wchars, `L >= 3` per section 1's minimum-token floor),
+the kernel emits `L` uppercase-hex
 wchars by iterating `round = 0, 1, 2, ...` until it has produced `L`
 characters (16 hex chars per hash, so
 `ceil(L / 16)` rounds are needed).
@@ -223,10 +234,67 @@ Disk&Ven_ABCDEF01&Prod_1234567890AB
 
 ---
 
-## 8. Version history
+## 8. Value-side recipe (v5.0.5 Phase 2) — how the VALUE handler stays consistent
+
+The `RegNtPostQueryValueKey` handler (v5.0.5 Phase 2) rewrites the DATA of
+values like `HardwareID` / `CompatibleIDs` so a by-name `RegQueryValueEx`
+returns synthetic tokens that match the enumerated subkey name. The whole
+point is that a userland validator (or the anti-cheat's own cross-check)
+sees the SAME synthetic token in both places.
+
+Consistency is achieved by construction, not by a second recipe:
+
+1. The handler parses the REAL token (Ven / Prod / Rev / SUBSYS / BD_ADDR /
+   GUID) out of the value's **parent key path** — e.g. for a `HardwareID`
+   read on `\...\Enum\SCSI\Disk&Ven_KINGSTON&Prod_SA400S37480G\<instance>`
+   it extracts Ven=`KINGSTON`, Prod=`SA400S37480G` from the `Disk&Ven_...`
+   component. This is the SAME string the enum-name synth saw as the subkey
+   name, so the FNV input (section 2) is byte-identical.
+2. It computes the synthetic token with the SAME `TrackDFillTokenFnv`
+   primitive, SAME domain tags, SAME seed, SAME UTF-16LE real bytes, SAME
+   round-byte formula. Output length equals input length (section 4).
+3. For the string-value surfaces (SCSI, BTH, STORAGE\Volume) it then does a
+   **same-length substring replacement** of every occurrence of the real
+   token in the value data with the synthetic token, matching case-
+   insensitively but writing the fixed synthetic bytes. Because the
+   synthetic token has the identical wchar count, `REG_MULTI_SZ` NUL
+   separators, the double-NUL terminator, and `REG_SZ` terminators are all
+   preserved.
+4. For PCI the value entries are literally `PCI\VEN_..&DEV_..&SUBSYS_..&REV_..`
+   (same shape as the subkey name), so it reuses the marker-anchored field
+   rewrite (`&SUBSYS_`/`&REV_`) — identical to `TrackDBuildSyntheticPciName`.
+
+Domain tags used on the value side (identical to the name side):
+
+| Surface | Real token source (parent path) | Domain |
+|---------|---------------------------------|--------|
+| SCSI Ven / Prod / Rev | `Disk&Ven_<V>&Prod_<P>&Rev_<R>` | `SCSI_VEN\|` / `SCSI_PROD\|` / `SCSI_REV\|` |
+| PCI SUBSYS / REV | `..&SUBSYS_<S>&REV_<R>` (marker-anchored) | `PCI_SUBSYS\|` / `PCI_REV\|` |
+| BTH BD_ADDR | `..\Dev_<12hex>` | `BTH_DEV\|` |
+| STORAGE\Volume GUID | `..\STORAGE\Volume\{GUID}#..` | `STORAGE_VOL\|` |
+
+EDID is the exception: it is a value-only surface with no name-side
+counterpart, so it has no consistency constraint. Its rewriter derives the
+new 4-byte numeric serial (bytes 12–15) from `FNV(EDID_SN| + seed + real
+serial bytes)` and the 0xFF serial-ASCII descriptor from
+`FNV(EDID_SNSTR| + seed + real text bytes)`, then recomputes the block-0
+checksum (byte 127). A userland reproducer that wants to predict the EDID
+output must mirror those two domain tags and the checksum step.
+
+A userland reproducer of a VALUE (rather than a subkey name) therefore
+reuses the section-2 recipe verbatim, feeding the token it parses out of
+the device instance path — no new mixing rules.
+
+---
+
+## 9. Version history
 
 - **2026-09-01** — v5.0.0 initial. Domain-tag inventory
   (`SCSI_VEN|` / `SCSI_PROD|` / `SCSI_REV|`) established. UTF-16LE
   real-field bytes canonicalized. Round-byte wrap past round 9
   documented (does not trigger for MVP SCSI field widths but a
   future expansion to wider fields MUST preserve the same formula).
+- **2026-09-01** — v5.0.5 Phase 2 value-side addendum (section 8). The
+  value-read handler reuses the section-2 recipe verbatim; new domain tags
+  `BTH_DEV|`, `STORAGE_VOL|` (shared with the name side) and EDID-only
+  `EDID_SN|` / `EDID_SNSTR|` documented.

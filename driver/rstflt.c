@@ -317,6 +317,131 @@
  *       - Implementation writeup + 5-lens adversarial review outcome +
  *         the empirical STORAGE\Volume shape findings:
  *         docs/postmortem-v5-track-d/incident-v505-phase1-implementation.md
+ *     v5.0.5 Phase 2 (same version marker; kickoff §5) - the value-read
+ *       handler, the arithmetically dominant fix. v5.0.4 rewrote subkey
+ *       NAMES on RegNtPostEnumerateKey, but the post-ban triage proved
+ *       EMAC never enumerates: it opens each device key by exact name (via
+ *       SetupDi/CM_*) and reads the VALUES (HardwareID, CompatibleIDs, ...)
+ *       with RegQueryValueEx. Those values still returned the REAL
+ *       Ven/Prod/Rev/SUBSYS tokens - a synthetic subkey name paired with a
+ *       real HardwareID is a STRONGER ban tell than a raw fingerprint.
+ *       Phase 2 rewrites the value data to match the name-side synthetics.
+ *       - New notify class RegNtPostQueryValueKey -> TrackDHandlePostQuery
+ *         Value, dispatched only when g_TrackDValueRewriteEnabled. Design:
+ *           * The kickoff §5.1 lists RegNtPostQueryValueKey +
+ *             RegNtPostGetValueKey. There is NO RegNtPostGetValueKey in the
+ *             REG_NOTIFY_CLASS enum - NtQueryValueKey backs BOTH the Win32
+ *             RegQueryValueEx AND RegGetValue and surfaces only as
+ *             RegNtPostQueryValueKey. That one class covers the kickoff's
+ *             two. RegEnumValue (-> RegNtPostEnumerateValueKey) is a
+ *             separate class the recon does NOT implicate (EMAC reads by
+ *             name); left to v5.0.6 if evidence appears.
+ *           * Post-only (kickoff §5.1): the kernel already filled the
+ *             buffer, so we rewrite in place. We bail unless
+ *             post->Status == success (this also excludes the two-call
+ *             size-probe's STATUS_BUFFER_OVERFLOW, whose buffer is not
+ *             fully populated).
+ *       - SEPARATE value-descriptor table g_TrackDValueDescriptors (NOT
+ *         ValueRows bolted onto g_TrackDDescriptors, contra kickoff §5.2):
+ *         the enum-name matchers match the CONTAINER key (`\Enum\SCSI`
+ *         suffix), but value reads land on the leaf/instance key several
+ *         levels deeper, so they need a "path CONTAINS `\Enum\SCSI\`"-style
+ *         matcher. Five rows: SCSI, PCI, BTH, STORAGE\Volume, DISPLAY/EDID.
+ *       - Consistency with the name side is BY CONSTRUCTION: each synthetic
+ *         token is derived from the SAME real token (parsed from the
+ *         value's parent key path) via the SAME FNV domain the name synth
+ *         uses (SCSI_VEN|/SCSI_PROD|/SCSI_REV|, PCI_SUBSYS|/PCI_REV|,
+ *         BTH_DEV|, STORAGE_VOL|). Same domain + same real bytes + same
+ *         length => byte-for-byte identical token in the enumerated subkey
+ *         name and in the value data. The kernel OWNS these surfaces
+ *         (userland Level A runs --skip-disk/--skip-volume/--skip-usb/
+ *         --skip-hid), so only internal name<->value consistency matters.
+ *       - Two rewrite engines, both same-length / in-place:
+ *           * Substring neutralizer (SCSI, BTH, STORAGE): snapshot the
+ *             pristine value, find each real token in the snapshot, write
+ *             the synthetic token at the matching offset in the live buffer.
+ *             Scanning the snapshot (not the live buffer) is what makes
+ *             multi-token rewrites safe - a synthetic hex token can never be
+ *             re-matched as a later (short) real token. A MIN_TOKEN_WCHARS=3
+ *             floor blocks blind replacement of 1-2 char tokens.
+ *           * Marker-field rewriter (PCI): for each `&SUBSYS_`/`&REV_`
+ *             marker, rewrite the following field via the shared
+ *             TrackDFillTokenFnv (real field snapshotted first). Marker-
+ *             anchored, so the short 2-hex PCI REV is safe; VEN_/DEV_ (PnP
+ *             binding keys) are preserved.
+ *       - KEY_VALUE_*_INFORMATION extraction (TrackDExtractValueData)
+ *         handles KeyValuePartial / PartialAlign64 / Full / FullAlign64;
+ *         KeyValueBasic (no data) + unknown classes pass through. The data
+ *         region [DataOffset, DataOffset+DataLength) is bounds-checked to
+ *         lie fully inside the caller's buffer (pre->Length) before any
+ *         write. The rewrite is SEH-wrapped (TRACKD_TAG_SEH_FAULT).
+ *       - EDID (DISPLAY, a value-only surface, REG_BINARY 128): rewrites
+ *         the per-unit numeric serial (bytes 12-15) + the 0xFF serial-ASCII
+ *         descriptor, then recomputes the block-0 checksum (byte 127). DTDs
+ *         (bytes off,off+1 != 0) and the 0xFC model name are deliberately
+ *         LEFT ALONE (name/product code are model-level, not unit-level;
+ *         hex-izing a monitor name is itself anomalous, and a bad DTD would
+ *         reset the mode). Gated behind its OWN default-off flag
+ *         EnableEdidValueRewrite (on TOP of EnableValueReadRewrite) because
+ *         the recommended deployment already spoofs EDID from userland -
+ *         enabling both would double-spoof.
+ *       - USB/HID have NO value row: their HardwareID (`USB\VID_&PID_&REV_`)
+ *         carries no serial - the serial lives only in the device instance
+ *         ID (a CM_Get_Device_ID surface, not a registry value), out of
+ *         reach of RegNtPostQueryValueKey. Documented as a v5.0.6 candidate.
+ *       - Config + hot-toggle: LoadTrackDConfig reads EnableValueReadRewrite
+ *         + EnableEdidValueRewrite (both REG_DWORD, default 0 for boot
+ *         safety - a bug during the LSA/Winlogon boot value-read storm would
+ *         brick). TrackDHandlePreSetValue now taps all three enable values
+ *         so track-d-arm.ps1 can hot-toggle the value handler without a
+ *         reboot (mirrors the existing EnableRegCallback tap).
+ *       - Instrumentation: per-surface value counters CallbackValHit_SCSI/
+ *         _PCI/_BTH/_Storage/_Edid (engagement = parent+value-name matched
+ *         and the rewriter ran; a no-op when the value doesn't carry the
+ *         token, which is itself the diagnostic for BTH/STORAGE) +
+ *         CallbackNonRubiValueMatch (a non-rubinot process read a target
+ *         value). Ring buffer reused - the WasGated field is repurposed as
+ *         a kind byte {0 enum-nonrubi, 1 enum-gated, 2 value-gated, 3
+ *         value-nonrubi} so no struct/decoder size change. Persisted by
+ *         TrackDFlushWorker with the existing drift-recheck symmetry.
+ *       - Companion userland changes: track-d-arm.ps1 gains
+ *         -EnableValueRewrite/-DisableValueRewrite (and an -Edid switch on
+ *         -EnableValueRewrite) plus -Diagnose decode of the value counters
+ *         and the value-side ring kinds; check-consistency.ps1 Track D
+ *         block extended the same way.
+ *       - No image-name gate change. No new BSS beyond the counters +
+ *         config flags + marker UNICODE_STRING views.
+ *       - Adversarial review fixups (5-lens workflow, 6 confirmed findings
+ *         = 2 distinct issues + 2 dismissed-but-actioned design points):
+ *           (A) MEDIUM name<->value floor desync. The value rewriter floors
+ *               short (1-2 wchar) SCSI Ven/Prod/Rev tokens (a blind
+ *               substring replace of a 1-2 char token would collide), but
+ *               the enum-name synth had NO floor - so a disk with a 2-char
+ *               vendor ("HP") or revision got a synthetic NAME but a real
+ *               VALUE, the exact ban tell Phase 2 removes. Fix: apply the
+ *               same TRACKD_MIN_TOKEN_WCHARS floor in TrackDBuildSynthetic
+ *               Name so both sides skip short tokens in lockstep (low-
+ *               entropy tokens stay real in BOTH; no change for >= 3).
+ *           (B) LOW order-dependent SCSI substring clobber. Three
+ *               sequential all-occurrence passes could let a later token
+ *               (Prod) overwrite an earlier token's synth (Ven) where one
+ *               nested in the other. Fix: TrackDValueRewriteScsi now does a
+ *               single LONGEST-MATCH scan over the snapshot - each byte is
+ *               claimed by exactly one (most-specific) token, matching the
+ *               name side's per-field semantics.
+ *           (C) PERF: the non-rubi value diagnostic called CmCallbackGet
+ *               KeyObjectID on EVERY system-wide NtQueryValueKey while
+ *               armed. Fix: a cheap value-name union pre-filter
+ *               (TrackDValueNameIsInteresting) runs BEFORE the key-object
+ *               walk / image-name check, so only reads of a fingerprint
+ *               value name (HardwareID/EDID/...) incur it.
+ *           (D) STORAGE zero-offset symmetry: TrackDValueRewriteStorage now
+ *               mirrors the name-side conservative zero-offset skip, so a
+ *               (degenerate) zero-offset volume stays real in both name and
+ *               value.
+ *       - Implementation writeup + adversarial review outcome + the value
+ *         format / EDID rationale:
+ *         docs/postmortem-v5-track-d/incident-v505-phase2-implementation.md
  * v5.0.4 - Simplify PID matching to per-callback image-name check
  *       (Kickoff sec 3.3 Option A). Remove PsSetCreateProcessNotifyRoutineEx
  *       + g_TrackDTrackedPids[] + KSPIN_LOCK + g_TrackDOverridePid +
@@ -927,6 +1052,105 @@ const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
 #define TRACKD_BTH_CHILD_PREFIX_STR   L"Dev_"
 #define TRACKD_STORAGE_VOL_SUFFIX_STR L"\\Enum\\STORAGE\\Volume"
 
+/* ================================================================
+ *  v5.0.5 Phase 2 - value-read handler (RegNtPostQueryValueKey).
+ *
+ *  The name-side (RegNtPostEnumerateKey) rewrites SUBKEY NAMES; but the
+ *  empirical v5.0.4 triage (docs/postmortem-v5-track-d/incident-v505-
+ *  post-ban-triage.md) showed EMAC never enumerates - it opens each
+ *  device key by exact name (via SetupDi/CM_*) and calls RegQueryValueEx
+ *  on the VALUES (HardwareID, CompatibleIDs, ...). Those values still
+ *  leak the REAL Ven/Prod/Rev/SUBSYS/BD_ADDR/GUID tokens, creating a
+ *  name-vs-value inconsistency (synthetic subkey name but real HardwareID)
+ *  that is itself a stronger ban tell than a raw fingerprint. Phase 2
+ *  rewrites the value DATA to match the name-side synthetics.
+ *
+ *  Design notes (deliberate deviations from the kickoff §5, all documented
+ *  in the v5.0.5 Phase 2 changelog block + incident-v505-phase2-
+ *  implementation.md):
+ *    - The kickoff lists two notify classes RegNtPostQueryValueKey +
+ *      RegNtPostGetValueKey. There is NO RegNtPostGetValueKey in the
+ *      REG_NOTIFY_CLASS enum: NtQueryValueKey backs BOTH the Win32
+ *      RegQueryValueEx AND RegGetValue, and surfaces only as
+ *      RegNtPostQueryValueKey. That single class covers the kickoff's two.
+ *      RegEnumValue -> NtEnumerateValueKey -> RegNtPostEnumerateValueKey is
+ *      a separate class the recon does NOT implicate (EMAC reads by name)
+ *      and is left to v5.0.6 if evidence appears.
+ *    - A SEPARATE value-descriptor table (g_TrackDValueDescriptors) rather
+ *      than ValueRows bolted onto g_TrackDDescriptors. The name-side
+ *      matchers match the CONTAINER key (`\Enum\SCSI` suffix); value reads
+ *      happen on the leaf/instance key several levels deeper, so they need
+ *      a different "path CONTAINS `\Enum\SCSI\`" style matcher.
+ *    - Consistency with the name side is guaranteed by deriving each
+ *      synthetic token from the SAME real token (parsed from the value's
+ *      parent key path) via the SAME FNV domain the name synth uses
+ *      (SCSI_VEN|, SCSI_PROD|, SCSI_REV|, PCI_SUBSYS|, PCI_REV|, BTH_DEV|,
+ *      STORAGE_VOL|). Same domain + same real bytes + same length =>
+ *      byte-for-byte identical synthetic token in the subkey name and in
+ *      the value data. The kernel OWNS these surfaces (userland Level A
+ *      runs with --skip-disk/--skip-volume/--skip-usb/--skip-hid), so only
+ *      internal name<->value consistency matters, never consistency with a
+ *      userland-written value.
+ *    - EDID (a value-only surface, no name-side counterpart) is gated
+ *      behind its OWN default-off flag EnableEdidValueRewrite because the
+ *      recommended deployment already spoofs EDID from userland
+ *      (spoof-edid-full.ps1); enabling both would double-spoof. */
+#define TRACKD_ENUM_SCSI_MARKER_STR   L"Disk&Ven_"           /* value: SCSI leaf token host */
+#define TRACKD_ENUM_PCI_MARKER_STR    L"\\Enum\\PCI\\"       /* value: PCI instance path */
+#define TRACKD_ENUM_BTH_MARKER_STR    L"\\Enum\\BTH\\"       /* value: BTH instance path */
+#define TRACKD_ENUM_STORVOL_MARKER_STR L"\\Enum\\STORAGE\\Volume\\" /* value: STORAGE instance */
+#define TRACKD_DISPLAY_MARKER_STR     L"\\Enum\\DISPLAY\\"   /* value: EDID host */
+#define TRACKD_DEVPARAMS_SUFFIX_STR   L"\\Device Parameters" /* value: EDID subkey suffix */
+#define TRACKD_PROD_MARKER_STR        L"&Prod_"
+#define TRACKD_REV_MARKER_STR         L"&Rev_"
+#define TRACKD_SUBSYS_MARKER_STR      L"&SUBSYS_"
+
+/* EnableValueReadRewrite (REG_DWORD, default 0). Gates the whole
+ * RegNtPostQueryValueKey device-value handler independently of
+ * EnableRegCallback (the name-side gate), so the operator can arm
+ * name-side first and value-side only after Windows is fully up
+ * (kickoff §5.3 boot safety - a bug in this handler during the
+ * LSA/Winlogon boot value-read storm would brick). */
+#define TRACKD_ENABLE_VALREAD_VAL_STR L"EnableValueReadRewrite"
+/* EnableEdidValueRewrite (REG_DWORD, default 0). SEPARATE opt-in for the
+ * EDID binary rewriter - see the double-spoof note above. */
+#define TRACKD_ENABLE_EDID_VAL_STR    L"EnableEdidValueRewrite"
+
+/* Token bounds for the value-side substring neutralizer. A real token
+ * (Ven/Prod/BD_ADDR/GUID) shorter than MIN is skipped: a 1-2 char vendor
+ * substring-replaced blindly across a value would collide with unrelated
+ * data. MAX bounds the on-stack synthetic-token scratch buffer. */
+#define TRACKD_MIN_TOKEN_WCHARS   3u
+#define TRACKD_MAX_TOKEN_WCHARS   64u
+/* Upper bound on a value's data we will snapshot+rewrite in a substring
+ * pass. Real HardwareID/CompatibleIDs/FriendlyName values are well under
+ * this; anything larger passes through untouched (defensive, and bounds
+ * the on-stack snapshot buffer). */
+#define TRACKD_MAX_VALUE_BYTES    2048u
+
+/* EDID (block 0) byte layout used by the Phase 2 binary rewriter. */
+#define TRACKD_EDID_SIZE          128u
+#define TRACKD_EDID_SERIAL_OFF    12u   /* bytes 12-15: 4-byte LE serial */
+#define TRACKD_EDID_DESC0_OFF     54u   /* first 18-byte descriptor      */
+#define TRACKD_EDID_DESC_STRIDE   18u
+#define TRACKD_EDID_DESC_COUNT    4u
+#define TRACKD_EDID_DESC_TEXT_OFF 5u    /* descriptor text at desc+5     */
+#define TRACKD_EDID_DESC_TEXT_LEN 13u   /* 13 ASCII bytes, 0x0A term     */
+#define TRACKD_EDID_TAG_SERIAL    0xFFu /* descriptor tag: serial ASCII  */
+#define TRACKD_EDID_CHECKSUM_OFF  127u
+
+/* Kind byte stored in TRACKD_HIT_RECORD.WasGated (repurposed as a small
+ * enum in Phase 2 so the ring buffer distinguishes name-side from value-
+ * side events without changing the 96-byte record layout / decoder size):
+ *   0 = enum-side non-rubi parent match   (v5.0.5 Phase 0)
+ *   1 = enum-side gated rewrite landed     (v5.0.5 Phase 0)
+ *   2 = value-side gated rewrite landed    (v5.0.5 Phase 2)
+ *   3 = value-side non-rubi parent match   (v5.0.5 Phase 2) */
+#define TRACKD_HITKIND_ENUM_NONRUBI  0u
+#define TRACKD_HITKIND_ENUM_GATED    1u
+#define TRACKD_HITKIND_VALUE_GATED   2u
+#define TRACKD_HITKIND_VALUE_NONRUBI 3u
+
 /* Suffix on our OWN Parameters key path for the write-tap that lets
  * userland toggle RubinOtPid + EnableRegCallback without a rebooted
  * driver having to re-read Parameters (which would deadlock under the
@@ -1005,8 +1229,39 @@ typedef enum _TRACKD_PATH_TYPE {
     TRACKD_PATH_AUDIO_RENDER   = 5,
     TRACKD_PATH_AUDIO_CAPTURE  = 6,
     TRACKD_PATH_BTH            = 7,  /* v5.0.5 Phase 1 */
-    TRACKD_PATH_STORAGE_VOLUME = 8   /* v5.0.5 Phase 1 */
+    TRACKD_PATH_STORAGE_VOLUME = 8,  /* v5.0.5 Phase 1 */
+    TRACKD_PATH_DISPLAY_EDID   = 9   /* v5.0.5 Phase 2 (value-only) */
 } TRACKD_PATH_TYPE;
+
+/* v5.0.5 Phase 2 - value-descriptor table types. A value read is matched
+ * on its parent KEY path (which device instance owns the value), then the
+ * requested value name is checked against the descriptor's curated name
+ * list, then the surface's rewriter neutralizes the leaking tokens in the
+ * value DATA in place (same byte length, so ResultLength/DataLength stay
+ * valid). See the Phase 2 macro block above for the design rationale.
+ *
+ * Contract (identical reentrancy rules as the rest of Track D -
+ * PASSIVE_LEVEL, no Zw*, memory-only):
+ *   MatchParent(parent)                 -> TRUE iff this row owns the key
+ *                                          `parent` whose value is read.
+ *   Rewriter(parent, type, data, bytes) -> mutate `data` in place. MUST be
+ *                                          same-length; MUST no-op (leave
+ *                                          data byte-identical) on any type
+ *                                          / shape it does not recognize. */
+struct _TRACKD_VALUE_DESCRIPTOR;
+typedef BOOLEAN (*TRACKD_VALUE_PARENT_MATCHER)(PCUNICODE_STRING parent);
+typedef VOID    (*TRACKD_VALUE_REWRITER)(PCUNICODE_STRING parent, ULONG valueType,
+                                         PUCHAR data, ULONG dataBytes);
+
+typedef struct _TRACKD_VALUE_DESCRIPTOR {
+    UCHAR                        PathType;    /* TRACKD_PATH_TYPE enum      */
+    const char *                 Label;       /* ring-buffer label          */
+    TRACKD_VALUE_PARENT_MATCHER  MatchParent;
+    const WCHAR * const *        ValueNames;  /* NULL-terminated allow-list */
+    TRACKD_VALUE_REWRITER        Rewriter;
+    volatile LONG *              HitCounter;  /* per-surface value counter  */
+    BOOLEAN                      NeedsEdidGate;/* TRUE => EnableEdidValueRewrite */
+} TRACKD_VALUE_DESCRIPTOR;
 
 /* ================================================================
  *  v5.0.5 Phase 1 - path descriptor table.
@@ -1112,6 +1367,16 @@ static UNICODE_STRING  g_TrackDEnableValueName;    /* EnableRegCallback */
 /* v5.0.5 Phase 1 additional parent-path views */
 static UNICODE_STRING  g_TrackDBthSuffix;          /* \Enum\BTH */
 static UNICODE_STRING  g_TrackDStorageVolSuffix;   /* \Enum\STORAGE\Volume */
+/* v5.0.5 Phase 2 - value-read handler config + marker views. */
+static BOOLEAN         g_TrackDValueRewriteEnabled = FALSE; /* EnableValueReadRewrite */
+static BOOLEAN         g_TrackDEdidRewriteEnabled  = FALSE; /* EnableEdidValueRewrite */
+static UNICODE_STRING  g_TrackDEnableValReadName;  /* EnableValueReadRewrite (tap) */
+static UNICODE_STRING  g_TrackDEnableEdidName;     /* EnableEdidValueRewrite (tap) */
+static UNICODE_STRING  g_TrackDPciMarker;          /* \Enum\PCI\ (value parent) */
+static UNICODE_STRING  g_TrackDBthMarker;          /* \Enum\BTH\ (value parent) */
+static UNICODE_STRING  g_TrackDStorVolMarker;      /* \Enum\STORAGE\Volume\ */
+static UNICODE_STRING  g_TrackDDisplayMarker;      /* \Enum\DISPLAY\ (EDID host) */
+static UNICODE_STRING  g_TrackDDevParamsSuffix;    /* \Device Parameters */
 
 /* Rewrite counter (incremented once per successful in-place mutation)
  * plus flush infrastructure. The Cm callback never opens registry
@@ -1155,6 +1420,22 @@ static volatile LONG   g_TrackDHitCount_Storage = 0;
  * extra CmCallbackGetKeyObjectID per name-miss - bounded by the miss
  * rate (~200/sec at v5.0.4 baseline), negligible. */
 static volatile LONG   g_TrackDNonRubiParentMatchCount = 0;
+
+/* v5.0.5 Phase 2 - per-surface VALUE-read hit counters (rewrites that
+ * landed in a RegNtPostQueryValueKey value buffer), persisted as
+ * Parameters\CallbackValHit_* REG_DWORDs. Separate from the enum-side
+ * CallbackHit_* so the operator can see which half (enum name vs value
+ * read) is actually firing in a real RubinOT session - the whole point
+ * of the v5.0.4 -> Phase 2 pivot. EDID has its own counter because it is
+ * gated by a distinct opt-in flag. */
+static volatile LONG   g_TrackDValHitCount_SCSI    = 0;
+static volatile LONG   g_TrackDValHitCount_PCI     = 0;
+static volatile LONG   g_TrackDValHitCount_BTH     = 0;
+static volatile LONG   g_TrackDValHitCount_Storage = 0;
+static volatile LONG   g_TrackDValHitCount_Edid    = 0;
+/* Value-side analogue of g_TrackDNonRubiParentMatchCount: a non-rubinot
+ * process read a value on one of our target device keys. */
+static volatile LONG   g_TrackDNonRubiValueMatchCount = 0;
 
 /* v5.0.5 Phase 0 - one record per rewrite event (or non-rubi parent
  * match). Fixed-size fields, no dynamic allocation, no pointers -
@@ -1310,6 +1591,42 @@ static VOID     TrackDRecordHit(UCHAR pathType, UCHAR wasGated,
                                 const WCHAR *childReal, ULONG childWchars);
 static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2);
 static VOID     TrackDHandlePreSetValue(PVOID Argument2);
+/* v5.0.5 Phase 2 - value-read handler + helpers. */
+static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2);
+static ULONG    TrackDFindSubstrI(const WCHAR *hay, ULONG hayWchars,
+                                  const WCHAR *needle, ULONG needleWchars);
+static VOID     TrackDSynthToken(const WCHAR *realTok, ULONG tokWchars,
+                                 const UCHAR *domain, ULONG domainLen,
+                                 WCHAR *outSynth);
+static BOOLEAN  TrackDIsWideRegType(ULONG regType);
+static VOID     TrackDReplaceWideTokenAll(PUCHAR data, const UCHAR *orig,
+                                          ULONG dataBytes,
+                                          const WCHAR *realTok, ULONG tokWchars,
+                                          const WCHAR *synthTok);
+static VOID     TrackDValueMarkerFieldRewrite(PUCHAR data, ULONG dataBytes,
+                                              const WCHAR *marker, ULONG markerWchars,
+                                              const UCHAR *domain, ULONG domainLen);
+static BOOLEAN  TrackDExtractValueData(ULONG infoClass, PVOID buf, ULONG bufLen,
+                                       ULONG *outType, ULONG *outDataOff,
+                                       ULONG *outDataLen);
+static BOOLEAN  TrackDValueNameAllowed(PCUNICODE_STRING valueName,
+                                       const WCHAR * const *allow);
+static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING parent);
+static VOID     TrackDValueRewriteScsi(PCUNICODE_STRING parent, ULONG valueType,
+                                       PUCHAR data, ULONG dataBytes);
+static VOID     TrackDValueRewritePci(PCUNICODE_STRING parent, ULONG valueType,
+                                      PUCHAR data, ULONG dataBytes);
+static VOID     TrackDValueRewriteBth(PCUNICODE_STRING parent, ULONG valueType,
+                                      PUCHAR data, ULONG dataBytes);
+static VOID     TrackDValueRewriteStorage(PCUNICODE_STRING parent, ULONG valueType,
+                                          PUCHAR data, ULONG dataBytes);
+static VOID     TrackDValueRewriteEdid(PCUNICODE_STRING parent, ULONG valueType,
+                                       PUCHAR data, ULONG dataBytes);
+static BOOLEAN  TrackDValueMatchScsi(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDValueMatchPci(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDValueMatchBth(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDValueMatchStorage(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDValueMatchEdid(PCUNICODE_STRING parent);
 static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
                                     PVOID Argument1,
                                     PVOID Argument2);
@@ -2598,17 +2915,27 @@ static VOID TrackDBuildSyntheticName(const WCHAR *realName, ULONG realWchars,
         }
     }
 
-    if (venEnd > venStart) {
+    /* v5.0.5 Phase 2 consistency: apply the SAME TRACKD_MIN_TOKEN_WCHARS
+     * floor the value-read handler uses (TrackDValueRewriteScsi). The
+     * value side must floor short tokens because a blind 1-2 char
+     * substring replace across HardwareID/CompatibleIDs would collide; if
+     * the name side rewrote a 1-2 char Ven/Prod/Rev but the value side
+     * skipped it, the enumerated subkey name and the by-name value read
+     * would DISAGREE for that token - the exact synthetic-name/real-value
+     * ban tell Phase 2 exists to remove. Flooring both sides keeps them in
+     * lockstep (a 1-2 char token, which is low-entropy anyway, stays real
+     * in both). No effect on tokens >= 3 wchars (the common case). */
+    if (venEnd - venStart >= TRACKD_MIN_TOKEN_WCHARS) {
         TrackDFillTokenFnv(outName, venStart, venEnd - venStart,
                            realName, venStart, venEnd - venStart,
                            DOMAIN_VEN, DOMAIN_VEN_LEN);
     }
-    if (hasProd && prodEnd > prodStart) {
+    if (hasProd && prodEnd - prodStart >= TRACKD_MIN_TOKEN_WCHARS) {
         TrackDFillTokenFnv(outName, prodStart, prodEnd - prodStart,
                            realName, prodStart, prodEnd - prodStart,
                            DOMAIN_PROD, DOMAIN_PROD_LEN);
     }
-    if (hasRev && revEnd > revStart) {
+    if (hasRev && revEnd - revStart >= TRACKD_MIN_TOKEN_WCHARS) {
         TrackDFillTokenFnv(outName, revStart, revEnd - revStart,
                            realName, revStart, revEnd - revStart,
                            DOMAIN_REV, DOMAIN_REV_LEN);
@@ -3505,17 +3832,27 @@ static VOID TrackDHandlePreSetValue(PVOID Argument2)
     ULONG_PTR keyId = 0;
     PCUNICODE_STRING keyName = NULL;
     ULONG newValue = 0;
+    BOOLEAN *target = NULL;             /* which flag this write toggles */
 
     info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
     if (info == NULL || info->ValueName == NULL) return;
     if (info->Type != REG_DWORD || info->DataSize < sizeof(ULONG)) return;
     if (info->Data == NULL) return;
 
-    /* v5.0.4: only EnableRegCallback survives as a hot-toggle tap. The
-     * pre-v5.0.4 RubinOtPid arm went away with the Ps notify + PID
-     * array subsystem (name-based gate needs no PID plumbing). */
-    if (!RtlEqualUnicodeString(&g_TrackDEnableValueName,
-                               info->ValueName, TRUE)) {
+    /* v5.0.4: EnableRegCallback is the master hot-toggle. v5.0.5 Phase 2
+     * adds EnableValueReadRewrite + EnableEdidValueRewrite as independent
+     * hot-toggles so the value-read handler can be armed/disarmed without
+     * a reboot (and stays off across boot unless explicitly enabled -
+     * kickoff §5.3 boot safety). Every other ValueName is IGNORED (our own
+     * TrackDFlushWorker writes many REG_DWORDs into this same key and its
+     * writes fire this tap; the name filter prevents recursion). */
+    if (RtlEqualUnicodeString(&g_TrackDEnableValueName, info->ValueName, TRUE)) {
+        target = &g_TrackDEnabled;
+    } else if (RtlEqualUnicodeString(&g_TrackDEnableValReadName, info->ValueName, TRUE)) {
+        target = &g_TrackDValueRewriteEnabled;
+    } else if (RtlEqualUnicodeString(&g_TrackDEnableEdidName, info->ValueName, TRUE)) {
+        target = &g_TrackDEdidRewriteEnabled;
+    } else {
         return;
     }
 
@@ -3532,15 +3869,740 @@ static VOID TrackDHandlePreSetValue(PVOID Argument2)
         return;
     }
 
-    /* Toggle the hot-path gate. Plain BOOLEAN write; the hot path
-     * reads g_TrackDEnabled without a lock (single-byte MOV is
-     * inherently atomic on x86-64). Value semantics: 1 = enabled,
-     * anything else = disabled (mirrors LoadTrackDConfig). */
-    g_TrackDEnabled = (newValue == 1) ? TRUE : FALSE;
+    /* Toggle the selected hot-path gate. Plain BOOLEAN write; the hot path
+     * reads these without a lock (single-byte MOV is inherently atomic on
+     * x86-64). Value semantics: 1 = enabled, anything else = disabled
+     * (mirrors LoadTrackDConfig). */
+    *target = (newValue == 1) ? TRUE : FALSE;
 #if DBG
-    DbgPrint("[RstFlt/TrackD] EnableRegCallback toggled to %u via Parameters tap (g_TrackDEnabled=%d)\n",
-             newValue, g_TrackDEnabled);
+    DbgPrint("[RstFlt/TrackD] %wZ toggled to %u via Parameters tap (target now %d)\n",
+             info->ValueName, newValue, *target);
 #endif
+}
+
+/* ================================================================
+ *  v5.0.5 Phase 2 - value-read handler (RegNtPostQueryValueKey).
+ *
+ *  Rewrites the DATA of fingerprint-leaking values on our target device
+ *  keys so a by-name RegQueryValueEx / RegGetValue returns synthetic
+ *  tokens byte-for-byte consistent with the enum-name synths. Same
+ *  reentrancy contract as the rest of Track D: PASSIVE_LEVEL, no Zw*,
+ *  memory-only, same-length in-place mutation.
+ * ================================================================ */
+
+/* TRUE for the REG value types whose data is a WCHAR string (or list of
+ * strings) that the substring / marker-field rewriters can walk safely. */
+static BOOLEAN TrackDIsWideRegType(ULONG regType)
+{
+    return regType == REG_SZ || regType == REG_EXPAND_SZ || regType == REG_MULTI_SZ;
+}
+
+/* Case-insensitive (ASCII) search for `needle` in `hay` (both WCHAR
+ * arrays, lengths in wchars). Returns the first wchar index, or (ULONG)-1
+ * if absent. */
+static ULONG TrackDFindSubstrI(const WCHAR *hay, ULONG hayWchars,
+                               const WCHAR *needle, ULONG needleWchars)
+{
+    ULONG i, j;
+    if (hay == NULL || needle == NULL || needleWchars == 0) return (ULONG)-1;
+    if (needleWchars > hayWchars) return (ULONG)-1;
+    for (i = 0; i + needleWchars <= hayWchars; i++) {
+        BOOLEAN m = TRUE;
+        for (j = 0; j < needleWchars; j++) {
+            WCHAR a = hay[i + j];
+            WCHAR b = needle[j];
+            if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+            if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+            if (a != b) { m = FALSE; break; }
+        }
+        if (m) return i;
+    }
+    return (ULONG)-1;
+}
+
+/* Produce `tokWchars` synthetic uppercase-hex wchars into outSynth[0..)
+ * from FNV over <domain> + <seed> + '|' + <realTok UTF-16LE> + '|' +
+ * <round>. Byte-for-byte identical to the enum-name field synth
+ * (TrackDFillTokenFnv) for the same real token + domain + length, which
+ * is what guarantees name<->value consistency. outSynth must hold at
+ * least tokWchars wchars (callers pass a TRACKD_MAX_TOKEN_WCHARS buffer
+ * and cap tokWchars accordingly). */
+static VOID TrackDSynthToken(const WCHAR *realTok, ULONG tokWchars,
+                             const UCHAR *domain, ULONG domainLen,
+                             WCHAR *outSynth)
+{
+    if (tokWchars == 0) return;
+    TrackDFillTokenFnv(outSynth, 0, tokWchars, realTok, 0, tokWchars,
+                       domain, domainLen);
+}
+
+/* Overwrite every occurrence of `realTok` (tokWchars) found in the
+ * IMMUTABLE snapshot `orig` with `synthTok` (same wchar count) at the
+ * matching offset in the live `data`. Scanning the snapshot rather than
+ * the live buffer is what makes multi-token rewrites safe: a synthetic
+ * hex token written for an earlier token can never be re-matched as a
+ * later (short) real token, because match-finding always sees the
+ * original bytes. Same length => the total data size is unchanged, so
+ * REG_MULTI_SZ null separators and the double-null terminator are all
+ * preserved. */
+static VOID TrackDReplaceWideTokenAll(PUCHAR data, const UCHAR *orig,
+                                      ULONG dataBytes,
+                                      const WCHAR *realTok, ULONG tokWchars,
+                                      const WCHAR *synthTok)
+{
+    const WCHAR *o = (const WCHAR *)orig;
+    WCHAR *w = (WCHAR *)data;
+    ULONG total = dataBytes / sizeof(WCHAR);
+    ULONG i, j;
+
+    if (tokWchars == 0 || total < tokWchars) return;
+    for (i = 0; i + tokWchars <= total; ) {
+        BOOLEAN m = TRUE;
+        for (j = 0; j < tokWchars; j++) {
+            WCHAR a = o[i + j];
+            WCHAR b = realTok[j];
+            if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+            if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+            if (a != b) { m = FALSE; break; }
+        }
+        if (m) {
+            for (j = 0; j < tokWchars; j++) w[i + j] = synthTok[j];
+            i += tokWchars;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* For every `marker` (e.g. L"&SUBSYS_") in the WCHAR blob `data`, rewrite
+ * the field that follows it (up to '&', '\\', a NUL separator, or the
+ * blob end) with FNV hex under `domain`. Marker-anchored, so short fields
+ * (e.g. a 2-hex PCI REV) rewrite safely without the collision risk of a
+ * blind substring pass; the hex output contains no '&'/'_' so it never
+ * re-forms a marker on the continued scan. The real field is snapshotted
+ * into a stack buffer before TrackDFillTokenFnv writes, so the in-place
+ * write cannot corrupt the FNV input on multi-round fields. */
+static VOID TrackDValueMarkerFieldRewrite(PUCHAR data, ULONG dataBytes,
+                                          const WCHAR *marker, ULONG markerWchars,
+                                          const UCHAR *domain, ULONG domainLen)
+{
+    WCHAR *w = (WCHAR *)data;
+    ULONG total = dataBytes / sizeof(WCHAR);
+    ULONG i = 0;
+    WCHAR realField[TRACKD_MAX_TOKEN_WCHARS];
+
+    if (markerWchars == 0 || total < markerWchars) return;
+    while (i + markerWchars <= total) {
+        BOOLEAN m = TRUE;
+        ULONG j, fs, fl;
+        for (j = 0; j < markerWchars; j++) {
+            WCHAR a = w[i + j];
+            WCHAR b = marker[j];
+            if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+            if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+            if (a != b) { m = FALSE; break; }
+        }
+        if (!m) { i++; continue; }
+        fs = i + markerWchars;
+        fl = 0;
+        while (fs + fl < total) {
+            WCHAR c = w[fs + fl];
+            if (c == L'&' || c == L'\\' || c == L'\0') break;
+            fl++;
+        }
+        if (fl >= 1 && fl <= TRACKD_MAX_TOKEN_WCHARS) {
+            RtlCopyMemory(realField, &w[fs], fl * sizeof(WCHAR));
+            TrackDFillTokenFnv(w, fs, fl, realField, 0, fl, domain, domainLen);
+        }
+        i = fs + (fl ? fl : 1);
+    }
+}
+
+/* Decode the location of the value DATA inside a caller-supplied
+ * KEY_VALUE_*_INFORMATION buffer for the requested info class. Returns
+ * FALSE (and the caller passes the value through untouched) for classes
+ * with no data (KeyValueBasicInformation), a zero-length value, an
+ * unknown class, or any bounds violation. On TRUE, [*outDataOff,
+ * *outDataOff + *outDataLen) is guaranteed to lie fully inside bufLen. */
+static BOOLEAN TrackDExtractValueData(ULONG infoClass, PVOID buf, ULONG bufLen,
+                                      ULONG *outType, ULONG *outDataOff,
+                                      ULONG *outDataLen)
+{
+    *outType = 0;
+    *outDataOff = 0;
+    *outDataLen = 0;
+    if (buf == NULL || bufLen == 0) return FALSE;
+
+    switch (infoClass) {
+    case KeyValuePartialInformation: {
+        PKEY_VALUE_PARTIAL_INFORMATION p = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        ULONG hdr = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data);
+        if (bufLen < hdr) return FALSE;
+        *outType = p->Type;
+        *outDataLen = p->DataLength;
+        *outDataOff = hdr;
+        break;
+    }
+    case KeyValuePartialInformationAlign64: {
+        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 p =
+            (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)buf;
+        ULONG hdr = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION_ALIGN64, Data);
+        if (bufLen < hdr) return FALSE;
+        *outType = p->Type;
+        *outDataLen = p->DataLength;
+        *outDataOff = hdr;
+        break;
+    }
+    case KeyValueFullInformation:
+    case KeyValueFullInformationAlign64: {
+        PKEY_VALUE_FULL_INFORMATION p = (PKEY_VALUE_FULL_INFORMATION)buf;
+        ULONG hdr = (ULONG)FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name);
+        if (bufLen < hdr) return FALSE;
+        *outType = p->Type;
+        *outDataLen = p->DataLength;
+        *outDataOff = p->DataOffset;
+        break;
+    }
+    default:
+        /* KeyValueBasicInformation (name+type only, no data),
+         * KeyValueLayerInformation, or unknown -> nothing to rewrite. */
+        return FALSE;
+    }
+
+    if (*outDataLen == 0) return FALSE;
+    if (*outDataOff > bufLen) return FALSE;
+    if (*outDataLen > bufLen - *outDataOff) return FALSE;
+    return TRUE;
+}
+
+/* TRUE iff `valueName` is in the descriptor's curated allow-list (or the
+ * list is NULL = any named value). Case-insensitive. */
+static BOOLEAN TrackDValueNameAllowed(PCUNICODE_STRING valueName,
+                                      const WCHAR * const *allow)
+{
+    ULONG i;
+    if (valueName == NULL || valueName->Buffer == NULL || valueName->Length == 0)
+        return FALSE;
+    if (allow == NULL) return TRUE;
+    for (i = 0; allow[i] != NULL; i++) {
+        UNICODE_STRING a;
+        RtlInitUnicodeString(&a, allow[i]);
+        if (RtlEqualUnicodeString(&a, valueName, TRUE)) return TRUE;
+    }
+    return FALSE;
+}
+
+/* ---- value-parent matchers (classify by "path CONTAINS marker") ---- */
+
+static BOOLEAN TrackDValueMatchScsi(PCUNICODE_STRING parent)
+{
+    /* SCSI disk instance keys sit below a `Disk&Ven_...` node; that marker
+     * (reusing g_TrackDSubkeyPrefix = L"Disk&Ven_") is SCSI-specific and,
+     * matching the enum-name gate, excludes `CdRom&Ven_`. We ALSO require
+     * the path to contain `\Enum\SCSI` (g_TrackDEnumSuffix): a removable
+     * USBSTOR volume under `\Enum\STORAGE\Volume\` embeds `Disk&Ven_..` in
+     * its own name, and without this guard it would misclassify as SCSI
+     * (harmless - the SCSI rewriter no-ops on a STORAGE\Volume value - but
+     * it would mis-attribute the counter and steal the row from STORAGE,
+     * which is checked later). */
+    ULONG pw;
+    if (parent == NULL || parent->Buffer == NULL) return FALSE;
+    pw = parent->Length / sizeof(WCHAR);
+    if (TrackDFindSubstrI(parent->Buffer, pw, g_TrackDEnumSuffix.Buffer,
+                          g_TrackDEnumSuffix.Length / sizeof(WCHAR)) == (ULONG)-1)
+        return FALSE;
+    return TrackDFindSubstrI(parent->Buffer, pw, g_TrackDSubkeyPrefix.Buffer,
+                             g_TrackDSubkeyPrefix.Length / sizeof(WCHAR)) != (ULONG)-1;
+}
+static BOOLEAN TrackDValueMatchPci(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL) return FALSE;
+    return TrackDFindSubstrI(parent->Buffer, parent->Length / sizeof(WCHAR),
+                             g_TrackDPciMarker.Buffer,
+                             g_TrackDPciMarker.Length / sizeof(WCHAR)) != (ULONG)-1;
+}
+static BOOLEAN TrackDValueMatchBth(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL) return FALSE;
+    return TrackDFindSubstrI(parent->Buffer, parent->Length / sizeof(WCHAR),
+                             g_TrackDBthMarker.Buffer,
+                             g_TrackDBthMarker.Length / sizeof(WCHAR)) != (ULONG)-1;
+}
+static BOOLEAN TrackDValueMatchStorage(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL) return FALSE;
+    return TrackDFindSubstrI(parent->Buffer, parent->Length / sizeof(WCHAR),
+                             g_TrackDStorVolMarker.Buffer,
+                             g_TrackDStorVolMarker.Length / sizeof(WCHAR)) != (ULONG)-1;
+}
+static BOOLEAN TrackDValueMatchEdid(PCUNICODE_STRING parent)
+{
+    if (parent == NULL || parent->Buffer == NULL) return FALSE;
+    if (TrackDFindSubstrI(parent->Buffer, parent->Length / sizeof(WCHAR),
+                          g_TrackDDisplayMarker.Buffer,
+                          g_TrackDDisplayMarker.Length / sizeof(WCHAR)) == (ULONG)-1)
+        return FALSE;
+    /* EDID lives on the `...\Device Parameters` subkey of a DISPLAY node. */
+    return RtlSuffixUnicodeString(&g_TrackDDevParamsSuffix, parent, TRUE);
+}
+
+/* ---- value rewriters (one per surface) ---- */
+
+/* SCSI: neutralize the Ven/Prod/Rev INQUIRY strings (parsed from the
+ * value's parent `Disk&Ven_...` node) wherever they appear in the value
+ * data (HardwareID / CompatibleIDs / DeviceDesc / FriendlyName / Mfg).
+ * Uses the SAME FNV domains as the enum-name synth so the by-name value
+ * read and the enumerated subkey name agree token-for-token. */
+static VOID TrackDValueRewriteScsi(PCUNICODE_STRING parent, ULONG valueType,
+                                   PUCHAR data, ULONG dataBytes)
+{
+    static const UCHAR DOMAIN_VEN[]  = "SCSI_VEN|";
+    static const UCHAR DOMAIN_PROD[] = "SCSI_PROD|";
+    static const UCHAR DOMAIN_REV[]  = "SCSI_REV|";
+    const WCHAR *p;
+    ULONG plen, idx, rel;
+    ULONG venStart, venLen, prodStart, prodLen, revStart, revLen;
+    /* Up to three real tokens (Ven/Prod/Rev) each with its precomputed
+     * synthetic. A single longest-match scan below neutralizes them - see
+     * the rationale where the scan runs. */
+    const WCHAR *tokReal[3];
+    ULONG        tokLen[3];
+    WCHAR        tokSynth[3][TRACKD_MAX_TOKEN_WCHARS];
+    ULONG        ntok = 0;
+    UCHAR orig[TRACKD_MAX_VALUE_BYTES];
+
+    if (!TrackDIsWideRegType(valueType)) return;
+    if (dataBytes == 0 || (dataBytes % sizeof(WCHAR)) != 0) return;
+    if (dataBytes > sizeof(orig)) return;
+    if (parent == NULL || parent->Buffer == NULL) return;
+    p = parent->Buffer;
+    plen = parent->Length / sizeof(WCHAR);
+
+    idx = TrackDFindSubstrI(p, plen, g_TrackDSubkeyPrefix.Buffer,
+                            g_TrackDSubkeyPrefix.Length / sizeof(WCHAR));
+    if (idx == (ULONG)-1) return;
+
+    venStart = idx + (g_TrackDSubkeyPrefix.Length / sizeof(WCHAR));
+    venLen = 0;
+    while (venStart + venLen < plen &&
+           p[venStart + venLen] != L'&' && p[venStart + venLen] != L'\\')
+        venLen++;
+
+    prodStart = 0; prodLen = 0;
+    rel = TrackDFindSubstrI(p + venStart + venLen, plen - (venStart + venLen),
+                            TRACKD_PROD_MARKER_STR, 6);
+    if (rel != (ULONG)-1) {
+        prodStart = venStart + venLen + rel + 6;
+        while (prodStart + prodLen < plen &&
+               p[prodStart + prodLen] != L'&' && p[prodStart + prodLen] != L'\\')
+            prodLen++;
+    }
+
+    revStart = 0; revLen = 0;
+    if (prodLen > 0) {
+        rel = TrackDFindSubstrI(p + prodStart + prodLen, plen - (prodStart + prodLen),
+                                TRACKD_REV_MARKER_STR, 5);
+        if (rel != (ULONG)-1) {
+            revStart = prodStart + prodLen + rel + 5;
+            while (revStart + revLen < plen &&
+                   p[revStart + revLen] != L'&' && p[revStart + revLen] != L'\\')
+                revLen++;
+        }
+    }
+
+    /* Collect the >= MIN tokens with their synthetics. Same floor as the
+     * name synth TrackDBuildSyntheticName (both must agree - a token one
+     * side rewrites and the other keeps would desync name<->value). */
+    if (venLen >= TRACKD_MIN_TOKEN_WCHARS && venLen <= TRACKD_MAX_TOKEN_WCHARS) {
+        tokReal[ntok] = p + venStart; tokLen[ntok] = venLen;
+        TrackDSynthToken(p + venStart, venLen, DOMAIN_VEN, sizeof(DOMAIN_VEN) - 1, tokSynth[ntok]);
+        ntok++;
+    }
+    if (prodLen >= TRACKD_MIN_TOKEN_WCHARS && prodLen <= TRACKD_MAX_TOKEN_WCHARS) {
+        tokReal[ntok] = p + prodStart; tokLen[ntok] = prodLen;
+        TrackDSynthToken(p + prodStart, prodLen, DOMAIN_PROD, sizeof(DOMAIN_PROD) - 1, tokSynth[ntok]);
+        ntok++;
+    }
+    if (revLen >= TRACKD_MIN_TOKEN_WCHARS && revLen <= TRACKD_MAX_TOKEN_WCHARS) {
+        tokReal[ntok] = p + revStart; tokLen[ntok] = revLen;
+        TrackDSynthToken(p + revStart, revLen, DOMAIN_REV, sizeof(DOMAIN_REV) - 1, tokSynth[ntok]);
+        ntok++;
+    }
+    if (ntok == 0) return;
+
+    /* Single LONGEST-MATCH left-to-right scan over the pristine snapshot,
+     * writing synthetics into the live buffer. This replaces three
+     * independent all-occurrence substring passes, which were order-
+     * dependent when one real token nested inside another (e.g. Ven a
+     * prefix of Prod: the Prod pass would clobber the Ven synth at the
+     * shared offset, leaving vendor bytes carrying the product-domain
+     * synth - a divergence from the name side's per-field rewrite). By
+     * choosing the LONGEST token that matches at each position and then
+     * skipping past it, every byte is claimed by exactly one token (the
+     * most specific), matching the name-side field semantics, and no
+     * synthetic can be re-matched (matching always reads the snapshot).
+     * (The only unresolvable case is two DISTINCT fields whose real bytes
+     * are byte-identical - e.g. Ven == Prod - which substring matching
+     * cannot disambiguate; degenerate and not seen on real hardware.) */
+    RtlCopyMemory(orig, data, dataBytes);
+    {
+        WCHAR *w = (WCHAR *)data;
+        const WCHAR *o = (const WCHAR *)orig;
+        ULONG total = dataBytes / sizeof(WCHAR);
+        ULONG i, t, j;
+        for (i = 0; i < total; ) {
+            ULONG bestT = ntok;   /* sentinel = no match */
+            ULONG bestLen = 0;
+            for (t = 0; t < ntok; t++) {
+                BOOLEAN m;
+                if (tokLen[t] <= bestLen) continue;      /* only a strictly longer match wins */
+                if (tokLen[t] > total - i) continue;
+                m = TRUE;
+                for (j = 0; j < tokLen[t]; j++) {
+                    WCHAR a = o[i + j];
+                    WCHAR b = tokReal[t][j];
+                    if (a >= L'a' && a <= L'z') a = (WCHAR)(a - L'a' + L'A');
+                    if (b >= L'a' && b <= L'z') b = (WCHAR)(b - L'a' + L'A');
+                    if (a != b) { m = FALSE; break; }
+                }
+                if (m) { bestT = t; bestLen = tokLen[t]; }
+            }
+            if (bestLen > 0) {
+                for (j = 0; j < bestLen; j++) w[i + j] = tokSynth[bestT][j];
+                i += bestLen;
+            } else {
+                i++;
+            }
+        }
+    }
+}
+
+/* PCI: rewrite the SUBSYS_ and REV_ fields inside each HardwareID /
+ * CompatibleIDs entry (`PCI\VEN_..&DEV_..&SUBSYS_XXXXXXXX&REV_XX`),
+ * preserving VEN_/DEV_ (PnP binding keys). Marker-anchored, so the short
+ * REV field is safe. Same domains as the enum-name PCI synth. */
+static VOID TrackDValueRewritePci(PCUNICODE_STRING parent, ULONG valueType,
+                                  PUCHAR data, ULONG dataBytes)
+{
+    static const UCHAR DOMAIN_SUBSYS[] = "PCI_SUBSYS|";
+    static const UCHAR DOMAIN_REV[]    = "PCI_REV|";
+    UNREFERENCED_PARAMETER(parent);
+    if (!TrackDIsWideRegType(valueType)) return;
+    if (dataBytes == 0 || (dataBytes % sizeof(WCHAR)) != 0) return;
+    /* L"&SUBSYS_" = 8 wchars, L"&REV_" = 5 wchars. */
+    TrackDValueMarkerFieldRewrite(data, dataBytes, TRACKD_SUBSYS_MARKER_STR, 8,
+                                  DOMAIN_SUBSYS, sizeof(DOMAIN_SUBSYS) - 1);
+    TrackDValueMarkerFieldRewrite(data, dataBytes, TRACKD_REV_MARKER_STR, 5,
+                                  DOMAIN_REV, sizeof(DOMAIN_REV) - 1);
+}
+
+/* BTH: neutralize the 12-hex BD_ADDR (parsed from the value's parent
+ * `\Enum\BTH\...\Dev_XXXXXXXXXXXX` node) wherever it appears in the value
+ * data. Same domain as the enum-name BTH synth. Frequently a no-op (many
+ * BTH values carry a service UUID, not the address); the per-surface
+ * counter then reveals empirically whether these values leak the address. */
+static VOID TrackDValueRewriteBth(PCUNICODE_STRING parent, ULONG valueType,
+                                  PUCHAR data, ULONG dataBytes)
+{
+    static const UCHAR DOMAIN_BTH[] = "BTH_DEV|";
+    const WCHAR *p;
+    ULONG plen, idx, k;
+    WCHAR synth[TRACKD_MAX_TOKEN_WCHARS];
+    UCHAR orig[TRACKD_MAX_VALUE_BYTES];
+
+    if (!TrackDIsWideRegType(valueType)) return;
+    if (dataBytes == 0 || (dataBytes % sizeof(WCHAR)) != 0) return;
+    if (dataBytes > sizeof(orig)) return;
+    if (parent == NULL || parent->Buffer == NULL) return;
+    p = parent->Buffer;
+    plen = parent->Length / sizeof(WCHAR);
+
+    idx = TrackDFindSubstrI(p, plen, TRACKD_BTH_CHILD_PREFIX_STR, 4); /* L"Dev_" */
+    if (idx == (ULONG)-1) return;
+    idx += 4;
+    if (idx + 12 > plen) return;
+    for (k = 0; k < 12; k++) if (!TrackDIsHexWchar(p[idx + k])) return;
+
+    RtlCopyMemory(orig, data, dataBytes);
+    TrackDSynthToken(p + idx, 12, DOMAIN_BTH, sizeof(DOMAIN_BTH) - 1, synth);
+    TrackDReplaceWideTokenAll(data, orig, dataBytes, p + idx, 12, synth);
+}
+
+/* STORAGE\Volume: neutralize the canonical {GUID} (parsed from the value's
+ * parent `\Enum\STORAGE\Volume\{GUID}#offset` node) wherever it appears in
+ * the value data. Same domain + FNV recipe as the enum-name STORAGE synth,
+ * so a rewritten value GUID matches the rewritten subkey-name GUID. Often
+ * a no-op (STORAGE\Volume HardwareID is generic); the counter shows whether
+ * the GUID actually leaks through a value. */
+static VOID TrackDValueRewriteStorage(PCUNICODE_STRING parent, ULONG valueType,
+                                      PUCHAR data, ULONG dataBytes)
+{
+    static const UCHAR DOMAIN_STOR[] = "STORAGE_VOL|";
+    const WCHAR *p;
+    ULONG plen, idx;
+    WCHAR synth[40];
+    UCHAR orig[TRACKD_MAX_VALUE_BYTES];
+
+    if (!TrackDIsWideRegType(valueType)) return;
+    if (dataBytes == 0 || (dataBytes % sizeof(WCHAR)) != 0) return;
+    if (dataBytes > sizeof(orig)) return;
+    if (parent == NULL || parent->Buffer == NULL) return;
+    p = parent->Buffer;
+    plen = parent->Length / sizeof(WCHAR);
+
+    /* Locate the `{...}` GUID after the STORAGE\Volume marker; validate the
+     * canonical 38-wchar shape ({ + 8-4-4-4-12 + }). */
+    idx = TrackDFindSubstrI(p, plen, g_TrackDStorVolMarker.Buffer,
+                            g_TrackDStorVolMarker.Length / sizeof(WCHAR));
+    if (idx == (ULONG)-1) return;
+    idx += (g_TrackDStorVolMarker.Length / sizeof(WCHAR));
+    if (idx + 38 > plen) return;
+    if (p[idx] != L'{' || p[idx + 37] != L'}') return;
+    if (p[idx + 9] != L'-' || p[idx + 14] != L'-' ||
+        p[idx + 19] != L'-' || p[idx + 24] != L'-') return;
+    /* Mirror the name-side conservative zero-offset skip (TrackDGate
+     * StorageVol / TrackDBuildSyntheticStorageVol): require the `#offset`
+     * tail, and if the offset is zero leave the GUID REAL in the value too,
+     * so the enumerated subkey name and the by-name value stay in lockstep.
+     * Inert on real hardware (the system volume is at offset 0x100000, not
+     * 0) but removes a name<->value asymmetry. */
+    if (idx + 38 >= plen || p[idx + 38] != L'#') return;
+    if (TrackDStorageOffsetIsZero(&p[idx], plen - idx)) return;
+
+    /* synth GUID: copy real 38-wchar GUID, then rewrite the 32 nibbles. */
+    RtlCopyMemory(synth, &p[idx], 38 * sizeof(WCHAR));
+    TrackDRewriteGuid32InPlace(synth, &p[idx], DOMAIN_STOR, sizeof(DOMAIN_STOR) - 1);
+
+    RtlCopyMemory(orig, data, dataBytes);
+    TrackDReplaceWideTokenAll(data, orig, dataBytes, &p[idx], 38, synth);
+}
+
+/* EDID (REG_BINARY, 128-byte block 0): rewrite the per-unit identifiers -
+ * the 4-byte numeric serial (bytes 12-15) and the serial-ASCII descriptor
+ * (tag 0xFF) - then recompute the block-0 checksum (byte 127). The 0xFC
+ * model-name and product code are intentionally LEFT ALONE (they are
+ * model-level, not unit-level, identifiers; hex-izing a monitor name is
+ * itself anomalous). Detailed timing descriptors (bytes off,off+1 != 0)
+ * and the range-limits/0xFD descriptor are never touched, so timing/mode
+ * are preserved. Gated by EnableEdidValueRewrite (separate from the master
+ * value gate) so it never collides with a userland EDID spoof. */
+static VOID TrackDValueRewriteEdid(PCUNICODE_STRING parent, ULONG valueType,
+                                   PUCHAR data, ULONG dataBytes)
+{
+    static const UCHAR  MAGIC[8] = {0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00};
+    static const UCHAR  DOMAIN_SN[]    = "EDID_SN|";
+    static const UCHAR  DOMAIN_SNSTR[] = "EDID_SNSTR|";
+    static const CHAR   HEXA[16] = {'0','1','2','3','4','5','6','7',
+                                    '8','9','A','B','C','D','E','F'};
+    UCHAR buf[128];
+    ULONG bl, i, d, tl, k;
+    ULONGLONG h;
+    UCHAR sum;
+
+    UNREFERENCED_PARAMETER(parent);
+    if (valueType != REG_BINARY) return;
+    if (dataBytes < TRACKD_EDID_SIZE) return;
+    for (i = 0; i < 8; i++) if (data[i] != MAGIC[i]) return;   /* not EDID */
+
+    /* --- numeric serial (bytes 12-15): 4 synthetic bytes from FNV over
+     *     domain + seed + the real 4 serial bytes. --- */
+    bl = 0;
+    RtlCopyMemory(buf, DOMAIN_SN, sizeof(DOMAIN_SN) - 1);
+    bl = sizeof(DOMAIN_SN) - 1;
+    if (g_TrackDSeedLen > 0 && bl + g_TrackDSeedLen <= sizeof(buf)) {
+        RtlCopyMemory(buf + bl, g_TrackDSeed, g_TrackDSeedLen);
+        bl += g_TrackDSeedLen;
+    }
+    RtlCopyMemory(buf + bl, &data[TRACKD_EDID_SERIAL_OFF], 4);  /* reads real serial */
+    bl += 4;
+    h = TrackDFnvHash64(buf, bl);
+    for (i = 0; i < 4; i++)
+        data[TRACKD_EDID_SERIAL_OFF + i] = (UCHAR)((h >> (i * 8)) & 0xFF);
+
+    /* --- serial-ASCII descriptor (tag 0xFF): replace the text in place
+     *     with FNV hex, preserving the 0x0A terminator + 0x20 padding. --- */
+    for (d = 0; d < TRACKD_EDID_DESC_COUNT; d++) {
+        ULONG off = TRACKD_EDID_DESC0_OFF + d * TRACKD_EDID_DESC_STRIDE;
+        if (data[off] != 0 || data[off + 1] != 0 || data[off + 2] != 0)
+            continue;                                    /* DTD, not a descriptor */
+        if (data[off + 4] != 0) continue;
+        if (data[off + 3] != TRACKD_EDID_TAG_SERIAL) continue;
+
+        tl = 0;
+        while (tl < TRACKD_EDID_DESC_TEXT_LEN &&
+               data[off + TRACKD_EDID_DESC_TEXT_OFF + tl] != 0x0A)
+            tl++;
+        if (tl == 0) continue;
+
+        bl = 0;
+        RtlCopyMemory(buf, DOMAIN_SNSTR, sizeof(DOMAIN_SNSTR) - 1);
+        bl = sizeof(DOMAIN_SNSTR) - 1;
+        if (g_TrackDSeedLen > 0 && bl + g_TrackDSeedLen <= sizeof(buf)) {
+            RtlCopyMemory(buf + bl, g_TrackDSeed, g_TrackDSeedLen);
+            bl += g_TrackDSeedLen;
+        }
+        if (bl + tl <= sizeof(buf)) {
+            RtlCopyMemory(buf + bl, &data[off + TRACKD_EDID_DESC_TEXT_OFF], tl);
+            bl += tl;
+        }
+        h = TrackDFnvHash64(buf, bl);
+        /* tl <= 13 <= 16 so one hash covers the whole field. */
+        for (k = 0; k < tl; k++)
+            data[off + TRACKD_EDID_DESC_TEXT_OFF + k] =
+                (UCHAR)HEXA[(ULONG)((h >> (60 - k * 4)) & 0xFULL)];
+    }
+
+    /* --- block-0 checksum (byte 127) = -(sum of bytes 0..126) mod 256. --- */
+    sum = 0;
+    for (i = 0; i < TRACKD_EDID_CHECKSUM_OFF; i++)
+        sum = (UCHAR)(sum + data[i]);
+    data[TRACKD_EDID_CHECKSUM_OFF] = (UCHAR)(0u - sum);
+}
+
+/* ---- value-descriptor table + classifier ---- */
+
+static const WCHAR * const g_TrackDScsiValueNames[] = {
+    L"HardwareID", L"CompatibleIDs", L"DeviceDesc", L"FriendlyName", L"Mfg", NULL
+};
+static const WCHAR * const g_TrackDPciValueNames[] = {
+    L"HardwareID", L"CompatibleIDs", NULL
+};
+static const WCHAR * const g_TrackDBthValueNames[] = {
+    L"HardwareID", L"CompatibleIDs", L"DeviceDesc", NULL
+};
+static const WCHAR * const g_TrackDStorageValueNames[] = {
+    L"HardwareID", L"CompatibleIDs", NULL
+};
+static const WCHAR * const g_TrackDEdidValueNames[] = {
+    L"EDID", NULL
+};
+
+static const TRACKD_VALUE_DESCRIPTOR g_TrackDValueDescriptors[] = {
+    { TRACKD_PATH_SCSI,           "vSCSI",  TrackDValueMatchScsi,    g_TrackDScsiValueNames,    TrackDValueRewriteScsi,    &g_TrackDValHitCount_SCSI,    FALSE },
+    { TRACKD_PATH_PCI,            "vPCI",   TrackDValueMatchPci,     g_TrackDPciValueNames,     TrackDValueRewritePci,     &g_TrackDValHitCount_PCI,     FALSE },
+    { TRACKD_PATH_BTH,            "vBTH",   TrackDValueMatchBth,     g_TrackDBthValueNames,     TrackDValueRewriteBth,     &g_TrackDValHitCount_BTH,     FALSE },
+    { TRACKD_PATH_STORAGE_VOLUME, "vStor",  TrackDValueMatchStorage, g_TrackDStorageValueNames, TrackDValueRewriteStorage, &g_TrackDValHitCount_Storage, FALSE },
+    { TRACKD_PATH_DISPLAY_EDID,   "vEDID",  TrackDValueMatchEdid,    g_TrackDEdidValueNames,    TrackDValueRewriteEdid,    &g_TrackDValHitCount_Edid,    TRUE  },
+};
+
+static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING parent)
+{
+    ULONG i;
+    if (parent == NULL || parent->Buffer == NULL || parent->Length == 0) return NULL;
+    for (i = 0; i < ARRAYSIZE(g_TrackDValueDescriptors); ++i) {
+        if (g_TrackDValueDescriptors[i].MatchParent(parent))
+            return &g_TrackDValueDescriptors[i];
+    }
+    return NULL;
+}
+
+/* TRUE iff `valueName` is in ANY value descriptor's allow-list. A cheap
+ * union filter (a handful of short string compares, no allocation, no key-
+ * object walk) applied BEFORE CmCallbackGetKeyObjectID + classification so
+ * the overwhelmingly common value read (some name we never rewrite, e.g.
+ * "Start"/"Type") returns immediately. Without it, arming
+ * EnableValueReadRewrite would pay a CmCallbackGetKeyObjectID on EVERY
+ * NtQueryValueKey system-wide (the hottest registry path) - here only the
+ * rare reads of HardwareID/EDID/etc. incur that cost. Stays in sync with
+ * the descriptors automatically (walks their lists). */
+static BOOLEAN TrackDValueNameIsInteresting(PCUNICODE_STRING valueName)
+{
+    ULONG i;
+    if (valueName == NULL || valueName->Buffer == NULL || valueName->Length == 0)
+        return FALSE;
+    for (i = 0; i < ARRAYSIZE(g_TrackDValueDescriptors); ++i) {
+        if (TrackDValueNameAllowed(valueName, g_TrackDValueDescriptors[i].ValueNames))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* RegNtPostQueryValueKey body. Classify the value's parent device key,
+ * confirm the requested value name is one we own, extract the data buffer
+ * per KEY_VALUE info class, and dispatch to the surface rewriter (same
+ * byte length, in place). Gated by g_TrackDValueRewriteEnabled (plus
+ * g_TrackDEdidRewriteEnabled for the EDID row). */
+static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2)
+{
+    PREG_POST_OPERATION_INFORMATION post;
+    PREG_QUERY_VALUE_KEY_INFORMATION pre;
+    NTSTATUS keyIdSt;
+    ULONG_PTR keyId = 0;
+    PCUNICODE_STRING keyName = NULL;
+    const TRACKD_VALUE_DESCRIPTOR *desc = NULL;
+    ULONG vtype = 0, vDataOff = 0, vDataLen = 0;
+    PUCHAR dataPtr;
+
+    post = (PREG_POST_OPERATION_INFORMATION)Argument2;
+    if (post == NULL) return STATUS_SUCCESS;
+    if (!NT_SUCCESS(post->Status)) return STATUS_SUCCESS;   /* excludes BUFFER_OVERFLOW */
+    if (post->PreInformation == NULL) return STATUS_SUCCESS;
+    pre = (PREG_QUERY_VALUE_KEY_INFORMATION)post->PreInformation;
+    if (pre->ValueName == NULL || pre->Object == NULL) return STATUS_SUCCESS;
+
+    /* Cheap value-name pre-filter FIRST: the vast majority of value reads
+     * (system-wide, while armed) are for names we never rewrite - reject
+     * them with a few short string compares before any CmCallbackGetKey
+     * ObjectID (key-object walk) or PsGetProcessImageFileName. */
+    if (!TrackDValueNameIsInteresting(pre->ValueName)) return STATUS_SUCCESS;
+
+    /* Image-name gate (cheap _strnicmp). On a miss the caller is not
+     * rubinot*; classify the parent for the value-side non-rubi diagnostic
+     * (parity with the enum handler's Phase 0 NonRubiParentMatch) - now
+     * bounded to reads of a fingerprint value name by the filter above. */
+    if (!TrackDCurrentCallerNameMatches()) {
+        keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object,
+                                           &keyId, &keyName);
+        if (NT_SUCCESS(keyIdSt) && keyName != NULL) {
+            desc = TrackDClassifyValueParent(keyName);
+            if (desc != NULL &&
+                TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) {
+                InterlockedIncrement(&g_TrackDNonRubiValueMatchCount);
+                TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_NONRUBI,
+                                keyName, pre->ValueName->Buffer,
+                                pre->ValueName->Length / sizeof(WCHAR));
+            }
+        }
+        return STATUS_SUCCESS;
+    }
+
+    if (pre->KeyValueInformation == NULL || pre->Length == 0) return STATUS_SUCCESS;
+
+    keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object, &keyId, &keyName);
+    if (!NT_SUCCESS(keyIdSt) || keyName == NULL) {
+        WriteLastCallbackStatus(TRACKD_TAG_PATH_GET_FAIL, keyIdSt);
+        return STATUS_SUCCESS;
+    }
+    desc = TrackDClassifyValueParent(keyName);
+    if (desc == NULL) return STATUS_SUCCESS;
+    if (!TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) return STATUS_SUCCESS;
+
+    /* EDID row requires its own opt-in on TOP of the master value gate. */
+    if (desc->NeedsEdidGate && !g_TrackDEdidRewriteEnabled) return STATUS_SUCCESS;
+
+    if (!TrackDExtractValueData(pre->KeyValueInformationClass, pre->KeyValueInformation,
+                                pre->Length, &vtype, &vDataOff, &vDataLen))
+        return STATUS_SUCCESS;
+
+    dataPtr = (PUCHAR)pre->KeyValueInformation + vDataOff;
+
+    __try {
+        desc->Rewriter(keyName, vtype, dataPtr, vDataLen);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WriteLastCallbackStatus(TRACKD_TAG_SEH_FAULT, GetExceptionCode());
+        return STATUS_SUCCESS;
+    }
+
+    /* Count an engagement (parent + value name matched, rewriter ran).
+     * The rewriter is a no-op when the value doesn't actually carry the
+     * token, so this counts "value handler engaged for <surface>" - the
+     * metric the kickoff §6.3 outcome tree keys on. */
+    InterlockedIncrement(&g_TrackDHitCount);
+    InterlockedIncrement(desc->HitCounter);
+    TrackDRecordHit(desc->PathType, TRACKD_HITKIND_VALUE_GATED, keyName,
+                    pre->ValueName->Buffer, pre->ValueName->Length / sizeof(WCHAR));
+    WriteLastCallbackStatus(TRACKD_TAG_OK, STATUS_SUCCESS);
+    return STATUS_SUCCESS;
 }
 
 /* Cm dispatch. Runs at PASSIVE_LEVEL per MSDN contract. */
@@ -3571,6 +4633,13 @@ static NTSTATUS RstRegistryCallback(PVOID CallbackContext,
     switch (notifyClass) {
     case RegNtPostEnumerateKey:
         (void)TrackDHandlePostEnumerate(Argument2);
+        break;
+    case RegNtPostQueryValueKey:
+        /* v5.0.5 Phase 2: value-read handler, gated independently of the
+         * name-side by g_TrackDValueRewriteEnabled (EnableValueReadRewrite)
+         * so it can stay off across boot until Windows is fully up. */
+        if (g_TrackDValueRewriteEnabled)
+            (void)TrackDHandlePostQueryValue(Argument2);
         break;
     case RegNtPreSetValueKey:
         TrackDHandlePreSetValue(Argument2);
@@ -3621,6 +4690,12 @@ static VOID TrackDFlushWorker(PVOID unused)
     ULONG postHitScsi, postHitPci, postHitUsb, postHitHid;
     ULONG postHitAudioR, postHitAudioC, postHitBth, postHitStorage;
     ULONG postNonRubi, postRingIdx;
+    /* v5.0.5 Phase 2 - value-side counter snapshots (init so the early
+     * `goto out` drift-check path is deterministic). */
+    ULONG valScsi = 0, valPci = 0, valBth = 0, valStor = 0, valEdid = 0;
+    ULONG nonRubiVal = 0;
+    ULONG postValScsi, postValPci, postValBth, postValStor, postValEdid;
+    ULONG postNonRubiVal;
     /* Ring snapshot initialized in-declaration so the `goto out` early
      * path leaves `ringSnap` deterministic. Compiler emits a single
      * zeroing pass; equivalent to an RtlZeroMemory call but idiomatic. */
@@ -3654,6 +4729,13 @@ static VOID TrackDFlushWorker(PVOID unused)
     hitStorage = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_Storage,   0, 0);
     nonRubi    = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiParentMatchCount, 0, 0);
     ringIdx    = (ULONG)InterlockedCompareExchange(&g_TrackDRingIndex,          0, 0);
+    /* v5.0.5 Phase 2 - value-side snapshots. */
+    valScsi    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_SCSI,    0, 0);
+    valPci     = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_PCI,     0, 0);
+    valBth     = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_BTH,     0, 0);
+    valStor    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Storage, 0, 0);
+    valEdid    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Edid,    0, 0);
+    nonRubiVal = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiValueMatchCount, 0, 0);
     RtlCopyMemory(ringSnap, g_TrackDRingBuffer, sizeof(ringSnap));
 
     InitializeObjectAttributes(&oa, &g_TrackDParamsFullPath,
@@ -3722,6 +4804,25 @@ static VOID TrackDFlushWorker(PVOID unused)
     RtlInitUnicodeString(&valName, L"CallbackNonRubiParentMatch");
     (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
                         &nonRubi, sizeof(nonRubi));
+    /* v5.0.5 Phase 2 - per-surface value-read counters + non-rubi value. */
+    RtlInitUnicodeString(&valName, L"CallbackValHit_SCSI");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &valScsi, sizeof(valScsi));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_PCI");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &valPci, sizeof(valPci));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_BTH");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &valBth, sizeof(valBth));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_Storage");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &valStor, sizeof(valStor));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_Edid");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &valEdid, sizeof(valEdid));
+    RtlInitUnicodeString(&valName, L"CallbackNonRubiValueMatch");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
+                        &nonRubiVal, sizeof(nonRubiVal));
     RtlInitUnicodeString(&valName, L"CallbackHitRingIndex");
     (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
                         &ringIdx, sizeof(ringIdx));
@@ -3755,6 +4856,12 @@ out:
     postHitStorage = (ULONG)InterlockedCompareExchange(&g_TrackDHitCount_Storage,   0, 0);
     postNonRubi    = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiParentMatchCount, 0, 0);
     postRingIdx    = (ULONG)InterlockedCompareExchange(&g_TrackDRingIndex,          0, 0);
+    postValScsi    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_SCSI,    0, 0);
+    postValPci     = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_PCI,     0, 0);
+    postValBth     = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_BTH,     0, 0);
+    postValStor    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Storage, 0, 0);
+    postValEdid    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Edid,    0, 0);
+    postNonRubiVal = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiValueMatchCount, 0, 0);
     RtlCopyMemory(postMissSnap, g_TrackDLastMissName, sizeof(postMissSnap));
     if (postStatus     != statusValue   ||
         postHit        != hitValue      ||
@@ -3770,6 +4877,12 @@ out:
         postHitStorage != hitStorage    ||
         postNonRubi    != nonRubi       ||
         postRingIdx    != ringIdx       ||
+        postValScsi    != valScsi       ||
+        postValPci     != valPci        ||
+        postValBth     != valBth        ||
+        postValStor    != valStor       ||
+        postValEdid    != valEdid       ||
+        postNonRubiVal != nonRubiVal    ||
         RtlCompareMemory(postMissSnap, missSnap, sizeof(missSnap)) != sizeof(missSnap))
     {
         if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
@@ -3877,6 +4990,39 @@ static NTSTATUS LoadTrackDConfig(PUNICODE_STRING RegPath)
         if (flagVal == 1) g_TrackDEnabled = TRUE;
     }
 
+    /* v5.0.5 Phase 2: EnableValueReadRewrite (REG_DWORD, default 0). The
+     * value-read handler stays OFF across boot unless this is explicitly
+     * set - a bug in it during the LSA/Winlogon boot value-read storm
+     * would brick (kickoff §5.3). Hot-toggled at runtime by the
+     * TrackDHandlePreSetValue tap (like EnableRegCallback). */
+    flagVal = 0;
+    RtlInitUnicodeString(&valName, L"EnableValueReadRewrite");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &need);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) g_TrackDValueRewriteEnabled = TRUE;
+    }
+
+    /* v5.0.5 Phase 2: EnableEdidValueRewrite (REG_DWORD, default 0). A
+     * SEPARATE opt-in for the EDID binary rewriter (the recommended
+     * deployment already spoofs EDID from userland; enabling both would
+     * double-spoof). Requires EnableValueReadRewrite too. */
+    flagVal = 0;
+    RtlInitUnicodeString(&valName, L"EnableEdidValueRewrite");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &need);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) g_TrackDEdidRewriteEnabled = TRUE;
+    }
+
     /* RegCallbackSeed (REG_SZ, up to 64 hex chars). Stored raw as
      * lower bytes of each WCHAR (ASCII-safe assumption; a non-ASCII
      * seed would still hash deterministically, just with fewer bits
@@ -3937,6 +5083,14 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     /* v5.0.5 Phase 1 additional parent-path suffixes. */
     RtlInitUnicodeString(&g_TrackDBthSuffix,        TRACKD_BTH_SUFFIX_STR);
     RtlInitUnicodeString(&g_TrackDStorageVolSuffix, TRACKD_STORAGE_VOL_SUFFIX_STR);
+    /* v5.0.5 Phase 2 - value-read handler enable-value + marker views. */
+    RtlInitUnicodeString(&g_TrackDEnableValReadName, TRACKD_ENABLE_VALREAD_VAL_STR);
+    RtlInitUnicodeString(&g_TrackDEnableEdidName,    TRACKD_ENABLE_EDID_VAL_STR);
+    RtlInitUnicodeString(&g_TrackDPciMarker,         TRACKD_ENUM_PCI_MARKER_STR);
+    RtlInitUnicodeString(&g_TrackDBthMarker,         TRACKD_ENUM_BTH_MARKER_STR);
+    RtlInitUnicodeString(&g_TrackDStorVolMarker,     TRACKD_ENUM_STORVOL_MARKER_STR);
+    RtlInitUnicodeString(&g_TrackDDisplayMarker,     TRACKD_DISPLAY_MARKER_STR);
+    RtlInitUnicodeString(&g_TrackDDevParamsSuffix,   TRACKD_DEVPARAMS_SUFFIX_STR);
 
     ExInitializeWorkItem(&g_TrackDFlushWorkItem, TrackDFlushWorker, NULL);
 
