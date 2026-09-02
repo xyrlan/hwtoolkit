@@ -39,8 +39,9 @@
                                             um dos targets MAS image name nao
                                             bateu com "rubinot" - triage para
                                             "quem toca nossos parents fora do gate"
-      CallbackHitRingIndex       REG_DWORD  proximo slot a ser escrito (%16)
-      HitRingBuffer              REG_BINARY 16 * 96 bytes; ver decoder em -Diagnose
+      CallbackHitRingIndex       REG_DWORD  proximo slot a ser escrito (mod ring size)
+      HitRingBuffer              REG_BINARY N * 96 bytes; ver decoder em -Diagnose
+                                            (v5.0.5: N=16; v5.0.6 Phase 0: N=128)
 
     v5.0.5 Phase 2 additions:
       EnableValueReadRewrite     REG_DWORD  gate do value-read handler
@@ -54,6 +55,30 @@
       CallbackValHit_Storage     REG_DWORD  idem STORAGE\Volume
       CallbackValHit_Edid        REG_DWORD  idem EDID (requer EnableEdidValueRewrite)
       CallbackNonRubiValueMatch  REG_DWORD  processo non-rubi leu um value alvo
+
+    v5.0.6 Phase 0 additions (todos leitura):
+      EnableValueSynth                     REG_DWORD  scaffolding gate do synthesizer OEM
+                                                       string (DeviceDesc/FriendlyName/Mfg);
+                                                       0=off default. NAO tem reader em
+                                                       Phase 0 - persistencia + hot-toggle
+                                                       so; Phase 2 vai wirar o reader.
+      CallbackSynthHit_SCSI_FriendlyName   REG_DWORD  Phase 2: SCSI FriendlyName synth run
+      CallbackSynthHit_SCSI_DeviceDesc     REG_DWORD  Phase 2: SCSI DeviceDesc synth run
+      CallbackSynthHit_SCSI_Mfg            REG_DWORD  Phase 2: SCSI Mfg synth run
+      CallbackSynthHit_PCI_FriendlyName    REG_DWORD  Phase 2: PCI FriendlyName synth run
+      CallbackSynthHit_PCI_DeviceDesc      REG_DWORD  Phase 2: PCI DeviceDesc synth run
+      CallbackSynthHit_PCI_Mfg             REG_DWORD  Phase 2: PCI Mfg synth run
+      CallbackSynthHit_USB_FriendlyName    REG_DWORD  Phase 2: USB FriendlyName synth run
+      CallbackSynthHit_HID_FriendlyName    REG_DWORD  Phase 2: HID FriendlyName synth run
+      CallbackSynthHit_BTH_FriendlyName    REG_DWORD  Phase 2: BTH FriendlyName synth run
+      CallbackSynthTypeMismatchBail        REG_DWORD  Phase 2: REG type mismatched descriptor
+      CallbackSynthOverflowBail            REG_DWORD  Phase 2: synth larger than caller buffer
+      CallbackSynthSizeSanityBail          REG_DWORD  Phase 2: real value size out of bounds
+      CallbackSynthInventoryMissBail       REG_DWORD  Phase 2: synth pool lookup returned none
+      CallbackValHit_LocationInfo          REG_DWORD  Phase 0 measure-first: gated caller leu
+                                                       LocationInformation em parent classificado
+      CallbackValHit_LocationPaths         REG_DWORD  idem LocationPaths
+      CallbackValHit_ContainerID           REG_DWORD  idem ContainerID
 
     v5.0.4: RubinOtPid + -SetPid removidos. O gate agora e image-name
     inline (PsGetProcessImageFileName + _strnicmp "rubinot") em vez de
@@ -81,6 +106,16 @@
       .\track-d-arm.ps1 -DisableValueRewrite
         Escreve EnableValueReadRewrite=0 e EnableEdidValueRewrite=0. Efeito
         imediato; name-side (EnableRegCallback) permanece como estava.
+
+      .\track-d-arm.ps1 -EnableSynth
+        Escreve EnableValueSynth=1 (v5.0.6 Phase 0 scaffolding gate do
+        synthesizer OEM string). NAO tem efeito observavel em Phase 0 (o
+        synthesizer callback so entra em Phase 2). Persistencia + hot-
+        toggle via tap RegNtPreSetValueKey validam o pipeline; um arm
+        agora fica honored quando o Phase 2 wirar o reader.
+
+      .\track-d-arm.ps1 -DisableSynth
+        Escreve EnableValueSynth=0. Efeito imediato via tap.
 
       .\track-d-arm.ps1 -Diagnose
         Le todos os valores Parameters + decoded LastCallbackStatus/
@@ -110,6 +145,16 @@ param(
 
     [Parameter(ParameterSetName = 'DisableValue')]
     [switch]$DisableValueRewrite,
+
+    # v5.0.6 Phase 0: arm/disarm the synthesizer scaffolding gate.
+    # NO reader in Phase 0 - flag is dormant until Phase 2 wires the
+    # synthesizer callback. Kept as a first-class switch so the userland
+    # cycle can validate the persistence + hot-toggle end-to-end today.
+    [Parameter(ParameterSetName = 'EnableSynth')]
+    [switch]$EnableSynth,
+
+    [Parameter(ParameterSetName = 'DisableSynth')]
+    [switch]$DisableSynth,
 
     [Parameter(ParameterSetName = 'Diagnose')]
     [switch]$Diagnose
@@ -244,6 +289,31 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Info 'Efeito imediato. Name-side (EnableRegCallback) permanece inalterado.'
     }
 
+    'EnableSynth' {
+        Write-Section 'Track D - Enable value-synth (v5.0.6 Phase 0 scaffolding)'
+        Assert-DriverInstalled
+        # Sanity: Phase 0 has no reader, but warn the operator if the
+        # dependency gates are off - Phase 2 (which lands the reader) will
+        # need EnableRegCallback + EnableValueReadRewrite both armed.
+        $cur = Get-ItemProperty -Path $paramsKey -ErrorAction SilentlyContinue
+        $regCb = if ($cur -and $cur.PSObject.Properties.Name -contains 'EnableRegCallback') { [int]$cur.EnableRegCallback } else { 0 }
+        $vrw   = if ($cur -and $cur.PSObject.Properties.Name -contains 'EnableValueReadRewrite') { [int]$cur.EnableValueReadRewrite } else { 0 }
+        if ($regCb -ne 1) { Write-Warn 'EnableRegCallback != 1 - o callback nao esta armado; Phase 2 vai precisar dele armado.' }
+        if ($vrw   -ne 1) { Write-Warn 'EnableValueReadRewrite != 1 - value handler off; Phase 2 vai precisar dele armado tambem.' }
+        Set-ItemProperty -Path $paramsKey -Name 'EnableValueSynth' -Value 1 -Type DWord -Force
+        Write-OK 'EnableValueSynth = 1 (v5.0.6 Phase 0 scaffolding gate armed)'
+        Write-Info 'Sem reader em Phase 0 - persistencia + hot-toggle validation so.'
+        Write-Info 'Efeito imediato via tap RegNtPreSetValueKey. Phase 2 vai ler o gate quando synthesizer lands.'
+    }
+
+    'DisableSynth' {
+        Write-Section 'Track D - Disable value-synth (v5.0.6)'
+        Assert-DriverInstalled
+        Set-ItemProperty -Path $paramsKey -Name 'EnableValueSynth' -Value 0 -Type DWord -Force
+        Write-OK 'EnableValueSynth = 0'
+        Write-Info 'Efeito imediato. Outros gates (EnableRegCallback, EnableValueReadRewrite, EnableEdidValueRewrite) inalterados.'
+    }
+
     'Diagnose' {
         Write-Section 'Track D - Diagnose'
         Assert-DriverInstalled
@@ -295,6 +365,31 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Val 'CallbackNonRubiValueMatch'   '(nenhum non-rubi leu um value alvo)'
         Show-Val 'CallbackHitRingIndex'        '(ring buffer nunca escrito)'
 
+        # v5.0.6 Phase 0: synthesizer scaffolding + measure-first counters.
+        # SynthHit_* + Synth*Bail stay 0 in Phase 0 (Phase 2 wires bumps);
+        # the 3 measure-first (LocationInfo/Paths/ContainerID) ARE wired
+        # in Phase 0 - non-zero means EMAC reads that value name via
+        # RegQueryValueEx on one of our classified parents.
+        Write-Host ''
+        Write-Host '  --- v5.0.6 Phase 0 scaffolding (SynthHit_* + SynthBail dormant; measure-first WIRED) ---' -ForegroundColor DarkGray
+        Show-Val 'EnableValueSynth'                          '(0 ou ausente = synth gate off; Phase 2 lands the reader)'
+        Show-Val 'CallbackSynthHit_SCSI_FriendlyName'        '(Phase 2)'
+        Show-Val 'CallbackSynthHit_SCSI_DeviceDesc'          '(Phase 2)'
+        Show-Val 'CallbackSynthHit_SCSI_Mfg'                 '(Phase 2)'
+        Show-Val 'CallbackSynthHit_PCI_FriendlyName'         '(Phase 2)'
+        Show-Val 'CallbackSynthHit_PCI_DeviceDesc'           '(Phase 2)'
+        Show-Val 'CallbackSynthHit_PCI_Mfg'                  '(Phase 2)'
+        Show-Val 'CallbackSynthHit_USB_FriendlyName'         '(Phase 2)'
+        Show-Val 'CallbackSynthHit_HID_FriendlyName'         '(Phase 2)'
+        Show-Val 'CallbackSynthHit_BTH_FriendlyName'         '(Phase 2)'
+        Show-Val 'CallbackSynthTypeMismatchBail'             '(Phase 2)'
+        Show-Val 'CallbackSynthOverflowBail'                 '(Phase 2)'
+        Show-Val 'CallbackSynthSizeSanityBail'               '(Phase 2)'
+        Show-Val 'CallbackSynthInventoryMissBail'            '(Phase 2)'
+        Show-Val 'CallbackValHit_LocationInfo'               '(0 = EMAC nao le LocationInformation em parents classificados)'
+        Show-Val 'CallbackValHit_LocationPaths'              '(0 = EMAC nao le LocationPaths)'
+        Show-Val 'CallbackValHit_ContainerID'                '(0 = EMAC nao le ContainerID)'
+
         # LastCallbackStatus decoded (hot path breadcrumb)
         $last = $null
         if ($vals -and $vals.PSObject.Properties.Name -contains 'LastCallbackStatus') {
@@ -324,7 +419,13 @@ switch ($PSCmdlet.ParameterSetName) {
         }
         if ($null -ne $ring -and $ring.Length -ge 96) {
             $recSize = 96      # sizeof(TRACKD_HIT_RECORD) w/ MSVC x64 alignment
-            $slotCount = [Math]::Min(16, [int]($ring.Length / $recSize))
+            # v5.0.6 Phase 0: ring size is now driver-side (128); derive from
+            # the on-disk REG_BINARY length so a pre-v5.0.6 (16-slot / 1536-
+            # byte) blob keeps decoding. Cap at a defensive maximum in case a
+            # corrupted value ever surfaces a huge blob.
+            $maxSlots = 2048
+            $slotCount = [int]($ring.Length / $recSize)
+            if ($slotCount -gt $maxSlots) { $slotCount = $maxSlots }
             $pathNames = @{
                 0 = 'NONE   '; 1 = 'SCSI   '; 2 = 'PCI    ';
                 3 = 'USB    '; 4 = 'HID    '; 5 = 'AudioR '; 6 = 'AudioC ';
@@ -343,7 +444,7 @@ switch ($PSCmdlet.ParameterSetName) {
             # anomalous image names - exactly Phase 0's job.
             $ansiEnc = [Text.Encoding]::GetEncoding(1252)
             Write-Host ''
-            Write-Host '  --- Ring buffer (last 16 hits, physical slot order) ---' -ForegroundColor DarkGray
+            Write-Host ('  --- Ring buffer (last {0} hits, physical slot order) ---' -f $slotCount) -ForegroundColor DarkGray
             Write-Host '  slot  timestamp                    image             type     kind   hash    child' -ForegroundColor DarkGray
             $anyValid = $false
             for ($i = 0; $i -lt $slotCount; $i++) {
@@ -367,10 +468,12 @@ switch ($PSCmdlet.ParameterSetName) {
                 Write-Host ('   {0,2}  {1}   {2,-16}  {3}  {4}  0x{5:X4}  {6}' -f $i, $tsStr, $img, $ptStr, $gStr, $hash, $child) -ForegroundColor Cyan
             }
             if (-not $anyValid) {
-                Write-Host '   (todos os 16 slots vazios - nenhum hit ate agora)' -ForegroundColor DarkGray
+                Write-Host ('   (todos os {0} slots vazios - nenhum hit ate agora)' -f $slotCount) -ForegroundColor DarkGray
             }
         } elseif ($null -ne $ring) {
-            Write-Host ('  HitRingBuffer com tamanho inesperado ({0} bytes; esperava 1536)' -f $ring.Length) -ForegroundColor Yellow
+            # v5.0.6 Phase 0: acceptable sizes are 1536 (pre-v5.0.6, 16 slots)
+            # or 12288 (v5.0.6+, 128 slots); anything else is a schema drift.
+            Write-Host ('  HitRingBuffer com tamanho inesperado ({0} bytes; esperava 1536 ou 12288)' -f $ring.Length) -ForegroundColor Yellow
         }
 
         Write-Section 'Tag legend'

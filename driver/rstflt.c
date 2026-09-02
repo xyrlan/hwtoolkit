@@ -153,6 +153,95 @@
  *       its target hive is on-disk and mssmbios has already booted
  *       BOOT_START before us, so the timing pressure is on future
  *       readers/reloads, not this-boot mssmbios.)
+ * v5.0.6 - Phase 0 - OEM string synthesizer scaffolding + measure-first
+ *     counters.
+ *     Motivation: bare-metal RubinOT ban #5 (2026-09-02, driver v5.0.5
+ *     Phase 2 armed + engaged - 214 value-side rewrites landed across the
+ *     banned session, 0 BSOD) reproduced the exact "value handler works
+ *     mechanically but the leak lives elsewhere" outcome the v5.0.5 Phase 2
+ *     decision matrix predicted for `ValHit > 0 & ban`. Probe on the banned
+ *     host confirmed the root cause: `HardwareID` was rewritten byte-exact
+ *     by the Phase 2 substring rewriter (real token -> FNV synthetic in
+ *     both name and value), BUT `DeviceDesc` / `FriendlyName` / `Mfg`
+ *     values still returned OEM cleartext ("NVIDIA GeForce RTX 3070",
+ *     "KINGSTON SA400S37480G", "(ASMedia,3.20,1.10)"). Those strings come
+ *     from the driver .inf and share no substring with the fingerprint
+ *     tokens the parent-path parser extracts, so the substring engine
+ *     never matches them. See docs/postmortem-v5-track-d/incident-v505-
+ *     phase2-ban-cleartext-oem-strings.md. Phase 2 of this version will
+ *     add a per-(device-class, value-name) SYNTHESIZER that produces the
+ *     replacement string independently, keyed by seed + parent tokens
+ *     (so name<->value stay derivable and stable per host). Phase 0
+ *     (this version) lands ONLY the plumbing that Phase 2 will consume:
+ *     counters + arm flag + measure-first hooks + ring buffer resize.
+ *     No synthesizer code, no descriptor extension, no inventory.
+ *     - What LANDED (Phase 0):
+ *         * TRACKD_RING_SIZE bumped 16 -> 128. The 16-slot buffer wrapped
+ *           in ~1.3s at Phase 2's observed 12 hits/s, leaving zero
+ *           forensic window for a ~10 min RubinOT session; 128 slots
+ *           push the wrap to ~11s of continuous activity while staying
+ *           well under the 1 MB per-value cap (128 * 96 = 12288 bytes).
+ *           TrackDFlushWorker's on-stack ringSnap[] is promoted to a
+ *           heap allocation (NonPagedPoolNx, tag 'FRDT') because 12288
+ *           bytes would exceed the 12 KB kernel stack budget.
+ *         * 9 SynthHit_* + 4 Synth*Bail counters declared (SCSI/PCI/USB/
+ *           HID/BTH by (FriendlyName / DeviceDesc / Mfg) + type-mismatch
+ *           / overflow / size-sanity / inventory-miss). Zero-initialized
+ *           and persisted alongside the existing CallbackValHit_* counters
+ *           via TrackDFlushWorker + drift check. Not incremented anywhere
+ *           in Phase 0 - Phase 2 wires the synthesizer callback that bumps
+ *           them. Landing them now spares Phase 2 a persistence/decoder
+ *           edit pass across both userland scripts.
+ *         * 3 measure-first counters WIRED to TrackDHandlePostQueryValue
+ *           (LocationInformation / LocationPaths / ContainerID). A gated
+ *           `rubinot*` process reading one of these value names on any
+ *           classified parent bumps its counter WITHOUT any rewrite. The
+ *           point (kickoff §3.6) is to observe whether EMAC consults these
+ *           value names in a real ban session before spending Phase 2 LOC
+ *           to cover them - a counter that stays 0 across a full RubinOT
+ *           session drops that value name from the Phase 2 target list.
+ *         * EnableValueSynth (REG_DWORD, default 0) declared, parsed by
+ *           LoadTrackDConfig at boot, and hot-toggled by the existing
+ *           TrackDHandlePreSetValue tap so a userland arm today persists
+ *           cleanly and Phase 2 will land with the gate already-honored
+ *           across boot. NO READER in Phase 0 - the flag is dormant until
+ *           the Phase 2 synthesizer callback consults it.
+ *         * Companion userland: scripts/track-d-arm.ps1 gains
+ *           -EnableSynth/-DisableSynth (sets EnableValueSynth) and
+ *           -Diagnose surfaces the new counters and measure-first values.
+ *           scripts/check-consistency.ps1 Track D block extended for the
+ *           new counters and derives ring-buffer slot count from the
+ *           REG_BINARY length instead of hardcoding 16 (backward-compat
+ *           with pre-v5.0.6 1536-byte blobs).
+ *     - Post-review nit (LOW, perf): TrackDHandlePostQueryValue non-rubi
+ *       branch now short-circuits BEFORE the CmCallbackGetKeyObjectID walk
+ *       for measure-first value names (LocationInformation / LocationPaths
+ *       / ContainerID). Those names never appear in any descriptor's
+ *       ValueNames list, so the walk + classify on non-rubi callers ran
+ *       for no counter increment - bounded overhead but non-trivial under
+ *       EnableValueReadRewrite=1 during boot / device-arrival storms.
+ *       Gated (rubi) callers still hit the measure-first counters via the
+ *       block after TrackDClassifyValueParent below (behavior identical).
+ *     - What DEFERRED (kickoff explicitly, or found redundant on review):
+ *         * The actual synthesizer callbacks (Phase 2).
+ *         * TRACKD_VALUE_DESCRIPTOR extension with a Synthesizer field
+ *           (Phase 2 - depends on the callbacks it will hold).
+ *         * PCI sub-classification by class-code (GPU / NIC / storage
+ *           controller / audio codec) - Phase 1.
+ *         * Per-(class, value-name) synthetic inventory header - Phase 1.
+ *         * A periodic LastRingBufferSnapshot dumper (kickoff §7 nice-to-
+ *           have): REDUNDANT with the 128-slot ring + the existing
+ *           drift-check re-queue in TrackDFlushWorker. The v5.0.5 Phase 2
+ *           forensic gap was ring SIZE (16 slots wrapping in ~1.3s), not
+ *           flush cadence - the drift check already re-queues on any
+ *           counter or ring-index movement. Adding a second periodic path
+ *           on top would only duplicate writes without widening the
+ *           window the operator gets back on `-Diagnose`. Re-evaluate
+ *           only if a Phase 2 session reproduces the forensic-gap
+ *           symptom with 128 slots.
+ *     See docs/track-d-v506-oem-string-synthesizer-kickoff.md for full
+ *     design + docs/postmortem-v5-track-d/incident-v506-phase0-
+ *     implementation.md for the Phase 0 writeup + review outcome.
  * v5.0.5 - Phase 0 instrumentation preflight (Track D v5.0.5 kickoff).
  *     Motivation: v5.0.4 bare-metal RubinOT test banned #4 despite
  *     byte-exact SCSI/PCI/USB/HID/Audio name rewrite + probe-validated
@@ -969,7 +1058,7 @@ NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
  * Marker` can validate the installed driver came from v4.0.9+ source
  * without depending on the PE TimeDateStamp (which changes on relink). */
 #pragma comment(linker, "/INCLUDE:RstFltVersion")
-const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
+const char RstFltVersion[] = "RstFlt-v5.0.6-BUILD-MARKER";
 
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
@@ -1116,6 +1205,25 @@ const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
  * EDID binary rewriter - see the double-spoof note above. */
 #define TRACKD_ENABLE_EDID_VAL_STR    L"EnableEdidValueRewrite"
 
+/* v5.0.6 Phase 0: EnableValueSynth (REG_DWORD, default 0). Gates the
+ * Phase 2 synthesizer path (per-value-name OEM string synthesizer for
+ * DeviceDesc / FriendlyName / Mfg on SCSI/PCI/USB/HID/BTH). Phase 0
+ * only DECLARES + persists the gate + hot-toggles it via the tap; no
+ * reader yet. Kept independent of EnableValueReadRewrite so Phase 3
+ * A/B testing can arm the substring rewriter without the synthesizer
+ * or vice versa. See docs/track-d-v506-oem-string-synthesizer-kickoff.md
+ * section 3.4. */
+#define TRACKD_ENABLE_VALSYNTH_VAL_STR L"EnableValueSynth"
+
+/* v5.0.6 Phase 0 - measure-first value names. Any read of these by
+ * a gated caller on a classified parent device increments a counter
+ * without triggering a rewrite. Purpose: kickoff section 3.6 - measure
+ * whether EMAC actually consults these value names in a real ban
+ * window before spending Phase 2 LOC covering them. */
+#define TRACKD_VALNAME_LOCATIONINFO_STR    L"LocationInformation"
+#define TRACKD_VALNAME_LOCATIONPATHS_STR   L"LocationPaths"
+#define TRACKD_VALNAME_CONTAINERID_STR     L"ContainerID"
+
 /* Token bounds for the value-side substring neutralizer. A real token
  * (Ven/Prod/BD_ADDR/GUID) shorter than MIN is skipped: a 1-2 char vendor
  * substring-replaced blindly across a value would collide with unrelated
@@ -1191,8 +1299,14 @@ const char RstFltVersion[] = "RstFlt-v5.0.5-BUILD-MARKER";
 
 /* v5.0.5 Phase 0 - ring buffer of last-N hits. Power-of-two so slot
  * allocation is a masked increment. Sized to comfortably fit inside
- * one on-disk REG_BINARY value without needing sparse writes. */
-#define TRACKD_RING_SIZE          16u
+ * one on-disk REG_BINARY value without needing sparse writes.
+ * v5.0.6 Phase 0: 16 -> 128. The 16-slot window wrapped in ~1.3s at
+ * Phase 2's observed 12 hits/s, giving zero forensic surface for a
+ * ~10 min RubinOT session; 128 slots wrap in ~11s. Total on-disk
+ * REG_BINARY: 128 * 96 = 12288 bytes, well inside the 1 MB per-value
+ * cap. TrackDFlushWorker's on-stack ringSnap was promoted to a heap
+ * allocation (12288 bytes > 12 KB kernel stack budget); see banner. */
+#define TRACKD_RING_SIZE          128u
 #define TRACKD_RING_MASK          (TRACKD_RING_SIZE - 1u)
 
 /* Breadcrumb tags for LastCallbackStatus, encoded (tag<<24)|status.
@@ -1377,6 +1491,15 @@ static UNICODE_STRING  g_TrackDBthMarker;          /* \Enum\BTH\ (value parent) 
 static UNICODE_STRING  g_TrackDStorVolMarker;      /* \Enum\STORAGE\Volume\ */
 static UNICODE_STRING  g_TrackDDisplayMarker;      /* \Enum\DISPLAY\ (EDID host) */
 static UNICODE_STRING  g_TrackDDevParamsSuffix;    /* \Device Parameters */
+/* v5.0.6 Phase 0 - synthesizer gate (no reader yet; hot-toggle only). */
+static BOOLEAN         g_TrackDValueSynthEnabled   = FALSE; /* EnableValueSynth (v5.0.6, no reader yet) */
+static UNICODE_STRING  g_TrackDEnableValSynthName; /* EnableValueSynth (tap) */
+/* v5.0.6 Phase 0 - measure-first value-name views (LocationInformation,
+ * LocationPaths, ContainerID) - populated in ArmTrackD, compared case-
+ * insensitively in the value handler's pre-filter + measure branch. */
+static UNICODE_STRING  g_TrackDValNameLocationInfo;
+static UNICODE_STRING  g_TrackDValNameLocationPaths;
+static UNICODE_STRING  g_TrackDValNameContainerID;
 
 /* Rewrite counter (incremented once per successful in-place mutation)
  * plus flush infrastructure. The Cm callback never opens registry
@@ -1437,13 +1560,52 @@ static volatile LONG   g_TrackDValHitCount_Edid    = 0;
  * process read a value on one of our target device keys. */
 static volatile LONG   g_TrackDNonRubiValueMatchCount = 0;
 
+/* v5.0.6 Phase 0 - per-value-name SYNTHESIZER hit counters. Declared
+ * now so TrackDFlushWorker persistence + userland decoders don't need a
+ * second edit pass when Phase 2 wires the actual synthesizer callbacks.
+ * Zero-valued until Phase 2 lands (kickoff section 7). Row = (device
+ * class, value name); one counter per row so Phase 2 diagnostics can
+ * see which per-class rewrite engaged. */
+static volatile LONG   g_TrackDSynthHit_SCSI_FriendlyName = 0;
+static volatile LONG   g_TrackDSynthHit_SCSI_DeviceDesc   = 0;
+static volatile LONG   g_TrackDSynthHit_SCSI_Mfg          = 0;
+static volatile LONG   g_TrackDSynthHit_PCI_FriendlyName  = 0;
+static volatile LONG   g_TrackDSynthHit_PCI_DeviceDesc    = 0;
+static volatile LONG   g_TrackDSynthHit_PCI_Mfg           = 0;
+static volatile LONG   g_TrackDSynthHit_USB_FriendlyName  = 0;
+static volatile LONG   g_TrackDSynthHit_HID_FriendlyName  = 0;
+static volatile LONG   g_TrackDSynthHit_BTH_FriendlyName  = 0;
+
+/* v5.0.6 Phase 0 - synthesizer BAIL counters. Zero until Phase 2 runs.
+ * Distinguish failure modes at diagnostic time (kickoff section 7):
+ *   TypeMismatchBail   - REG type did not match descriptor expectedType
+ *   OverflowBail       - synthesized data larger than caller buffer
+ *   SizeSanityBail     - real value size outside [minRealBytes, maxRealBytes]
+ *   InventoryMissBail  - synth pool lookup returned no entry */
+static volatile LONG   g_TrackDSynthTypeMismatchBail  = 0;
+static volatile LONG   g_TrackDSynthOverflowBail      = 0;
+static volatile LONG   g_TrackDSynthSizeSanityBail    = 0;
+static volatile LONG   g_TrackDSynthInventoryMissBail = 0;
+
+/* v5.0.6 Phase 0 - measure-first counters. Incremented (Phase 0, wired)
+ * when a gated `rubinot*` caller reads LocationInformation / LocationPaths /
+ * ContainerID on any classified parent device (SCSI/PCI/BTH/STORAGE\Volume/
+ * DISPLAY). NO rewrite in Phase 0 - the point is to measure whether EMAC
+ * actually consults these values in a real ban window before spending
+ * Phase 2 LOC covering them. If a counter stays 0 across a full RubinOT
+ * session on bare-metal, that value name drops off the Phase 2 target
+ * list. */
+static volatile LONG   g_TrackDValHit_LocationInfo   = 0;
+static volatile LONG   g_TrackDValHit_LocationPaths  = 0;
+static volatile LONG   g_TrackDValHit_ContainerID    = 0;
+
 /* v5.0.5 Phase 0 - one record per rewrite event (or non-rubi parent
  * match). Fixed-size fields, no dynamic allocation, no pointers -
  * safe to memcpy verbatim into the on-disk REG_BINARY. Field layout
  * chosen for stable byte-for-byte serialization; userland decoder
  * must match: 8 (I64) + 16 (image) + 1 + 1 + 2 (hash) + 64 (wchar[32])
  * = 92 bytes, aligned by the compiler to 96 with 4 bytes trailing
- * pad. Ring buffer total: 16 * 96 = 1536 bytes. */
+ * pad. Ring buffer total (v5.0.6 Phase 0): 128 * 96 = 12288 bytes. */
 typedef struct _TRACKD_HIT_RECORD {
     LARGE_INTEGER   Timestamp;         /* KeQuerySystemTime, 100ns ticks;
                                         * written LAST as a commit barrier
@@ -1612,6 +1774,7 @@ static BOOLEAN  TrackDExtractValueData(ULONG infoClass, PVOID buf, ULONG bufLen,
 static BOOLEAN  TrackDValueNameAllowed(PCUNICODE_STRING valueName,
                                        const WCHAR * const *allow);
 static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING parent);
+static BOOLEAN  TrackDValueNameIsMeasureFirst(PCUNICODE_STRING valueName); /* v5.0.6 Phase 0 */
 static VOID     TrackDValueRewriteScsi(PCUNICODE_STRING parent, ULONG valueType,
                                        PUCHAR data, ULONG dataBytes);
 static VOID     TrackDValueRewritePci(PCUNICODE_STRING parent, ULONG valueType,
@@ -3852,6 +4015,12 @@ static VOID TrackDHandlePreSetValue(PVOID Argument2)
         target = &g_TrackDValueRewriteEnabled;
     } else if (RtlEqualUnicodeString(&g_TrackDEnableEdidName, info->ValueName, TRUE)) {
         target = &g_TrackDEdidRewriteEnabled;
+    } else if (RtlEqualUnicodeString(&g_TrackDEnableValSynthName, info->ValueName, TRUE)) {
+        /* v5.0.6 Phase 0: EnableValueSynth hot-toggle. No reader in Phase 0
+         * (the synthesizer callback lands in Phase 2), but persisting the
+         * tap now means a userland arm today stays honored end-to-end
+         * once Phase 2 wires the reader. */
+        target = &g_TrackDValueSynthEnabled;
     } else {
         return;
     }
@@ -4496,6 +4665,23 @@ static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING
     return NULL;
 }
 
+/* v5.0.6 Phase 0 - TRUE iff `valueName` is one of the measure-first names
+ * (LocationInformation / LocationPaths / ContainerID). These are NOT in any
+ * descriptor's allow-list, so without an explicit hook they short-circuit
+ * out of the value handler at the pre-filter and never get counted. This
+ * companion helper lets the handler classify them separately, bump the
+ * matching measure-first counter, and return WITHOUT invoking any rewriter
+ * (kickoff section 3.6). */
+static BOOLEAN TrackDValueNameIsMeasureFirst(PCUNICODE_STRING valueName)
+{
+    if (valueName == NULL || valueName->Buffer == NULL || valueName->Length == 0)
+        return FALSE;
+    if (RtlEqualUnicodeString(&g_TrackDValNameLocationInfo,  valueName, TRUE)) return TRUE;
+    if (RtlEqualUnicodeString(&g_TrackDValNameLocationPaths, valueName, TRUE)) return TRUE;
+    if (RtlEqualUnicodeString(&g_TrackDValNameContainerID,   valueName, TRUE)) return TRUE;
+    return FALSE;
+}
+
 /* TRUE iff `valueName` is in ANY value descriptor's allow-list. A cheap
  * union filter (a handful of short string compares, no allocation, no key-
  * object walk) applied BEFORE CmCallbackGetKeyObjectID + classification so
@@ -4504,7 +4690,11 @@ static const TRACKD_VALUE_DESCRIPTOR *TrackDClassifyValueParent(PCUNICODE_STRING
  * EnableValueReadRewrite would pay a CmCallbackGetKeyObjectID on EVERY
  * NtQueryValueKey system-wide (the hottest registry path) - here only the
  * rare reads of HardwareID/EDID/etc. incur that cost. Stays in sync with
- * the descriptors automatically (walks their lists). */
+ * the descriptors automatically (walks their lists).
+ *
+ * v5.0.6 Phase 0 - also lets measure-first names through the cheap pre-
+ * filter so the handler can classify their parent + bump the measure-
+ * first counter without rewriting. */
 static BOOLEAN TrackDValueNameIsInteresting(PCUNICODE_STRING valueName)
 {
     ULONG i;
@@ -4514,6 +4704,8 @@ static BOOLEAN TrackDValueNameIsInteresting(PCUNICODE_STRING valueName)
         if (TrackDValueNameAllowed(valueName, g_TrackDValueDescriptors[i].ValueNames))
             return TRUE;
     }
+    if (TrackDValueNameIsMeasureFirst(valueName))
+        return TRUE;
     return FALSE;
 }
 
@@ -4551,6 +4743,17 @@ static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2)
      * (parity with the enum handler's Phase 0 NonRubiParentMatch) - now
      * bounded to reads of a fingerprint value name by the filter above. */
     if (!TrackDCurrentCallerNameMatches()) {
+        /* v5.0.6 Phase 0 post-review: measure-first names (Location
+         * Information / LocationPaths / ContainerID) only produce a
+         * counter for GATED callers (see the measure-first block after
+         * TrackDClassifyValueParent below). For non-rubi callers those
+         * names never appear in any descriptor's ValueNames list, so
+         * the CmCallbackGetKeyObjectID walk + classify would run for
+         * nothing. Skip the walk entirely - keeps parity with the gated
+         * measurement counters while removing the walk overhead under
+         * EnableValueReadRewrite=1 during boot / device-arrival storms. */
+        if (TrackDValueNameIsMeasureFirst(pre->ValueName))
+            return STATUS_SUCCESS;
         keyIdSt = CmCallbackGetKeyObjectID(&g_TrackDCookie, pre->Object,
                                            &keyId, &keyName);
         if (NT_SUCCESS(keyIdSt) && keyName != NULL) {
@@ -4575,6 +4778,24 @@ static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2)
     }
     desc = TrackDClassifyValueParent(keyName);
     if (desc == NULL) return STATUS_SUCCESS;
+
+    /* v5.0.6 Phase 0 - measure-first: if this is a LocationInformation /
+     * LocationPaths / ContainerID read on a classified parent by a gated
+     * caller, bump the counter and return WITHOUT invoking the rewriter.
+     * Purpose: kickoff section 3.6 - measure whether EMAC consults these
+     * values before spending Phase 2 LOC covering them. Non-rubi callers
+     * are NOT counted here (they already increment CallbackNonRubiValue
+     * Match on the non-rubi path above). */
+    if (TrackDValueNameIsMeasureFirst(pre->ValueName)) {
+        if (RtlEqualUnicodeString(&g_TrackDValNameLocationInfo,  pre->ValueName, TRUE))
+            InterlockedIncrement(&g_TrackDValHit_LocationInfo);
+        else if (RtlEqualUnicodeString(&g_TrackDValNameLocationPaths, pre->ValueName, TRUE))
+            InterlockedIncrement(&g_TrackDValHit_LocationPaths);
+        else if (RtlEqualUnicodeString(&g_TrackDValNameContainerID,   pre->ValueName, TRUE))
+            InterlockedIncrement(&g_TrackDValHit_ContainerID);
+        return STATUS_SUCCESS;
+    }
+
     if (!TrackDValueNameAllowed(pre->ValueName, desc->ValueNames)) return STATUS_SUCCESS;
 
     /* EDID row requires its own opt-in on TOP of the master value gate. */
@@ -4696,10 +4917,31 @@ static VOID TrackDFlushWorker(PVOID unused)
     ULONG nonRubiVal = 0;
     ULONG postValScsi, postValPci, postValBth, postValStor, postValEdid;
     ULONG postNonRubiVal;
-    /* Ring snapshot initialized in-declaration so the `goto out` early
-     * path leaves `ringSnap` deterministic. Compiler emits a single
-     * zeroing pass; equivalent to an RtlZeroMemory call but idiomatic. */
-    TRACKD_HIT_RECORD ringSnap[TRACKD_RING_SIZE] = {0};
+    /* v5.0.6 Phase 0 - synthesizer + measure-first snapshots (16 new
+     * counters). Kept zero-initialized so the `goto out` early path
+     * still produces a deterministic drift comparison against `post`-
+     * prefixed values (both read as 0). Actual bumping happens in Phase 2
+     * for the SynthHit and SynthBail set; the measure-first triplet is
+     * wired NOW by TrackDHandlePostQueryValue. */
+    ULONG synScsiFn = 0, synScsiDd = 0, synScsiMfg = 0;
+    ULONG synPciFn  = 0, synPciDd  = 0, synPciMfg  = 0;
+    ULONG synUsbFn  = 0, synHidFn  = 0, synBthFn   = 0;
+    ULONG synTypeMismatch = 0, synOverflow = 0, synSizeSanity = 0, synInvMiss = 0;
+    ULONG valLocInfo = 0, valLocPaths = 0, valContainer = 0;
+    ULONG postSynScsiFn, postSynScsiDd, postSynScsiMfg;
+    ULONG postSynPciFn, postSynPciDd, postSynPciMfg;
+    ULONG postSynUsbFn, postSynHidFn, postSynBthFn;
+    ULONG postSynTypeMismatch, postSynOverflow, postSynSizeSanity, postSynInvMiss;
+    ULONG postValLocInfo, postValLocPaths, postValContainer;
+    /* v5.0.6 Phase 0 - ring buffer is 128 slots * 96 bytes = 12288 bytes,
+     * which exceeds the default 12 KB kernel worker-thread stack budget
+     * once other locals on this function are accounted for. Promote the
+     * snapshot to a NonPagedPoolNx heap allocation, freed at `out:`.
+     * Allocation failure is best-effort: we skip the ring persist for
+     * this pass; every other counter still flushes, and the drift-check
+     * at `out:` will re-queue on the next hot-path publish. */
+    PVOID              ringSnapMem = NULL;
+    TRACKD_HIT_RECORD *ringSnap    = NULL;
 
     UNREFERENCED_PARAMETER(unused);
     PAGED_CODE();
@@ -4736,7 +4978,35 @@ static VOID TrackDFlushWorker(PVOID unused)
     valStor    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Storage, 0, 0);
     valEdid    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Edid,    0, 0);
     nonRubiVal = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiValueMatchCount, 0, 0);
-    RtlCopyMemory(ringSnap, g_TrackDRingBuffer, sizeof(ringSnap));
+    /* v5.0.6 Phase 0 - synth + measure-first snapshots. Kept alongside
+     * the v5.0.5 snapshots so the drift-check chain at `out:` stays a
+     * single mega-comparison (no split flushes). */
+    synScsiFn        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_FriendlyName, 0, 0);
+    synScsiDd        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_DeviceDesc,   0, 0);
+    synScsiMfg       = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_Mfg,          0, 0);
+    synPciFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_FriendlyName,  0, 0);
+    synPciDd         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_DeviceDesc,    0, 0);
+    synPciMfg        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_Mfg,           0, 0);
+    synUsbFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_USB_FriendlyName,  0, 0);
+    synHidFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_HID_FriendlyName,  0, 0);
+    synBthFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_BTH_FriendlyName,  0, 0);
+    synTypeMismatch  = (ULONG)InterlockedCompareExchange(&g_TrackDSynthTypeMismatchBail,  0, 0);
+    synOverflow      = (ULONG)InterlockedCompareExchange(&g_TrackDSynthOverflowBail,      0, 0);
+    synSizeSanity    = (ULONG)InterlockedCompareExchange(&g_TrackDSynthSizeSanityBail,    0, 0);
+    synInvMiss       = (ULONG)InterlockedCompareExchange(&g_TrackDSynthInventoryMissBail, 0, 0);
+    valLocInfo       = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationInfo,   0, 0);
+    valLocPaths      = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationPaths,  0, 0);
+    valContainer     = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_ContainerID,    0, 0);
+
+    /* Heap-alloc ringSnap (12288 bytes at 128 slots exceeds the stack
+     * budget). Best-effort: on failure we skip the ring persist for
+     * this pass; drift-check at `out:` re-queues on the next publish. */
+    ringSnapMem = ExAllocatePoolWithTag(NonPagedPoolNx,
+                                        sizeof(g_TrackDRingBuffer), 'FRDT');
+    if (ringSnapMem != NULL) {
+        ringSnap = (TRACKD_HIT_RECORD *)ringSnapMem;
+        RtlCopyMemory(ringSnap, g_TrackDRingBuffer, sizeof(g_TrackDRingBuffer));
+    }
 
     InitializeObjectAttributes(&oa, &g_TrackDParamsFullPath,
                                OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
@@ -4826,11 +5096,52 @@ static VOID TrackDFlushWorker(PVOID unused)
     RtlInitUnicodeString(&valName, L"CallbackHitRingIndex");
     (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD,
                         &ringIdx, sizeof(ringIdx));
-    RtlInitUnicodeString(&valName, L"HitRingBuffer");
-    (void)ZwSetValueKey(hParams, &valName, 0, REG_BINARY,
-                        ringSnap, sizeof(ringSnap));
+    /* v5.0.6 Phase 0: ring is heap-allocated; skip persist on alloc-fail. */
+    if (ringSnap != NULL) {
+        RtlInitUnicodeString(&valName, L"HitRingBuffer");
+        (void)ZwSetValueKey(hParams, &valName, 0, REG_BINARY,
+                            ringSnap, sizeof(g_TrackDRingBuffer));
+    }
+
+    /* v5.0.6 Phase 0 - synthesizer + measure-first counters. All 16 land
+     * in Parameters as REG_DWORD; consumers read them via track-d-arm.ps1
+     * -Diagnose + check-consistency.ps1 Track D block. Phase 2 will wire
+     * the SynthHit and SynthBail set; measure-first triplet is already hot. */
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_SCSI_FriendlyName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synScsiFn, sizeof(synScsiFn));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_SCSI_DeviceDesc");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synScsiDd, sizeof(synScsiDd));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_SCSI_Mfg");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synScsiMfg, sizeof(synScsiMfg));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_PCI_FriendlyName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synPciFn, sizeof(synPciFn));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_PCI_DeviceDesc");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synPciDd, sizeof(synPciDd));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_PCI_Mfg");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synPciMfg, sizeof(synPciMfg));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_USB_FriendlyName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synUsbFn, sizeof(synUsbFn));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_HID_FriendlyName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synHidFn, sizeof(synHidFn));
+    RtlInitUnicodeString(&valName, L"CallbackSynthHit_BTH_FriendlyName");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synBthFn, sizeof(synBthFn));
+    RtlInitUnicodeString(&valName, L"CallbackSynthTypeMismatchBail");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synTypeMismatch, sizeof(synTypeMismatch));
+    RtlInitUnicodeString(&valName, L"CallbackSynthOverflowBail");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synOverflow, sizeof(synOverflow));
+    RtlInitUnicodeString(&valName, L"CallbackSynthSizeSanityBail");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synSizeSanity, sizeof(synSizeSanity));
+    RtlInitUnicodeString(&valName, L"CallbackSynthInventoryMissBail");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &synInvMiss, sizeof(synInvMiss));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_LocationInfo");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &valLocInfo, sizeof(valLocInfo));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_LocationPaths");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &valLocPaths, sizeof(valLocPaths));
+    RtlInitUnicodeString(&valName, L"CallbackValHit_ContainerID");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &valContainer, sizeof(valContainer));
 
 out:
+    if (ringSnapMem) { ExFreePool(ringSnapMem); ringSnapMem = NULL; ringSnap = NULL; }
     if (hParams) ZwClose(hParams);
     /* Release the guard so a concurrent update can re-queue. */
     InterlockedExchange(&g_TrackDFlushQueued, 0);
@@ -4862,6 +5173,24 @@ out:
     postValStor    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Storage, 0, 0);
     postValEdid    = (ULONG)InterlockedCompareExchange(&g_TrackDValHitCount_Edid,    0, 0);
     postNonRubiVal = (ULONG)InterlockedCompareExchange(&g_TrackDNonRubiValueMatchCount, 0, 0);
+    /* v5.0.6 Phase 0 - synth + measure-first drift-check reads. Any one
+     * that drifts from the snapshot we just persisted forces a re-queue. */
+    postSynScsiFn        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_FriendlyName, 0, 0);
+    postSynScsiDd        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_DeviceDesc,   0, 0);
+    postSynScsiMfg       = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_SCSI_Mfg,          0, 0);
+    postSynPciFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_FriendlyName,  0, 0);
+    postSynPciDd         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_DeviceDesc,    0, 0);
+    postSynPciMfg        = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_PCI_Mfg,           0, 0);
+    postSynUsbFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_USB_FriendlyName,  0, 0);
+    postSynHidFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_HID_FriendlyName,  0, 0);
+    postSynBthFn         = (ULONG)InterlockedCompareExchange(&g_TrackDSynthHit_BTH_FriendlyName,  0, 0);
+    postSynTypeMismatch  = (ULONG)InterlockedCompareExchange(&g_TrackDSynthTypeMismatchBail,  0, 0);
+    postSynOverflow      = (ULONG)InterlockedCompareExchange(&g_TrackDSynthOverflowBail,      0, 0);
+    postSynSizeSanity    = (ULONG)InterlockedCompareExchange(&g_TrackDSynthSizeSanityBail,    0, 0);
+    postSynInvMiss       = (ULONG)InterlockedCompareExchange(&g_TrackDSynthInventoryMissBail, 0, 0);
+    postValLocInfo       = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationInfo,   0, 0);
+    postValLocPaths      = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationPaths,  0, 0);
+    postValContainer     = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_ContainerID,    0, 0);
     RtlCopyMemory(postMissSnap, g_TrackDLastMissName, sizeof(postMissSnap));
     if (postStatus     != statusValue   ||
         postHit        != hitValue      ||
@@ -4883,6 +5212,23 @@ out:
         postValStor    != valStor       ||
         postValEdid    != valEdid       ||
         postNonRubiVal != nonRubiVal    ||
+        /* v5.0.6 Phase 0 - synth + measure-first drift terms. */
+        postSynScsiFn       != synScsiFn       ||
+        postSynScsiDd       != synScsiDd       ||
+        postSynScsiMfg      != synScsiMfg      ||
+        postSynPciFn        != synPciFn        ||
+        postSynPciDd        != synPciDd        ||
+        postSynPciMfg       != synPciMfg       ||
+        postSynUsbFn        != synUsbFn        ||
+        postSynHidFn        != synHidFn        ||
+        postSynBthFn        != synBthFn        ||
+        postSynTypeMismatch != synTypeMismatch ||
+        postSynOverflow     != synOverflow     ||
+        postSynSizeSanity   != synSizeSanity   ||
+        postSynInvMiss      != synInvMiss      ||
+        postValLocInfo      != valLocInfo      ||
+        postValLocPaths     != valLocPaths     ||
+        postValContainer    != valContainer    ||
         RtlCompareMemory(postMissSnap, missSnap, sizeof(missSnap)) != sizeof(missSnap))
     {
         if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
@@ -5023,6 +5369,23 @@ static NTSTATUS LoadTrackDConfig(PUNICODE_STRING RegPath)
         if (flagVal == 1) g_TrackDEdidRewriteEnabled = TRUE;
     }
 
+    /* v5.0.6 Phase 0: EnableValueSynth (REG_DWORD, default 0). No reader
+     * in Phase 0 - kept parsed so a userland arm at Phase 0 boot persists
+     * cleanly and Phase 2 lands with the gate already-honored across boot.
+     * Independent of EnableValueReadRewrite so Phase 3 A/B testing can arm
+     * the synthesizer without the substring rewriter (or vice versa). */
+    flagVal = 0;
+    RtlInitUnicodeString(&valName, L"EnableValueSynth");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &need);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) g_TrackDValueSynthEnabled = TRUE;
+    }
+
     /* RegCallbackSeed (REG_SZ, up to 64 hex chars). Stored raw as
      * lower bytes of each WCHAR (ASCII-safe assumption; a non-ASCII
      * seed would still hash deterministically, just with fewer bits
@@ -5091,6 +5454,11 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     RtlInitUnicodeString(&g_TrackDStorVolMarker,     TRACKD_ENUM_STORVOL_MARKER_STR);
     RtlInitUnicodeString(&g_TrackDDisplayMarker,     TRACKD_DISPLAY_MARKER_STR);
     RtlInitUnicodeString(&g_TrackDDevParamsSuffix,   TRACKD_DEVPARAMS_SUFFIX_STR);
+    /* v5.0.6 Phase 0 - EnableValueSynth tap + measure-first value names. */
+    RtlInitUnicodeString(&g_TrackDEnableValSynthName,  TRACKD_ENABLE_VALSYNTH_VAL_STR);
+    RtlInitUnicodeString(&g_TrackDValNameLocationInfo,  TRACKD_VALNAME_LOCATIONINFO_STR);
+    RtlInitUnicodeString(&g_TrackDValNameLocationPaths, TRACKD_VALNAME_LOCATIONPATHS_STR);
+    RtlInitUnicodeString(&g_TrackDValNameContainerID,   TRACKD_VALNAME_CONTAINERID_STR);
 
     ExInitializeWorkItem(&g_TrackDFlushWorkItem, TrackDFlushWorker, NULL);
 
