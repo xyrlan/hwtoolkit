@@ -212,4 +212,47 @@ echo   - Apos reiniciar, verifique com:
 echo       wmic diskdrive get serialnumber
 echo ========================================================
 echo.
+echo ========================================================
+echo   ATENCAO - DRIVER SOZINHO NAO SPOOFA IDENTIDADE!
+echo.
+echo   Este driver (rstflt.sys) instala o kernel Cm callback
+echo   (Track D: reescreve subkeys de Enum\SCSI/PCI/USB/HID/
+echo   BTH/STORAGE + values de HardwareID/FriendlyName/etc).
+echo   Ele NAO toca em nenhum dos seguintes signals de identidade
+echo   que anti-cheats correlacionam por sessao/reboot:
+echo.
+echo     - CPU string ^(ProcessorNameString^)
+echo     - ComputerName ^(HKLM\...\ComputerName\ComputerName^)
+echo     - MachineGuid  ^(HKLM\SOFTWARE\Microsoft\Cryptography^)
+echo     - MAC address  ^(adapter primaria^)
+echo     - EDID         ^(Enum\DISPLAY\...\Device Parameters^)
+echo     - Windows user SID + username
+echo.
+echo   O ban #6 ^(2026-09-02^) confirmou que a CPU real vazou 16x
+echo   ANTES do driver-scan bater ^(procmon evidence^). Sem Level A
+echo   ou Track A ^(kernel CPU replay^) armados, o driver Track D
+echo   nao adianta -- o identity bundle ja subiu no Cloudflare
+echo   heartbeat antes do primeiro request de gameplay.
+echo.
+echo   PROXIMO PASSO OBRIGATORIO antes de qualquer teste bare-metal:
+echo.
+echo     .\04b-aplicar-hwid-emac.bat --skip-disk --skip-volume ^
+echo                                 --skip-usb --skip-hid
+echo     ^(pipeline Level A: mac / audio / edid / emac / winid /
+echo      cpu / nls / persistence; NAO passe --skip-cpu^)
+echo.
+echo   OU ^(Level C kernel replay, so se testando CPU spoof kernel-mode^):
+echo.
+echo     .\scripts\spoof-smbios.ps1 -CpuOnly
+echo.
+echo   Depois:
+echo.
+echo     .\pre-test-checklist.bat        ^(auditoria + identity check^)
+echo.
+echo   Para armar tudo com fail-fast em drift antes do proximo teste:
+echo.
+echo     .\pre-test-checklist.bat --arm
+echo.
+echo ========================================================
+echo.
 pause
