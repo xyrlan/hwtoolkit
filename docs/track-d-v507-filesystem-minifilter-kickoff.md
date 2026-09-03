@@ -1,11 +1,11 @@
 # Track D v5.0.7 - Filesystem minifilter + defense-in-depth hardening (kickoff)
 
-**Status:** DRAFT / pre-implementation
+**Status:** **PARTIALLY SUPERSEDED 2026-09-02** by adversarial re-review (81-agent workflow spot-verified against raw procmon CSV). Phase 0 scaffolding landed as-is via PR #26 (arm-gated + dormant by default = safe to ship). **Phase 1 hide-logic wiring is on hold pending a probe bundle** — see §10 Revised Sequencing below and the amended postmortem §6. Original design core (§3) reads as-was for archaeological continuity, with inline **[CORRECTED]** blocks marking each falsified claim.
 **Owner:** xyrlan (@ Claude Opus 4.7)
-**Data:** 2026-09-02
+**Data:** 2026-09-02 (original) + 2026-09-02 corrections
 **Predecessor:** v5.0.6 Phase 2 (OEM string synthesizer dispatch, PR #24, commit 560cd5d, checkpoint `clean-v506-phase2-armed`)
 **Successor stub:** v5.0.8 (candidate = ProfileList SID rewrite handler as full Cm-callback extension if v5.0.7 P2 needs more; OR WMI in-proc shadow roadmap-v41 if P0-P2 land AND ban persists)
-**Postmortem que motiva:** [`docs/postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md`](postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md)
+**Postmortem que motiva:** [`docs/postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md`](postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md) — **read §3.4 and §3.6 corrections before acting on §3 below.**
 
 ---
 
@@ -96,6 +96,8 @@ static FLT_OPERATION_REGISTRATION Callbacks[] = {
 // Also register FastIO if IoManager promotes reads to FastIO path (Windows may bypass IRP_MJ_READ for cached pages).
 ```
 
+**[CORRECTED 2026-09-02]** — FastIO is not "if"; it is **required**. Raw CSV of ban #6 shows **8** `FASTIO_RELEASE_FOR_SECTION_SYNCHRONIZATION` events on `rstflt.sys` in the burst immediately after the initial `IRP_MJ_CREATE`. Without a `FAST_IO_DISPATCH` populated (`FastIoRead`, `AcquireForSectionSynchronization`, and the FastIO-analog stubs for the other MJ codes we intercept via IRP), a Phase 1 preop-only design leaks silently and `FsHideHitCount = 0` is not proof of "gate never triggered" — it is proof of FastIO bypass. Also consider `IRP_MJ_NETWORK_QUERY_OPEN` + `IRP_MJ_QUERY_INFORMATION` (metadata paths without IRP_MJ_CREATE), measure-first.
+
 - **`PreCreate`**: fired on `NtCreateFile` for gated caller opening a file whose name matches known-bad-driver list. Return `FLT_PREOP_COMPLETE` + set `Data->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND`.
 - **`PreRead`**: safety net if a handle was cached via `CreateFileMapping` before the create was gated. Same STATUS return.
 - **`PostDirCtl`**: strip `rstflt.sys` (and any name in the known-bad-driver list) from `FILE_BOTH_DIR_INFORMATION`/`FILE_ID_BOTH_DIR_INFORMATION`/`FILE_FULL_DIR_INFORMATION` buffers returned to gated callers. Requires walking the linked list of `NextEntryOffset` records and rewriting/removing entries.
@@ -107,6 +109,10 @@ Reuse `TrackDCurrentCallerNameMatches()` from `driver/rstflt.c` — `PsGetProces
 **Preop callbacks run at IRQL <= APC_LEVEL** typically PASSIVE for user-initiated IO. `PsGetProcessImageFileName` valid at PASSIVE — matches Track D contract.
 
 ### 3.5 Known-bad-driver name list
+
+**[CORRECTED 2026-09-02]** — the underlying premise ("rubinot has a hard-coded name blacklist string-match") is **FALSIFIED** by the raw CSV re-review (see postmortem §3.4). The actual probe order is `\SystemRoot\System32\drivers\rstflt.sys` (fumbled as `C:\SystemRoot\...`) FIRST — which is `SYSTEM_MODULE_INFORMATION.FullPathName` shape — then `%SystemRoot%` resolution → `C:\Windows\...` SUCCESS. Install-dir probes come 5.5 s later, likely a secondary sweep, not the primary vector. Rubinot pulls our filename from `NtQuerySystemInformation(SystemModuleInformation)` = a live enumeration, not from an embedded blacklist string.
+
+**Implication:** the hidden-name list still needs to exist (it is what the PreCreate leaf-match compares against — see §3.4), but its purpose is not "blacklist evasion." It is "cover the specific filenames rubinot's enumeration will surface". Since rubinot surfaces our name via enumeration, the list needs to be either (a) the exact current filename baked in at install time, or (b) computed at boot from `\Driver\<ourservice>`. Randomizing the name (P3 in §3.7) does not help unless enumeration also refuses to serve the row (out of Track D FsFilter scope — would need a SSDT hook or similar).
 
 Initial:
 ```c
@@ -129,6 +135,8 @@ Full path variants to catch:
 FltMgr normalizes these via `FltGetFileNameInformation(NORMALIZED)`. Use that + compare leaf name.
 
 ### 3.6 Registry-side companion: hide RstFlt service key
+
+**[CORRECTED 2026-09-02]** — spot-verified against raw CSV: **zero** `Services\RstFlt` enumeration events by rubinot_dx in the full 9.3 GB capture. This entire section addresses a non-observed vector. Deprioritize to v5.0.7 P3 or out-of-scope. See postmortem §3.6 for the CSV verification and §7 Q7 below for the SCM-path architectural gap that would also NOT be covered by a `RegNtPreEnumerateKey` handler (services.exe reads the registry, not rubinot).
 
 Extend existing Track D Cm callback with `RegNtPreEnumerateKey` handler on `HKLM\SYSTEM\CurrentControlSet\Services`:
 
@@ -229,7 +237,8 @@ Post-implementation workflow: correctness / IRQL-locking / memory-pool / anti-ch
 - **Recomendacao**: Strip in shipping-build. Keep in dev-build (identified by build flag `TRACKD_DEV_BUILD=1`) so `Read-DriverVersionMarker` in check-consistency.ps1 still works during development. If the operator ships a dev-build accidentally, they get the identity leak; add a warning in `03-instalar-driver.bat` "installing a dev-marker build" if the marker is present.
 
 **Q7 (low)**: Should `Services\RstFlt` scrub also cover the userland `sc query RstFlt` output? (SC uses Cm queries so same handler covers).
-- **Recomendacao**: YES automatically covered by RegNtPreEnumerateKey on `Services\`. Test: `sc query RstFlt` for gated rubinot* caller should return "The specified service does not exist as an installed service" (SC error 1060).
+- **Recomendacao [ORIGINAL, WRONG]**: YES automatically covered by RegNtPreEnumerateKey on `Services\`.
+- **[CORRECTED 2026-09-02]** — **architecturally FALSE.** `sc.exe` / `EnumServicesStatusEx` / `OpenServiceW` do not read the registry in the caller process — they issue an ALPC RPC to `services.exe`, and `services.exe` serves from an in-memory service table populated at boot. Our Cm callback gate (`PsGetProcessImageFileName` + `_strnicmp("rubinot",7)`) evaluates the CALLER of the registry read, which is `services.exe` (or `svchost` on some paths), never `rubinot`. The gate never fires and the scrub never runs. Testing: rename `reg.exe` → `rubinot_probe.exe`, run `.\rubinot_probe.exe query RstFlt` (from Cmd, invokes SCM ALPC) — service is returned. This means covering the SCM enumeration surface requires either (a) an ALPC-level RPC filter (out of Track D scope), (b) hiding the service from `services.exe`'s in-memory table (requires kernel-mode hook into SCM data structures, out of Track D scope), or (c) a userland pre-launch shim that removes our service from the registry before rubinot starts and re-adds it after (fragile, boot-time race, would be caught by ban #6-style file scan anyway). Combined with §3.6 correction (zero observed `Services\RstFlt` enumeration by rubinot_dx), the Q7 mitigation is deferred out of P0 entirely.
 
 ---
 
@@ -257,16 +266,24 @@ Post-implementation workflow: correctness / IRQL-locking / memory-pool / anti-ch
 
 ## 10. Estimates + sequencing
 
-| Phase | LOC | Days | Blocker? |
-|---|---:|---:|---|
-| **P0**: FsFilter driver + minifilter callbacks + RegNtPreEnumerateKey Services scrub | 800-1200 C | 5-10 | YES |
-| **P0 verify**: adversarial 6-lens review + inline fixes | +200 C | 2-3 | YES |
-| **P0 VM sanity**: `phase4-fsfilter-sanity-test.ps1` | 250 PS | 1 | YES |
-| **P0 bare-metal + docs**: postmortem + kickoff v5.0.8 stub | +300 md | 1 | YES |
-| **P1**: `verify-arm.ps1` + IFEO wrapper | 200 PS | 1 | Parallel |
-| **P2**: ProfileList SID rewrite Cm callback extension | 300 C | 3 | After P0 |
-| **P3 (build hardening)**: strip marker + evaluate random name | 100 (mixed) | 2 | Optional, after P0 |
+**[REVISED 2026-09-02 after adversarial re-review, per postmortem §6.]** Original sequencing (`P0 = FsFilter, P1 = verify-arm`) is inverted. Phase 0 scaffolding of FsFilter landed via PR #26 (arm-gated + dormant, safe to ship). Phase 1 hide-logic wiring is **on hold** pending a probe bundle that falsifies or confirms the assumptions this kickoff was built on.
 
-**Total v5.0.7 P0-only**: ~1500-1700 C + 250 PS + 300 md over 2-3 weeks.
+| # | Phase | LOC | Days | Blocker? |
+|---|-------|----:|-----:|----------|
+| — | **Phase 0 SCAFFOLDING** (shipped in PR #26) | ~1200 total (819 C + 116 PS + 47 PS + 116 md + docs) | delivered | done |
+| 1 | **Probe #1** — Level A CPU coverage audit (§10 postmortem) | 0 (fix install script if gap found) | 0.25 | YES |
+| 2 | **Probe #2 = P0.5** — `verify-arm.ps1` + IFEO wrapper (was P1) | 200 PS | 1 | YES |
+| 3 | **Probe #3** — Random-name A/B in bare-metal | ~50 batch changes + 1 test session | 1 | YES |
+| 4 | **Probe #4** — affctl.sys repro in bare-metal | ~30 batch changes + 1 test session | 1 | YES |
+| 5 | **Probe #5** — SCM/WMI enumeration probe (`rubinot_probe.exe`) | ~30 PS | 0.5 | YES |
+| 6 | **Probe #6** (optional) — TLS-MITM Cloudflare heartbeat | Wireshark + SSLKEYLOGFILE + analysis | 1-2 | Optional |
+| 7 | **DECISION** (GO/NO-GO on FsFilter Phase 1) based on §6 outcome tree | doc | 0.5 | YES |
+| 8 | **Phase 1 FsFilter hide (if GO)** — PreCreate + FastIO + PostDirCtl walker + measure-first counter wiring + sanity harness | 800-1200 C + 250 PS | 5-10 | conditional |
+| 9 | **P2** — ProfileList SID rewrite Cm callback extension (if Phase 1 lands + ban persists) | 300 C | 3 | conditional |
+| — | **P3** (build hardening) | 100 (mixed) | 2 | optional |
 
-**Sequencing**: P0 must land alone (no P1/P2 in same PR) to isolate outcome-tree diagnosis. If P0 branch #3 (Ban < 15min + FsHide > 0) fires, P1 + P2 land in v5.0.7.1 immediately.
+**Total probe bundle**: ~4-5 days end-to-end (probes 1-5), most of it bare-metal cycles not developer time.
+
+**Total v5.0.7 P0 if it goes forward**: ~1500-1700 C + 250 PS + 300 md over 2-3 weeks AFTER probe bundle decision.
+
+**Sequencing rule (new)**: probe bundle lands as separate small PRs (doc-only correction PR first, then Level A CPU audit, then verify-arm.ps1, then bare-metal test docs). No Phase 1 FsFilter code merges to main until the DECISION step (7) has been made and recorded in a follow-up postmortem.
