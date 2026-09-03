@@ -35,7 +35,7 @@ CC   = cl.exe
 LINK = link.exe
 
 # Shared flags. /Fo is per-target (see rules).
-CFLAGS_COMMON = /nologo /W4 /WX /wd4996 /Ox /GS- /Zl \
+CFLAGS_COMMON = /nologo /W4 /WX /wd4996 /wd4324 /Ox /GS- /Zl \
                 /D _AMD64_ /D _WIN64 /D NTDDI_VERSION=0x0A000007 /D _NT_TARGET_VERSION_WIN10_RS2 \
                 /I "$(WDK_INC)\km" \
                 /I "$(WDK_INC)\shared" \
@@ -54,8 +54,11 @@ LFLAGS_COMMON = /nologo /DRIVER /SUBSYSTEM:NATIVE /ENTRY:DriverEntry \
 # Registered stays FALSE). Testsigning does NOT bypass. See v5.0.3
 # changelog block in rstflt.c.
 
-# rstflt: legacy WDM upper filter (needs wdmsec.lib)
-RSTFLT_LIBS = wdmsec.lib
+# rstflt: legacy WDM upper filter (needs wdmsec.lib) + v5.0.7 Phase 0
+# FltMgr minifilter scaffolding (needs fltmgr.lib for FltRegisterFilter,
+# FltStartFiltering, FltUnregisterFilter). fltmgr.lib lives in the same
+# $(WDK_LIB)\km\x64 as ntoskrnl.lib -- no new /LIBPATH needed.
+RSTFLT_LIBS = wdmsec.lib fltmgr.lib
 
 all: rstflt.sys
 
