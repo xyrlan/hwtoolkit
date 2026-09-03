@@ -1,5 +1,29 @@
 # Incident v506 Phase 2 - Ban #6 root cause: `rstflt.sys` read AS A FILE by rubinot_dx.exe
 
+> ## 🚨 CRITICAL UPDATE 2026-09-02 (post-Q1a/Q2/Q3 operator answers)
+>
+> **The root-cause conclusion in this postmortem's original §1-§4 is FALSIFIED by new operator evidence. The desktop machine is on a server-side HW BLACKLIST, independent of the `rstflt.sys` file scan.**
+>
+> Operator confirmed (2026-09-02, after the adversarial re-review):
+>
+> 1. **Q1(a):** bare-metal DESKTOP with **Windows virgem (fresh install), account virgem, IP virgem, ZERO toolkit installed** → ban at ~15 min in-game. rstflt.sys does not exist on disk in this scenario.
+> 2. **Q2:** the SAME operator account, on a DIFFERENT physical machine (notebook, wifi/no-cable), played 24h+ without ban. Ban is HW-bound, not account-bound and not IP-bound.
+> 3. **Q3:** the recon-v3 `affctl.sys` "no reaction" observation never crossed the 15-min threshold — the session stayed on the login screen. The counterfactual is invalid; treat recon-v3's affctl claim as unproven, not as evidence.
+>
+> **Consequences for the roadmap:**
+>
+> - The **`rstflt.sys` file read** documented in §3.1-§3.4 is likely **corroborating telemetry**, not the ban trigger. Desktop-virgin-no-toolkit still bans at ~15 min → hiding the file does nothing to a machine that is already blacklisted at a HW-signal level.
+> - The **v5.0.7 P0 FsFilter direction is now on INDEFINITE HOLD.** Ban would repro even with the hide fully wired.
+> - The **new dominant vector is HW fingerprint scan** (client-side, triggered ~10-13 min post-login, results uploaded to server which correlates against a per-machine blacklist). Timer determinism matches across all 6 bans.
+> - **v5.0.7 P0.5** (`verify-arm.ps1`) stays useful as defensive infrastructure for the NOTEBOOK / any clean machine, but does NOT fix the desktop.
+>
+> **New roadmap:** two-phase probing to distinguish `HW-permanent` blacklist (survives Windows reinstall) vs `Windows-install-state` blacklist (SysPrep / Level A / SID rotation clears it). See v5.0.7 kickoff §11 "Path A / Path B" for the concrete procedure. Path A is a 2-hour test that decides whether the desktop is salvageable at all under any user-mode approach.
+>
+> The rest of this postmortem stays as archaeological record of what we THOUGHT ban #6 meant. Read §5 (ranked alternates) and §3.6 (empirical corrections) for the still-valid data; ignore §3.4/§6 P0/§7 conclusions that presume "file scan is the primary vector".
+>
+> **Session context:** all three answers came from the operator after the 81-agent adversarial re-review + in-session CSV spot-verify. The evidence is not itself in this repo; it is direct testimony that the desktop-virgin-no-toolkit ban outcome has been reproduced by the operator. Trust level = eyewitness from the person who runs the bare-metal tests.
+
+
 **Status:** Root cause identified. Ban de 12min pos-login em sessao bare-metal 2026-09-02. Driver v5.0.6 Phase 2 armed + 3 gates up + Level A userland aplicado (parcial - ver §5). 357M callback invocations, 0 BSOD, LastCallbackStatus=OK. Callback funcionou mecanicamente perfeito. Ban veio via **filesystem read do `rstflt.sys` por `rubinot_dx.exe`** (36 file-system ops em burst de 35ms as 18:47:35 = 11min into session, ~2min antes do ban server-side). Callback Cm no altitude 321000 nao alcanca IoManager/FltMgr. **Phase 2 (OEM string synth) e a extensao Phase 2.1 (USB+HID class-code hashmap) DEPRIORIZADAS** - expandir Cm callback ampliaria uma superfice que EMAC nao exercita. Roadmap pivota pra **v5.0.7 P0 = filesystem minifilter**.
 
 **Data:** 2026-09-02

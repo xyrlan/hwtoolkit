@@ -1,5 +1,27 @@
 # CLAUDE.md — hwtoolkit project notes
 
+> ## 🛑 STRATEGIC PIVOT 2026-09-02 — desktop is on HW blacklist, FsFilter direction on hold
+>
+> **Operator evidence (2026-09-02, direct testimony after adversarial re-review of ban #6):** the desktop physical machine bans at ~15 min in-game even on a **Windows-virgem install, IP virgem, conta virgem, ZERO toolkit ever installed**. The SAME operator account on a NOTEBOOK plays 24h+ without ban. Ban is HW-bound (not account, not IP, not toolkit-presence-based).
+>
+> This falsifies the v5.0.7 P0 FsFilter direction: hiding `rstflt.sys` cannot prevent a ban that fires whether the file exists on disk or not. **All new FsFilter code is on INDEFINITE HOLD** pending Path A (see [`docs/track-d-v507-filesystem-minifilter-kickoff.md`](docs/track-d-v507-filesystem-minifilter-kickoff.md) §11):
+>
+> - **Path A (2h, operator-run):** wipe + reinstall Windows on desktop, hotspot IP, virgin account, ZERO toolkit, 30 min in-game.
+>   - Ban → HW-firmware-anchored blacklist (CPU serial / SMBIOS UUID / MB serial / disk firmware / EDID EEPROM). User-mode NOTHING helps. Roadmap becomes hypervisor tooling OR component replacement OR retire desktop from RubinOT.
+>   - No ban → Windows-install-state anchored. SysPrep cold rotation + Level A resolve. rstflt driver remains useless.
+> - **Path B (1d, optional):** TLS-MITM diff of the fingerprint upload between notebook (whitelisted) and desktop (blacklisted). Identifies the exact signal.
+>
+> **Still useful (do not retire):**
+> - v5.0.7 P0.5 `scripts/verify-arm.ps1` + IFEO wrapper — defensive infra for the NOTEBOOK and any future clean machine to prevent first-ban.
+> - `scripts/check-identity-drift.ps1` + `pre-test-checklist.bat` step [7/6] — same rationale.
+> - Level A userland pipeline (`04b-aplicar-hwid-emac.bat`).
+>
+> **Retired-in-place (leave in-tree, no wiring):**
+> - v5.0.7 Phase 0 FsFilter scaffolding (arm-gated + dormant; harmless).
+> - v5.0.6 Phase 2 OEM synth (functionally orthogonal to the actual ban vector; keep as dormant defense-in-depth).
+>
+> Every code PR opened from now on should note whether it applies to the "clean machine" scenario (still relevant) or the "already-blacklisted desktop" scenario (do not code until Path A). See [`docs/postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md`](docs/postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md) top-of-file CRITICAL UPDATE block for the operator-evidence narrative.
+
 Windows hardware-fingerprint spoofing toolkit: BOOT_START kernel filter driver (`driver/rstflt.c`, DiskDrive class UpperFilter) + PowerShell user-mode spoofers (`scripts/`) + sequential `NN-*.bat` pipeline in the repo root. Targets: Fase 5 anti-cheat detection surfaces (WMI, SMBIOS, CPU registry, MAC, EDID, disk serial, Windows machine identity). Primary threat model docs: `docs/emac-recon-v2.md`, `docs/fase2-kickoff.md`.
 
 **As of Phase 1 (2026-08-31), Level A (EMAC-only userland spoof, no kernel driver) is the recommended default against EMAC-tier anti-cheats (RubinOT) per `docs/emac-recon-v3.md`.** Level C driver install (`03-instalar-driver.bat` + kernel replay) remains opt-in for future stronger anti-cheats that inspect SMBIOS/CPUID beyond what EMAC surfaces today.
