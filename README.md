@@ -191,6 +191,114 @@ cross-value-coherence + isolation (gated=synth, non-gated=real) +
 hive-non-persistence + hot-toggle round-trip. Postmortem:
 `docs/postmortem-v5-track-d/incident-v506-phase2-implementation.md`.
 
+**v5.0.7 Phase 0 (2026-09-02, PR pending) — filesystem minifilter
+SCAFFOLDING (dormant).** Motivacao: bare-metal ban #6 (2026-09-02, ~12min
+in-game) provou que `rstflt.sys` esta sendo lido AS-A-FILE por
+`rubinot_dx.exe` (36 file-system ops em burst de 35ms, `ReadFile Offset:0
+Length:89360 x2` = binary inteiro consumido as 18:47:35). Cm callback
+altitude 321000 fica no dispatch chain `Cm` (registry); `NtCreateFile /
+NtReadFile` passam por `ObjectManager -> IoManager -> FltMgr -> NTFS` -
+chain COMPLETAMENTE DIFERENTE. Postmortem completo:
+`docs/postmortem-v5-track-d/incident-v506-phase2-ban-driver-file-read.md`
++ kickoff `docs/track-d-v507-filesystem-minifilter-kickoff.md`.
+
+Phase 0 landa **INFRA APENAS** (mesmo padrao dormant-vs-declared do
+v5.0.6 Phase 0):
+
+  * Single-driver dual-altitude: rstflt.sys agora registra `Fl
+    tRegisterFilter` no altitude **408000** (TEST-ONLY, `FSFilter
+    Activity Monitor` group) EM ADICAO ao Cm callback altitude 321000.
+    Instances subkey (`Services\RstFlt\Instances\RstFlt Instance` com
+    `DefaultInstance` + `Altitude="408000"` + `Flags=0`) escrita
+    programaticamente de DriverEntry via Zw* - `03-instalar-driver.bat`
+    fica inalterado. `FltRegisterFilter + FltStartFiltering` sao
+    scheduled via `DelayedWorkQueue` workitem porque o driver Group
+    atual e `"PnP Filter"` (carrega ANTES de FSFilter Infrastructure =
+    fltmgr.sys); registration sincrona de DriverEntry retornaria
+    `STATUS_NOT_FOUND`. Failure em qualquer passo (Instances write ou
+    FltRegisterFilter ou FltStartFiltering) grava tag+status especifico
+    em `Parameters\LastFsFilterStatus` mas nunca propaga - driver
+    carrega mesmo assim e o Cm callback + IRP dispatch ficam ativos.
+
+  * 3 IRP preop callbacks (`IRP_MJ_CREATE`, `IRP_MJ_READ`,
+    `IRP_MJ_DIRECTORY_CONTROL`) todos retornam
+    `FLT_PREOP_SUCCESS_NO_CALLBACK` em Phase 0 - **nenhuma hide logic**.
+    Phase 1 vai wirar `TrackDFsFilterPreCreate` para chamar
+    `FltGetFileNameInformation` + `FltParseFileNameInformation`, comparar
+    leaf name case-insensitive contra `"rstflt.sys"`, aplicar o gate
+    `PsGetProcessImageFileName + _strnicmp("rubinot", 7)` (mesmo do Cm
+    callback), e retornar `FLT_PREOP_COMPLETE` com
+    `Data->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND` para gated
+    callers.
+
+  * `FilterUnloadCallback` + `InstanceQueryTeardownCallback` retornam
+    `STATUS_FLT_DO_NOT_DETACH` - respeita o contrato "Intentionally no
+    DriverUnload" do BOOT_START (`fltmc unload RstFlt` de userland e
+    recusado; teardown real so via reboot + `08-desinstalar-driver.bat`).
+
+  * `InstanceSetupCallback` bumpa `g_FsFilterInstanceCount` a cada
+    volume atacheado. Post-boot value `>= 1` prova que o
+    `FLT_REGISTRATION` bindou em pelo menos um volume.
+
+  * Novo arm flag `EnableFsFilter` (REG_DWORD, default 0). NAO tem
+    reader em Phase 0 (todos os preops retornam
+    `FLT_PREOP_SUCCESS_NO_CALLBACK` independente do flag). Parseado por
+    `LoadTrackDConfig` + hot-toggle via `TrackDHandlePreSetValue` tap -
+    valida persistencia end-to-end antes de Phase 1 wirar o reader.
+
+  * Novo breadcrumb `LastFsFilterStatus` (REG_DWORD, encoding
+    `(tag<<24) | (status & 0x00FFFFFF)` mesmo formato do
+    `LastCallbackStatus`). Tags proprios: `0x01 INSTANCES-WRITE-FAIL`,
+    `0x02 FLT-REGISTER-FAIL`, `0x03 FLT-START-FAIL`, `0x04 ARM-OK`,
+    `0x05 ARM-NULL-DRVOBJ`. Decoder proprio em
+    `scripts/track-d-arm.ps1 -Diagnose` e `scripts/check-consistency.ps1`
+    (independent do tag table do LastCallbackStatus).
+
+  * 12 novos REG_DWORDs em Parameters persistidos por
+    `TrackDFlushWorker` extendido: `LastFsFilterStatus`,
+    `FsFilterRegistered`, `FsFilterInstanceCount`, 6 dormant Phase-1
+    counters (`FsHideHitCount`, `FsFilterCreateHit`, `FsFilterReadHit`,
+    `FsFilterDirCtlHit`, `FsGateMissCount`, `FsFilterAllocBail`) + 3
+    measure-first probes (`FsProbe_InstallDir`,
+    `FsProbe_System32Drivers`, `FsProbe_CatRoot` - Phase 1 vai wirar
+    quando `PreCreate` inspeciona filename).
+
+  * Master `#include` mudou `<ntddk.h> -> <fltKernel.h>` (superset;
+    evita `error C2371: 'PEPROCESS': redefinition`). Makefile:
+    `fltmgr.lib` adicionado a `RSTFLT_LIBS`; `/wd4324` (WDK
+    fltKernel.h padded-struct warning storm) adicionado a
+    `CFLAGS_COMMON` - `/W4 /WX` continuam. BUILD-MARKER bumped
+    `v5.0.6 -> v5.0.7`. rstflt.sys `89360 -> 93456` bytes.
+
+**Adversarial review (5 lens: correctness / IRQL-locking / memory-pool /
+anti-cheat-detect / buildability)** rodou 12 raw findings, 5
+sobreviveram verify e todas as 5 foram aplicadas inline pre-PR. A
+CRITICAL#1 mudou o design: **`FltRegisterFilter` agora e GATED em
+`EnableFsFilter=1`**. Publicar nosso nome + altitude via `fltmc
+filters` antes de Phase 1 wirar o hide widenaria a detection surface
+sem oferecer defesa. Boot arm roda iff flag=1 no boot; hot-toggle 0→1
+via tap schedula o worker sob demanda. Novo tag `0x07 ARM-GATED-OFF` e
+o estado saudavel "flag off". Fixes HIGH#2 (`InstanceSetup` gates em
+`FLT_FSTYPE_NTFS + FILE_DEVICE_DISK_FILE_SYSTEM`), MED#3
+(`InstanceQueryTeardown` retorna `STATUS_SUCCESS` em P0), LOW#4
+(`FilterUnloadCallback` trata `FLTFL_FILTER_UNLOAD_MANDATORY` limpando
+estado) e LOW#5 (comentario de fall-through amendado) tambem landadas
+inline.
+
+Arm: `.\scripts\track-d-arm.ps1 -EnableFsFilter` (grava
+`EnableFsFilter=1` E schedula a arm-worker via tap se ainda nao
+armada). Disarm: `-DisableFsFilter` (nao desregistra em P0). Diagnose:
+`-Diagnose`. **Duas configuracoes esperadas:** (1) default install
+SEM `-EnableFsFilter` -> `LastFsFilterStatus=07 ARM-GATED-OFF`, `Fs
+FilterRegistered=0`, `FsFilterInstanceCount=0`, e `fltmc filters` NAO
+mostra RstFlt (zero widening da detection surface — recomendado para
+bare-metal single-ship do dormant scaffolding); (2) apos
+`-EnableFsFilter` -> `LastFsFilterStatus=04 ARM-OK`, `FsFilter
+Registered=1`, `FsFilterInstanceCount >= 1` (NTFS-on-disk apenas).
+NAO ha sanity script separado em Phase 0 (deferred pra Phase 1
+alongside o callback que ele exercitaria). Postmortem:
+`docs/postmortem-v5-track-d/incident-v507-phase0-implementation.md`.
+
 Escopo `v5.0.0` (MVP): apenas `\Enum\SCSI` + subkeys `Disk&Ven_*`.
 Escopo `v5.0.1+` (expanded coverage per bare-metal test prep):
 

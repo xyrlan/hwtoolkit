@@ -1,4 +1,87 @@
 /*
+ * v5.0.7 - Phase 0 (2026-09-02): FILESYSTEM MINIFILTER SCAFFOLDING (dormant)
+ *
+ * Motivation: ban #6 (2026-09-02) proved rstflt.sys is being read AS A FILE
+ * by rubinot_dx.exe (36 file-system ops in a 35ms burst, ReadFile Offset:0
+ * Length:89360 x2 = full binary consumed). The Cm callback at altitude
+ * 321000 is on a different dispatch chain (ObjectManager -> IoManager ->
+ * FltMgr -> NTFS) and cannot see any of it. See docs/postmortem-v5-track-d/
+ * incident-v506-phase2-ban-driver-file-read.md and the v5.0.7 kickoff at
+ * docs/track-d-v507-filesystem-minifilter-kickoff.md.
+ *
+ * Phase 0 lands INFRA ONLY, mirroring the v5.0.6 Phase 0 dormant-vs-measure
+ * split. Every FLT_OPERATION_REGISTRATION preop returns
+ * FLT_PREOP_SUCCESS_NO_CALLBACK; the FilterUnloadCallback and
+ * InstanceQueryTeardownCallback return STATUS_FLT_DO_NOT_DETACH to keep
+ * the BOOT_START unloadability contract (see the "Intentionally no
+ * DriverUnload" note near DriverEntry).
+ *
+ * Load-order note: RstFlt is Group = "PnP Filter" (loads BEFORE
+ * FSFilter Infrastructure = FltMgr.sys), so FltRegisterFilter from a
+ * synchronous DriverEntry would return STATUS_NOT_FOUND. Instead the arm
+ * path is scheduled on DelayedWorkQueue via ExQueueWorkItem (same pattern
+ * as the CPU-replay worker); the worker body runs at PASSIVE well after
+ * FSFilter Infrastructure has come up. On the RstFlt Services key, the
+ * companion Instances subkey (Altitude = "408000" TEST-ONLY per kickoff
+ * Q1) is written from DriverEntry synchronously via Zw* -- safe because
+ * the SCM has fully set up Services\RstFlt before invoking DriverEntry.
+ *
+ * What Phase 0 DECLARES/WIRES:
+ *   - FltRegisterFilter (scheduled workitem) with a 3-entry
+ *     FLT_OPERATION_REGISTRATION table (IRP_MJ_CREATE, IRP_MJ_READ,
+ *     IRP_MJ_DIRECTORY_CONTROL) all dormant. **Registration is GATED on
+ *     EnableFsFilter=1** (adversarial review CRITICAL#1): publishing
+ *     our name + altitude to `fltmc filters` before Phase 1's hide is
+ *     wired would strictly widen the detection surface for zero
+ *     defensive value. Boot arm runs iff the flag is 1 at boot; a
+ *     hot-toggle 0->1 via the tap schedules the worker on demand.
+ *     LastFsFilterStatus = 0x07 ARM-GATED-OFF is the benign "flag off"
+ *     steady state.
+ *   - InstanceSetup GATES on FLT_FSTYPE_NTFS + FILE_DEVICE_DISK_FILE_
+ *     SYSTEM (adversarial review HIGH#2): promiscuous attach to CDFS/
+ *     NETWORK/RAW would produce a distinctive fltmc-instances shape
+ *     for zero hide value.
+ *   - InstanceQueryTeardown returns STATUS_SUCCESS in Phase 0
+ *     (adversarial review MEDIUM#3): refusing detach with no hide
+ *     state to protect only adds a tamper-resistance fingerprint bit.
+ *   - FilterUnloadCallback handles FLTFL_FILTER_UNLOAD_MANDATORY by
+ *     clearing state (adversarial review LOW#4): forced unload
+ *     otherwise leaves stale handle + misreported LastFsFilterStatus.
+ *   - Programmatic Services\RstFlt\Instances subkey write from
+ *     DriverEntry (unconditional; inert until FltRegisterFilter reads
+ *     it) so 03-instalar-driver.bat stays unchanged.
+ *   - EnableFsFilter REG_DWORD arm flag (default 0). Parsed in
+ *     LoadTrackDConfig; hot-toggled via TrackDHandlePreSetValue tap;
+ *     ALSO drives whether the arm worker ever runs (see above). Preop
+ *     callbacks return FLT_PREOP_SUCCESS_NO_CALLBACK regardless in
+ *     Phase 0 -- Phase 1 wires the reader.
+ *   - Dormant counters (never incremented in Phase 0):
+ *     FsHideHitCount, FsFilterCreateHit, FsFilterReadHit,
+ *     FsFilterDirCtlHit, FsGateMissCount, FsFilterAllocBail.
+ *   - Wired counters (Phase 0 already updates these):
+ *     FsFilterInstanceCount (bumped in the InstanceSetup callback).
+ *   - Measure-first counters (declared, wired in Phase 1 preop when the
+ *     name-inspection code lands): FsProbe_InstallDir,
+ *     FsProbe_System32Drivers, FsProbe_CatRoot. Answer "does EMAC also
+ *     probe CatRoot/signer surfaces, or only install-dir/System32
+ *     image?" before Phase 1 spends LOC on hide logic.
+ *   - LastFsFilterStatus REG_DWORD breadcrumb (same tag<<24|status
+ *     packing as LastCallbackStatus / LastReplayStatus; own set of
+ *     TRACKD_FS_TAG_* tags starting at 0x01).
+ *
+ * What Phase 0 does NOT land (deferred to Phase 1+):
+ *   - Any rewrite / STATUS_OBJECT_NAME_NOT_FOUND return path.
+ *   - PostDirCtl NextEntryOffset walker (kickoff §3.1 line 101).
+ *   - RegNtPreEnumerateKey Services\RstFlt scrub (Cm callback extension).
+ *   - Known-bad-driver name list (Phase 0 will hard-code exactly one
+ *     name -- "rstflt.sys" -- for the measure-first probes; expandable
+ *     in Phase 1).
+ *   - IRP_MJ_QUERY_INFORMATION preop (kickoff Q3).
+ *
+ * BUILD-MARKER bumped v5.0.6 -> v5.0.7. rstflt.sys expected ~89360 -> ~94k.
+ */
+
+/*
  * RstFlt - Minimal SMBIOS + Gated CPU Registry Replay Filter Driver (v4.0.10)
  *
  * SYSTEM_START upper filter of the DiskDrive class. Its jobs are to
@@ -1363,7 +1446,17 @@
  * Test signing mode required to load unsigned drivers.
  */
 
-#include <ntddk.h>
+/* v5.0.7 Phase 0: switched the master include from <ntddk.h> to
+ * <fltKernel.h>. FltMgr minifilter drivers need <fltKernel.h> for the
+ * FLT_REGISTRATION / FltRegisterFilter / FltStartFiltering surface;
+ * <fltKernel.h> internally pulls <ntifs.h>, which itself supersets
+ * <ntddk.h> (all WDM primitives -- IRP, DRIVER_OBJECT, ExAllocatePool*,
+ * Zw*, KeInitializeSpinLock, PsGetProcessImageFileName, etc -- remain
+ * available exactly as before). Including <ntddk.h> in ADDITION to
+ * <fltKernel.h> triggers "PEPROCESS / PETHREAD redefinition; different
+ * basic types" (WDM's opaque pointer vs ntifs.h's exposed struct), so
+ * the ntddk include was replaced, not augmented. */
+#include <fltKernel.h>
 
 /* v5.0.4: PsGetProcessImageFileName is a semi-documented kernel export
  * (present in ntoskrnl.exe on every supported Windows version since XP
@@ -1402,7 +1495,7 @@ NTKERNELAPI PCHAR NTAPI PsGetProcessImageFileName(_In_ PEPROCESS Process);
  * Marker` can validate the installed driver came from v4.0.9+ source
  * without depending on the PE TimeDateStamp (which changes on relink). */
 #pragma comment(linker, "/INCLUDE:RstFltVersion")
-const char RstFltVersion[] = "RstFlt-v5.0.6-BUILD-MARKER";
+const char RstFltVersion[] = "RstFlt-v5.0.7-BUILD-MARKER";
 
 
 /* v4.0: per-string caps for the cached CpuStrings REG_MULTI_SZ.
@@ -1567,6 +1660,61 @@ const char RstFltVersion[] = "RstFlt-v5.0.6-BUILD-MARKER";
 #define TRACKD_VALNAME_LOCATIONINFO_STR    L"LocationInformation"
 #define TRACKD_VALNAME_LOCATIONPATHS_STR   L"LocationPaths"
 #define TRACKD_VALNAME_CONTAINERID_STR     L"ContainerID"
+
+/* v5.0.7 Phase 0 - filesystem minifilter scaffolding constants. All strings
+ * live in .rdata; the .sys carries the literals whether the arm flag is 0
+ * or 1 (Phase 0 scaffolding is dormant per the changelog block). */
+
+/* EnableFsFilter (REG_DWORD, default 0). Gates the Phase 1+ hide logic.
+ * Phase 0 has no reader; parsed at boot + hot-toggled via the tap so a
+ * userland arm today persists cleanly and Phase 1's callback lands with
+ * the gate already-honored across boot. */
+#define TRACKD_ENABLE_FSFILTER_VAL_STR  L"EnableFsFilter"
+
+/* Altitude for FltRegisterFilter. 408000 is inside the TEST-ONLY range
+ * (400000-409999, group "FSFilter Activity Monitor") never allocated by
+ * Microsoft. Matches the precedent set by the Cm callback altitude
+ * (321000, TEST-ONLY). Requisition a real allocation only if v5.0.7 ships
+ * beyond the maintainer's own systems. See kickoff §3.2 + Q1. */
+#define TRACKD_FS_ALTITUDE_STR          L"408000"
+
+/* Companion Instances subkey shape (kickoff §3.2). FltRegisterFilter reads
+ * Services\<name>\Instances\<DefaultInstance> at registration time; the
+ * DefaultInstance value picks a per-instance subkey holding Altitude +
+ * Flags. Written from DriverEntry via Zw* so 03-instalar-driver.bat stays
+ * unchanged. Instance name intentionally short + ASCII-safe. */
+#define TRACKD_FS_INSTANCES_SUFFIX_STR  L"\\Instances"
+#define TRACKD_FS_INSTANCE_NAME_STR     L"RstFlt Instance"
+#define TRACKD_FS_DEFAULT_INSTANCE_STR  L"RstFlt Instance"
+
+/* v5.0.7 Phase 0 leaf-name hide target. Phase 1 will read this + a small
+ * list from Parameters; Phase 0 hard-codes the one string so the
+ * measure-first probes have a needle to look for. */
+#define TRACKD_FS_HIDDEN_LEAF_STR       L"rstflt.sys"
+
+/* Breadcrumb tags for LastFsFilterStatus. Own decoder table so these are
+ * unrelated to the TRACKD_TAG_* set used by LastCallbackStatus /
+ * LastReplayStatus (decoder in scripts/track-d-arm.ps1 + check-
+ * consistency.ps1 special-cases LastFsFilterStatus). Encoded as
+ * (tag<<24) | (status & 0x00FFFFFF), same shape as LastCallbackStatus. */
+#define TRACKD_FS_TAG_INSTANCES_WRITE_FAIL 0x01u  /* Zw* into Instances     */
+#define TRACKD_FS_TAG_FLT_REGISTER_FAIL    0x02u  /* FltRegisterFilter fail */
+#define TRACKD_FS_TAG_FLT_START_FAIL       0x03u  /* FltStartFiltering fail */
+#define TRACKD_FS_TAG_ARM_OK               0x04u  /* Arm worker completed   */
+#define TRACKD_FS_TAG_ARM_NULL_DRVOBJ      0x05u  /* Workitem lost DrvObj   */
+/* v5.0.7 P0 review finding [4] LOW irql-locking: FltMgr may issue a
+ * mandatory unload (fltmc unload force, verifier tear-down) that overrides
+ * our STATUS_FLT_DO_NOT_DETACH return. We clear g_FsFilterHandle +
+ * g_FsFilterRegistered so a subsequent -Diagnose reports the true state
+ * (also pre-lands the null-guard Phase 1 will need before dereferencing
+ * g_FsFilterHandle in the preop). */
+#define TRACKD_FS_TAG_MANDATORY_UNLOAD     0x06u  /* Forced unload; state cleared */
+/* v5.0.7 P0 review finding [1] CRITICAL anti-cheat-detect: FltRegister-
+ * Filter publishes our name + altitude to fltmc/FilterFindFirst. Phase 0
+ * gates the arm on g_FsFilterEnabled so a boot with the flag off never
+ * widens the detection surface (Instances subkey is still written; it is
+ * dormant registry shape until FltMgr reads it during registration). */
+#define TRACKD_FS_TAG_ARM_GATED_OFF        0x07u  /* Arm skipped: EnableFsFilter=0 */
 
 /* Token bounds for the value-side substring neutralizer. A real token
  * (Ven/Prod/BD_ADDR/GUID) shorter than MIN is skipped: a 1-2 char vendor
@@ -2030,6 +2178,73 @@ static volatile LONG   g_TrackDValHit_LocationInfo   = 0;
 static volatile LONG   g_TrackDValHit_LocationPaths  = 0;
 static volatile LONG   g_TrackDValHit_ContainerID    = 0;
 
+/* ================================================================
+ *  v5.0.7 Phase 0 - filesystem minifilter scaffolding globals.
+ *
+ *  Set-once at DriverEntry (g_FsFilterDrvObj + Instances-key writer)
+ *  then written from the delayed-workitem arm path
+ *  (TrackDFsFilterArmWorker). Volatile counters are updated with
+ *  Interlocked* verbs same as the Cm callback set. NO reader in
+ *  Phase 0: every IRP preop returns FLT_PREOP_SUCCESS_NO_CALLBACK
+ *  regardless of g_FsFilterEnabled, so the flag only matters for
+ *  hot-toggle round-trip validation.
+ * ================================================================ */
+
+/* Cached driver object for the arm-worker (owned by the IO manager for
+ * the driver's lifetime; safe to hold a pointer). */
+static PDRIVER_OBJECT  g_FsFilterDrvObj  = NULL;
+
+/* FltRegisterFilter opaque handle, populated by the arm worker. */
+static PFLT_FILTER     g_FsFilterHandle  = NULL;
+
+/* Runtime arm flag mirror of Parameters\EnableFsFilter. Same single-byte
+ * BOOLEAN semantics as the other three arm flags: written by
+ * LoadTrackDConfig at boot and by TrackDHandlePreSetValue on tap; read
+ * (in Phase 1) by the IRP preops. Phase 0 has no reader. */
+static BOOLEAN         g_FsFilterEnabled = FALSE;
+
+/* 1 after FltRegisterFilter + FltStartFiltering both succeeded; 0 while
+ * arm is pending or if arm failed. Used by TrackDFlushWorker to persist
+ * FsFilterRegistered so userland can distinguish "arm not scheduled"
+ * from "arm scheduled but failed". */
+static volatile LONG   g_FsFilterRegistered = 0;
+
+/* One-shot guard for scheduling the arm workitem. */
+static volatile LONG   g_FsFilterArmQueued  = 0;
+static WORK_QUEUE_ITEM g_FsFilterArmWorkItem;
+
+/* LastFsFilterStatus breadcrumb - tag<<24 | (status & 0x00FFFFFF). */
+static volatile LONG   g_FsFilterLastStatus = 0;
+
+/* Dormant counters - declared now, incremented in Phase 1+. Persisted
+ * every flush so a userland diagnose won't fault on a missing value name
+ * post-Phase-0 install even before Phase 1 wires the increments. */
+static volatile LONG   g_FsHideHitCount        = 0;
+static volatile LONG   g_FsFilterCreateHit     = 0;
+static volatile LONG   g_FsFilterReadHit       = 0;
+static volatile LONG   g_FsFilterDirCtlHit     = 0;
+static volatile LONG   g_FsGateMissCount       = 0;
+static volatile LONG   g_FsFilterAllocBail     = 0;
+
+/* Wired in Phase 0 (bumped from TrackDFsFilterInstanceSetup on every
+ * volume attach; the value at steady state == number of mounted volumes
+ * FltMgr routed our filter to). >= 1 proves the FLT_REGISTRATION table
+ * successfully bound to at least one instance. */
+static volatile LONG   g_FsFilterInstanceCount = 0;
+
+/* Measure-first counters (declared, wired in Phase 1). Bucketed by
+ * parent-path prefix so the operator can tell whether EMAC's file probe
+ * came in on the install-dir path
+ * (C:\Program Files*\RubinOT*\rstflt.sys), the canonical System32
+ * drivers path, or the CatRoot cross-check surface. */
+static volatile LONG   g_FsProbe_InstallDir      = 0;
+static volatile LONG   g_FsProbe_System32Drivers = 0;
+static volatile LONG   g_FsProbe_CatRoot         = 0;
+
+/* Arm-flag UNICODE_STRING view initialized in ArmTrackD alongside the
+ * other Track D name views. */
+static UNICODE_STRING  g_TrackDEnableFsFilterName;
+
 /* v5.0.5 Phase 0 - one record per rewrite event (or non-rubi parent
  * match). Fixed-size fields, no dynamic allocation, no pointers -
  * safe to memcpy verbatim into the on-disk REG_BINARY. Field layout
@@ -2184,6 +2399,38 @@ static VOID     TrackDRecordHit(UCHAR pathType, UCHAR wasGated,
                                 const WCHAR *childReal, ULONG childWchars);
 static NTSTATUS TrackDHandlePostEnumerate(PVOID Argument2);
 static VOID     TrackDHandlePreSetValue(PVOID Argument2);
+/* v5.0.7 Phase 0 - filesystem minifilter scaffolding forward decls. */
+static VOID     WriteLastFsFilterStatus(UCHAR tag, NTSTATUS st);
+static NTSTATUS TrackDFsFilterWriteInstancesKey(PUNICODE_STRING RegPath);
+static VOID     TrackDFsFilterArmWorker(PVOID Context);
+static NTSTATUS FLTAPI TrackDFsFilterInstanceSetup(
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    FLT_INSTANCE_SETUP_FLAGS Flags,
+                    DEVICE_TYPE VolumeDeviceType,
+                    FLT_FILESYSTEM_TYPE VolumeFilesystemType);
+static NTSTATUS FLTAPI TrackDFsFilterInstanceQueryTeardown(
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags);
+static VOID     FLTAPI TrackDFsFilterInstanceTeardownStart(
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    FLT_INSTANCE_TEARDOWN_FLAGS Flags);
+static VOID     FLTAPI TrackDFsFilterInstanceTeardownComplete(
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    FLT_INSTANCE_TEARDOWN_FLAGS Flags);
+static NTSTATUS FLTAPI TrackDFsFilterUnloadCallback(
+                    FLT_FILTER_UNLOAD_FLAGS Flags);
+static FLT_PREOP_CALLBACK_STATUS FLTAPI TrackDFsFilterPreCreate(
+                    PFLT_CALLBACK_DATA Data,
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    PVOID *CompletionContext);
+static FLT_PREOP_CALLBACK_STATUS FLTAPI TrackDFsFilterPreRead(
+                    PFLT_CALLBACK_DATA Data,
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    PVOID *CompletionContext);
+static FLT_PREOP_CALLBACK_STATUS FLTAPI TrackDFsFilterPreDirCtl(
+                    PFLT_CALLBACK_DATA Data,
+                    PCFLT_RELATED_OBJECTS FltObjects,
+                    PVOID *CompletionContext);
 /* v5.0.5 Phase 2 - value-read handler + helpers. */
 static NTSTATUS TrackDHandlePostQueryValue(PVOID Argument2);
 static ULONG    TrackDFindSubstrI(const WCHAR *hay, ULONG hayWchars,
@@ -4498,6 +4745,12 @@ static VOID TrackDHandlePreSetValue(PVOID Argument2)
          * tap now means a userland arm today stays honored end-to-end
          * once Phase 2 wires the reader. */
         target = &g_TrackDValueSynthEnabled;
+    } else if (RtlEqualUnicodeString(&g_TrackDEnableFsFilterName, info->ValueName, TRUE)) {
+        /* v5.0.7 Phase 0: EnableFsFilter hot-toggle. No reader in Phase 0
+         * (every FLT preop returns FLT_PREOP_SUCCESS_NO_CALLBACK). Persisted
+         * so Phase 1's PreCreate lands with the gate already honored across
+         * a userland arm that predates Phase 1 install. */
+        target = &g_FsFilterEnabled;
     } else {
         return;
     }
@@ -4524,6 +4777,26 @@ static VOID TrackDHandlePreSetValue(PVOID Argument2)
     DbgPrint("[RstFlt/TrackD] %wZ toggled to %u via Parameters tap (target now %d)\n",
              info->ValueName, newValue, *target);
 #endif
+
+    /* v5.0.7 P0 review finding [1] CRITICAL companion: when EnableFsFilter
+     * transitions 0->1 via userland tap AND the boot-time arm never ran
+     * (g_FsFilterArmQueued still 0 because Parameters\EnableFsFilter was 0
+     * at boot), schedule the arm worker now. Same one-shot CAS guard as
+     * TrackDFsFilterSchedule so a race between boot arm and tap arm never
+     * queues twice. Safe from Cm callback body: ExInitializeWorkItem +
+     * ExQueueWorkItem require IRQL <= DISPATCH_LEVEL (the Cm callback runs
+     * at PASSIVE-ish, IRQL <= APC_LEVEL per MSDN). g_FsFilterDrvObj was
+     * cached at DriverEntry and persists for the driver's lifetime. */
+    if (target == &g_FsFilterEnabled &&
+        newValue == 1 &&
+        g_FsFilterDrvObj != NULL &&
+        InterlockedCompareExchange(&g_FsFilterArmQueued, 1, 0) == 0)
+    {
+        ExInitializeWorkItem(&g_FsFilterArmWorkItem,
+                             TrackDFsFilterArmWorker,
+                             g_FsFilterDrvObj);
+        ExQueueWorkItem(&g_FsFilterArmWorkItem, DelayedWorkQueue);
+    }
 }
 
 /* ================================================================
@@ -6400,6 +6673,22 @@ static VOID TrackDFlushWorker(PVOID unused)
     ULONG postSynUsbFn, postSynHidFn, postSynBthFn;
     ULONG postSynTypeMismatch, postSynOverflow, postSynSizeSanity, postSynInvMiss;
     ULONG postValLocInfo, postValLocPaths, postValContainer;
+    /* v5.0.7 Phase 0 - filesystem-minifilter snapshots. All dormant in
+     * Phase 0 except g_FsFilterInstanceCount (bumped by InstanceSetup
+     * callback) and g_FsFilterLastStatus + g_FsFilterRegistered (bumped
+     * by TrackDFsFilterArmWorker). Everything else stays 0 until Phase 1
+     * wires the preop increment sites - persistence pattern kept
+     * symmetric so a Phase-0 install already has the value names present
+     * (userland decoder never faults on missing values across a Phase 0
+     * -> Phase 1 upgrade). */
+    ULONG fsLastStatus = 0, fsRegistered = 0, fsInstances = 0;
+    ULONG fsHide = 0, fsCreate = 0, fsRead = 0, fsDirCtl = 0;
+    ULONG fsGate = 0, fsAllocBail = 0;
+    ULONG fsProbeInstall = 0, fsProbeSys32 = 0, fsProbeCatRoot = 0;
+    ULONG postFsLastStatus, postFsRegistered, postFsInstances;
+    ULONG postFsHide, postFsCreate, postFsRead, postFsDirCtl;
+    ULONG postFsGate, postFsAllocBail;
+    ULONG postFsProbeInstall, postFsProbeSys32, postFsProbeCatRoot;
     /* v5.0.6 Phase 0 - ring buffer is 128 slots * 96 bytes = 12288 bytes,
      * which exceeds the default 12 KB kernel worker-thread stack budget
      * once other locals on this function are accounted for. Promote the
@@ -6464,6 +6753,19 @@ static VOID TrackDFlushWorker(PVOID unused)
     valLocInfo       = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationInfo,   0, 0);
     valLocPaths      = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationPaths,  0, 0);
     valContainer     = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_ContainerID,    0, 0);
+    /* v5.0.7 Phase 0 - filesystem-minifilter snapshots. */
+    fsLastStatus     = (ULONG)InterlockedCompareExchange(&g_FsFilterLastStatus,     0, 0);
+    fsRegistered     = (ULONG)InterlockedCompareExchange(&g_FsFilterRegistered,     0, 0);
+    fsInstances      = (ULONG)InterlockedCompareExchange(&g_FsFilterInstanceCount,  0, 0);
+    fsHide           = (ULONG)InterlockedCompareExchange(&g_FsHideHitCount,         0, 0);
+    fsCreate         = (ULONG)InterlockedCompareExchange(&g_FsFilterCreateHit,      0, 0);
+    fsRead           = (ULONG)InterlockedCompareExchange(&g_FsFilterReadHit,        0, 0);
+    fsDirCtl         = (ULONG)InterlockedCompareExchange(&g_FsFilterDirCtlHit,      0, 0);
+    fsGate           = (ULONG)InterlockedCompareExchange(&g_FsGateMissCount,        0, 0);
+    fsAllocBail      = (ULONG)InterlockedCompareExchange(&g_FsFilterAllocBail,      0, 0);
+    fsProbeInstall   = (ULONG)InterlockedCompareExchange(&g_FsProbe_InstallDir,      0, 0);
+    fsProbeSys32     = (ULONG)InterlockedCompareExchange(&g_FsProbe_System32Drivers, 0, 0);
+    fsProbeCatRoot   = (ULONG)InterlockedCompareExchange(&g_FsProbe_CatRoot,         0, 0);
 
     /* Heap-alloc ringSnap (12288 bytes at 128 slots exceeds the stack
      * budget). Best-effort: on failure we skip the ring persist for
@@ -6607,6 +6909,37 @@ static VOID TrackDFlushWorker(PVOID unused)
     RtlInitUnicodeString(&valName, L"CallbackValHit_ContainerID");
     (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &valContainer, sizeof(valContainer));
 
+    /* v5.0.7 Phase 0 - filesystem-minifilter breadcrumb + counters. All 12
+     * land as REG_DWORD; consumers read them via track-d-arm.ps1 -Diagnose
+     * + check-consistency.ps1 Track D block. LastFsFilterStatus uses the
+     * TRACKD_FS_TAG_* set (own decoder path). Phase 0 dormancy: only
+     * FsFilterInstanceCount / FsFilterRegistered / LastFsFilterStatus are
+     * ever non-zero; the rest turn hot in Phase 1+. */
+    RtlInitUnicodeString(&valName, L"LastFsFilterStatus");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsLastStatus, sizeof(fsLastStatus));
+    RtlInitUnicodeString(&valName, L"FsFilterRegistered");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsRegistered, sizeof(fsRegistered));
+    RtlInitUnicodeString(&valName, L"FsFilterInstanceCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsInstances, sizeof(fsInstances));
+    RtlInitUnicodeString(&valName, L"FsHideHitCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsHide, sizeof(fsHide));
+    RtlInitUnicodeString(&valName, L"FsFilterCreateHit");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsCreate, sizeof(fsCreate));
+    RtlInitUnicodeString(&valName, L"FsFilterReadHit");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsRead, sizeof(fsRead));
+    RtlInitUnicodeString(&valName, L"FsFilterDirCtlHit");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsDirCtl, sizeof(fsDirCtl));
+    RtlInitUnicodeString(&valName, L"FsGateMissCount");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsGate, sizeof(fsGate));
+    RtlInitUnicodeString(&valName, L"FsFilterAllocBail");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsAllocBail, sizeof(fsAllocBail));
+    RtlInitUnicodeString(&valName, L"FsProbe_InstallDir");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsProbeInstall, sizeof(fsProbeInstall));
+    RtlInitUnicodeString(&valName, L"FsProbe_System32Drivers");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsProbeSys32, sizeof(fsProbeSys32));
+    RtlInitUnicodeString(&valName, L"FsProbe_CatRoot");
+    (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &fsProbeCatRoot, sizeof(fsProbeCatRoot));
+
 out:
     if (ringSnapMem) { ExFreePool(ringSnapMem); ringSnapMem = NULL; ringSnap = NULL; }
     if (hParams) ZwClose(hParams);
@@ -6658,6 +6991,19 @@ out:
     postValLocInfo       = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationInfo,   0, 0);
     postValLocPaths      = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_LocationPaths,  0, 0);
     postValContainer     = (ULONG)InterlockedCompareExchange(&g_TrackDValHit_ContainerID,    0, 0);
+    /* v5.0.7 Phase 0 - filesystem-minifilter drift-check reads. */
+    postFsLastStatus     = (ULONG)InterlockedCompareExchange(&g_FsFilterLastStatus,     0, 0);
+    postFsRegistered     = (ULONG)InterlockedCompareExchange(&g_FsFilterRegistered,     0, 0);
+    postFsInstances      = (ULONG)InterlockedCompareExchange(&g_FsFilterInstanceCount,  0, 0);
+    postFsHide           = (ULONG)InterlockedCompareExchange(&g_FsHideHitCount,         0, 0);
+    postFsCreate         = (ULONG)InterlockedCompareExchange(&g_FsFilterCreateHit,      0, 0);
+    postFsRead           = (ULONG)InterlockedCompareExchange(&g_FsFilterReadHit,        0, 0);
+    postFsDirCtl         = (ULONG)InterlockedCompareExchange(&g_FsFilterDirCtlHit,      0, 0);
+    postFsGate           = (ULONG)InterlockedCompareExchange(&g_FsGateMissCount,        0, 0);
+    postFsAllocBail      = (ULONG)InterlockedCompareExchange(&g_FsFilterAllocBail,      0, 0);
+    postFsProbeInstall   = (ULONG)InterlockedCompareExchange(&g_FsProbe_InstallDir,      0, 0);
+    postFsProbeSys32     = (ULONG)InterlockedCompareExchange(&g_FsProbe_System32Drivers, 0, 0);
+    postFsProbeCatRoot   = (ULONG)InterlockedCompareExchange(&g_FsProbe_CatRoot,         0, 0);
     RtlCopyMemory(postMissSnap, g_TrackDLastMissName, sizeof(postMissSnap));
     if (postStatus     != statusValue   ||
         postHit        != hitValue      ||
@@ -6696,6 +7042,19 @@ out:
         postValLocInfo      != valLocInfo      ||
         postValLocPaths     != valLocPaths     ||
         postValContainer    != valContainer    ||
+        /* v5.0.7 Phase 0 - filesystem-minifilter drift terms. */
+        postFsLastStatus    != fsLastStatus    ||
+        postFsRegistered    != fsRegistered    ||
+        postFsInstances     != fsInstances     ||
+        postFsHide          != fsHide          ||
+        postFsCreate        != fsCreate        ||
+        postFsRead          != fsRead          ||
+        postFsDirCtl        != fsDirCtl        ||
+        postFsGate          != fsGate          ||
+        postFsAllocBail     != fsAllocBail     ||
+        postFsProbeInstall  != fsProbeInstall  ||
+        postFsProbeSys32    != fsProbeSys32    ||
+        postFsProbeCatRoot  != fsProbeCatRoot  ||
         RtlCompareMemory(postMissSnap, missSnap, sizeof(missSnap)) != sizeof(missSnap))
     {
         if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
@@ -6743,6 +7102,431 @@ static VOID WriteLastArmStatus(UCHAR tag, NTSTATUS st)
     RtlInitUnicodeString(&valName, L"LastArmStatus");
     (void)ZwSetValueKey(hParams, &valName, 0, REG_DWORD, &code, sizeof(code));
     ZwClose(hParams);
+}
+
+/* ================================================================
+ *  v5.0.7 Phase 0 - filesystem minifilter scaffolding.
+ *
+ *  Registration:
+ *    - Instances subkey (Services\RstFlt\Instances\<default> with
+ *      Altitude + Flags) is written from DriverEntry via
+ *      TrackDFsFilterWriteInstancesKey (safe: PASSIVE, Cm callback
+ *      not yet armed, no CM-internal lock held).
+ *    - FltRegisterFilter + FltStartFiltering are scheduled onto
+ *      DelayedWorkQueue (TrackDFsFilterArmWorker) so the arm path
+ *      runs AFTER FSFilter Infrastructure (fltmgr.sys) has come up.
+ *      Our own driver Group is "PnP Filter" which loads BEFORE
+ *      FSFilter Infrastructure - a synchronous FltRegisterFilter
+ *      from DriverEntry would fail with STATUS_NOT_FOUND. The
+ *      worker runs at PASSIVE on a system thread, long after boot
+ *      has flushed through the FSFilter groups.
+ *
+ *  Callbacks:
+ *    - InstanceSetup       - bump FsFilterInstanceCount, return SUCCESS
+ *    - InstanceQueryTear   - return STATUS_FLT_DO_NOT_DETACH (never
+ *                            release volumes; BOOT_START contract)
+ *    - InstanceTeardown*   - no-op (called only on driver unload,
+ *                            which we refuse)
+ *    - FilterUnload        - return STATUS_FLT_DO_NOT_DETACH (matches
+ *                            the "Intentionally no DriverUnload" note)
+ *    - IRP preops (CREATE/READ/DIRECTORY_CONTROL) - Phase 0 returns
+ *      FLT_PREOP_SUCCESS_NO_CALLBACK unconditionally; Phase 1 wires
+ *      the name-inspection + measure-first counter bumps + gated
+ *      STATUS_OBJECT_NAME_NOT_FOUND response.
+ *
+ *  Reentrancy contract (same discipline as the Cm callback):
+ *    - No Zw* from inside a preop (FltMgr documents preops as
+ *      PASSIVE-typical, but bulk registry work from a hot preop
+ *      would still stall the caller's IO). Any deferred state
+ *      changes go through TrackDFlushWorker.
+ *    - Every REG_DWORD counter is Interlocked* updated.
+ *    - The FLT_FILE_NAME_INFORMATION cache introduced in Phase 1
+ *      lives OUTSIDE preop context and is short-lived.
+ * ================================================================ */
+
+/* Callback-safe status writer for LastFsFilterStatus (own key value
+ * separate from LastCallbackStatus / LastReplayStatus / LastArmStatus,
+ * so a Phase 1 hot-path preop event never overwrites the arm-worker's
+ * final tag). Shares the g_TrackDFlushWorkItem + g_TrackDFlushQueued
+ * pair with the Cm-side writer - one work item persists every counter
+ * on every flush pass. */
+static VOID WriteLastFsFilterStatus(UCHAR tag, NTSTATUS st)
+{
+    ULONG code = ((ULONG)tag << 24) | ((ULONG)st & 0x00FFFFFFUL);
+    InterlockedExchange(&g_FsFilterLastStatus, (LONG)code);
+    if (InterlockedCompareExchange(&g_TrackDFlushQueued, 1, 0) == 0) {
+        ExQueueWorkItem(&g_TrackDFlushWorkItem, DelayedWorkQueue);
+    }
+}
+
+/* Write the companion Instances subkey shape FltRegisterFilter reads at
+ * registration time. Programmatic (not INF-driven) so 03-instalar-
+ * driver.bat stays untouched (kickoff §3.1 Recomendacao A).
+ *
+ * Shape (kickoff §3.2):
+ *   Services\RstFlt\Instances                                    (subkey)
+ *     DefaultInstance = "RstFlt Instance"           (REG_SZ)
+ *   Services\RstFlt\Instances\RstFlt Instance                    (subkey)
+ *     Altitude = "408000"                           (REG_SZ)
+ *     Flags    = 0                                  (REG_DWORD)
+ *
+ * Runs at PASSIVE from DriverEntry (safe: SCM has fully set up the
+ * Services\RstFlt key before invoking DriverEntry, and the Cm callback
+ * is not yet armed so no CM-internal lock to trip). All handles use
+ * OBJ_KERNEL_HANDLE + ZwClose on every exit path. */
+static NTSTATUS TrackDFsFilterWriteInstancesKey(PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+    HANDLE hInstances = NULL, hInst = NULL;
+    OBJECT_ATTRIBUTES oa;
+    UNICODE_STRING instancesPath, instancePath, valName;
+    UNICODE_STRING tail, instanceLeaf;
+    WCHAR pathBuf[600];
+    ULONG disp = 0;
+    ULONG flagsVal = 0;
+
+    if (RegPath == NULL || RegPath->Buffer == NULL || RegPath->Length == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Build "\Registry\Machine\...\Services\RstFlt\Instances". */
+    instancesPath.Buffer        = pathBuf;
+    instancesPath.Length        = 0;
+    instancesPath.MaximumLength = sizeof(pathBuf);
+    st = RtlAppendUnicodeStringToString(&instancesPath, RegPath);
+    if (!NT_SUCCESS(st)) return st;
+    RtlInitUnicodeString(&tail, TRACKD_FS_INSTANCES_SUFFIX_STR);
+    st = RtlAppendUnicodeStringToString(&instancesPath, &tail);
+    if (!NT_SUCCESS(st)) return st;
+
+    InitializeObjectAttributes(&oa, &instancesPath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwCreateKey(&hInstances, KEY_ALL_ACCESS, &oa, 0, NULL,
+                     REG_OPTION_NON_VOLATILE, &disp);
+    if (!NT_SUCCESS(st)) return st;
+
+    /* DefaultInstance = "RstFlt Instance". */
+    RtlInitUnicodeString(&valName, L"DefaultInstance");
+    RtlInitUnicodeString(&instanceLeaf, TRACKD_FS_DEFAULT_INSTANCE_STR);
+    st = ZwSetValueKey(hInstances, &valName, 0, REG_SZ,
+                       instanceLeaf.Buffer,
+                       instanceLeaf.Length + sizeof(WCHAR));
+    if (!NT_SUCCESS(st)) goto cleanup;
+
+    /* Build ".\...\Instances\RstFlt Instance". */
+    instancePath.Buffer        = pathBuf;
+    instancePath.Length        = 0;
+    instancePath.MaximumLength = sizeof(pathBuf);
+    st = RtlAppendUnicodeStringToString(&instancePath, RegPath);
+    if (!NT_SUCCESS(st)) goto cleanup;
+    st = RtlAppendUnicodeStringToString(&instancePath, &tail);
+    if (!NT_SUCCESS(st)) goto cleanup;
+    RtlInitUnicodeString(&tail, L"\\");
+    st = RtlAppendUnicodeStringToString(&instancePath, &tail);
+    if (!NT_SUCCESS(st)) goto cleanup;
+    RtlInitUnicodeString(&tail, TRACKD_FS_INSTANCE_NAME_STR);
+    st = RtlAppendUnicodeStringToString(&instancePath, &tail);
+    if (!NT_SUCCESS(st)) goto cleanup;
+
+    InitializeObjectAttributes(&oa, &instancePath,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+    st = ZwCreateKey(&hInst, KEY_ALL_ACCESS, &oa, 0, NULL,
+                     REG_OPTION_NON_VOLATILE, &disp);
+    if (!NT_SUCCESS(st)) goto cleanup;
+
+    /* Altitude = "408000" (TEST-ONLY). REG_SZ, NUL-terminated. */
+    RtlInitUnicodeString(&valName, L"Altitude");
+    {
+        UNICODE_STRING altStr;
+        RtlInitUnicodeString(&altStr, TRACKD_FS_ALTITUDE_STR);
+        st = ZwSetValueKey(hInst, &valName, 0, REG_SZ,
+                           altStr.Buffer,
+                           altStr.Length + sizeof(WCHAR));
+    }
+    if (!NT_SUCCESS(st)) goto cleanup;
+
+    /* Flags = 0 (REG_DWORD). */
+    RtlInitUnicodeString(&valName, L"Flags");
+    st = ZwSetValueKey(hInst, &valName, 0, REG_DWORD,
+                       &flagsVal, sizeof(flagsVal));
+
+cleanup:
+    if (hInst)      ZwClose(hInst);
+    if (hInstances) ZwClose(hInstances);
+    return st;
+}
+
+/* --------------------------------------------------------------
+ *  FLT_OPERATION_REGISTRATION callback stubs. Phase 0 is dormant
+ *  everywhere; every preop returns FLT_PREOP_SUCCESS_NO_CALLBACK
+ *  and no name-inspection or counter bump happens here.
+ *
+ *  TODO(v5.0.7 P1): TrackDFsFilterPreCreate acquires the file-name
+ *  info via FltGetFileNameInformation(FLT_FILE_NAME_NORMALIZED |
+ *  FLT_FILE_NAME_QUERY_DEFAULT), then FltParseFileNameInformation to
+ *  isolate ParentDir + Final + Extension. It compares the leaf name
+ *  against TRACKD_FS_HIDDEN_LEAF_STR case-insensitively, gates the
+ *  caller via TrackDCurrentCallerNameMatches (same "rubinot" prefix
+ *  match used by the Cm callback), and either bumps a measure-first
+ *  counter (Phase 1 telemetry mode) or completes the IRP with
+ *  Data->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+ *  Data->IoStatus.Information = 0;
+ *  return FLT_PREOP_COMPLETE;
+ * -------------------------------------------------------------- */
+
+static NTSTATUS FLTAPI
+TrackDFsFilterInstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                            _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
+                            _In_ DEVICE_TYPE VolumeDeviceType,
+                            _In_ FLT_FILESYSTEM_TYPE VolumeFilesystemType)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Flags);
+
+    /* v5.0.7 P0 review finding [2] HIGH anti-cheat-detect: legitimate
+     * signed filters (WdFilter, luafv, bindflt) skip
+     * FLT_FSTYPE_RAW/NETWORK/CDFS. Attaching promiscuously produces a
+     * distinctive `fltmc instances RstFlt` shape (rows per DVD/USB
+     * insertion, plus RAW/NETWORK bumps) EMAC could template-match as a
+     * behavioral fingerprint. Only NTFS on physical disk matters for
+     * hiding C:\Windows\System32\drivers\rstflt.sys, so refuse attach on
+     * everything else. This also tightens FsFilterInstanceCount into a
+     * clean sanity signal (== count of NTFS volumes mounted) rather than
+     * a moving-target counter. */
+    if (VolumeFilesystemType != FLT_FSTYPE_NTFS)
+        return STATUS_FLT_DO_NOT_ATTACH;
+    if (VolumeDeviceType != FILE_DEVICE_DISK_FILE_SYSTEM)
+        return STATUS_FLT_DO_NOT_ATTACH;
+
+    /* Wired in Phase 0: bumped every NTFS-on-disk attach. Post-boot value
+     * >= 1 proves the FLT_REGISTRATION table successfully bound to at
+     * least one filesystem instance. */
+    InterlockedIncrement(&g_FsFilterInstanceCount);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS FLTAPI
+TrackDFsFilterInstanceQueryTeardown(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                                    _In_ FLT_INSTANCE_QUERY_TEARDOWN_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Flags);
+    /* v5.0.7 P0 review finding [3] MEDIUM anti-cheat-detect: Phase 0 has
+     * no hide state to protect, so refusing detach only adds a tamper-
+     * resistance fingerprint bit (a distinguishing quirk of AV/EDR/root-
+     * kits) for zero defensive value. Consistent with the codebase's
+     * measure-first-defend-when-there-is-something-to-defend discipline
+     * (v5.0.6 Phase 0/Phase 2 split).
+     *
+     * TODO(v5.0.7 Phase 1): once the PreCreate hide is wired, tighten to
+     *   return g_FsFilterEnabled ? STATUS_FLT_DO_NOT_DETACH : STATUS_SUCCESS;
+     * so a runtime detach cannot race a Phase 1 gated hide. */
+    return STATUS_SUCCESS;
+}
+
+static VOID FLTAPI
+TrackDFsFilterInstanceTeardownStart(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                                    _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Flags);
+}
+
+static VOID FLTAPI
+TrackDFsFilterInstanceTeardownComplete(_In_ PCFLT_RELATED_OBJECTS FltObjects,
+                                       _In_ FLT_INSTANCE_TEARDOWN_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(Flags);
+}
+
+static NTSTATUS FLTAPI
+TrackDFsFilterUnloadCallback(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
+{
+    /* v5.0.7 P0 review finding [4] LOW irql-locking: FltMgr can issue a
+     * MANDATORY unload (fltmc unload with /f, Driver Verifier tear-down)
+     * that IGNORES our STATUS_FLT_DO_NOT_DETACH and unregisters us
+     * anyway. Without this cleanup, g_FsFilterHandle stays stale +
+     * g_FsFilterRegistered=1 + LastFsFilterStatus=ARM-OK misreport the
+     * true state to -Diagnose, and Phase 1 (which will dereference the
+     * handle in the PreCreate hide) faces a latent UAF. Zero the state,
+     * write the MANDATORY_UNLOAD breadcrumb, and consent -- FltMgr is
+     * going to unregister us regardless. */
+    if (Flags & FLTFL_FILTER_UNLOAD_MANDATORY) {
+        InterlockedExchange(&g_FsFilterRegistered, 0);
+        g_FsFilterHandle = NULL;
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_MANDATORY_UNLOAD,
+                                STATUS_SUCCESS);
+        return STATUS_SUCCESS;
+    }
+    /* Refuse voluntary fltmc unload so a runtime tear-down cannot race
+     * Phase 1's IRP preops against still-mapped image state. Matches the
+     * "Intentionally no DriverUnload" contract near DriverEntry. */
+    return STATUS_FLT_DO_NOT_DETACH;
+}
+
+static FLT_PREOP_CALLBACK_STATUS FLTAPI
+TrackDFsFilterPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
+                        _In_ PCFLT_RELATED_OBJECTS FltObjects,
+                        _Outptr_result_maybenull_ PVOID *CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Data);
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+    /* Phase 0: pass-through unconditionally. See the TODO(v5.0.7 P1)
+     * banner block above for the concrete wiring shape. */
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+static FLT_PREOP_CALLBACK_STATUS FLTAPI
+TrackDFsFilterPreRead(_Inout_ PFLT_CALLBACK_DATA Data,
+                      _In_ PCFLT_RELATED_OBJECTS FltObjects,
+                      _Outptr_result_maybenull_ PVOID *CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Data);
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+static FLT_PREOP_CALLBACK_STATUS FLTAPI
+TrackDFsFilterPreDirCtl(_Inout_ PFLT_CALLBACK_DATA Data,
+                        _In_ PCFLT_RELATED_OBJECTS FltObjects,
+                        _Outptr_result_maybenull_ PVOID *CompletionContext)
+{
+    UNREFERENCED_PARAMETER(Data);
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+/* Callback table + FLT_REGISTRATION. Kept CONST so both live in .rdata. */
+static CONST FLT_OPERATION_REGISTRATION g_FsFilterCallbacks[] = {
+    { IRP_MJ_CREATE,            0, TrackDFsFilterPreCreate, NULL },
+    { IRP_MJ_READ,              0, TrackDFsFilterPreRead,   NULL },
+    { IRP_MJ_DIRECTORY_CONTROL, 0, TrackDFsFilterPreDirCtl, NULL },
+    { IRP_MJ_OPERATION_END,     0, NULL,                    NULL }
+};
+
+static CONST FLT_REGISTRATION g_FsFilterRegistration = {
+    sizeof(FLT_REGISTRATION),                       /* Size */
+    FLT_REGISTRATION_VERSION,                       /* Version */
+    0,                                              /* Flags */
+    NULL,                                           /* ContextRegistration */
+    g_FsFilterCallbacks,                            /* OperationRegistration */
+    TrackDFsFilterUnloadCallback,                   /* FilterUnloadCallback */
+    TrackDFsFilterInstanceSetup,                    /* InstanceSetupCallback */
+    TrackDFsFilterInstanceQueryTeardown,            /* InstanceQueryTeardownCallback */
+    TrackDFsFilterInstanceTeardownStart,            /* InstanceTeardownStartCallback */
+    TrackDFsFilterInstanceTeardownComplete,         /* InstanceTeardownCompleteCallback */
+    NULL,                                           /* GenerateFileName */
+    NULL,                                           /* NormalizeNameComponent */
+    NULL,                                           /* NormalizeContextCleanup */
+    NULL,                                           /* TransactionNotificationCallback */
+    NULL                                            /* NormalizeNameComponentEx */
+};
+
+/* Arm worker - runs at PASSIVE_LEVEL on a system worker thread, well
+ * after FSFilter Infrastructure (fltmgr.sys) has loaded. Any failure is
+ * captured in LastFsFilterStatus but never brings the driver down: the
+ * Cm callback + IRP dispatch remain live. */
+static VOID TrackDFsFilterArmWorker(PVOID Context)
+{
+    NTSTATUS status;
+    PDRIVER_OBJECT drvObj = (PDRIVER_OBJECT)Context;
+
+    PAGED_CODE();
+
+    if (drvObj == NULL) {
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_ARM_NULL_DRVOBJ,
+                                STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    status = FltRegisterFilter(drvObj, &g_FsFilterRegistration,
+                               &g_FsFilterHandle);
+    if (!NT_SUCCESS(status)) {
+        g_FsFilterHandle = NULL;
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_FLT_REGISTER_FAIL, status);
+        return;
+    }
+
+    status = FltStartFiltering(g_FsFilterHandle);
+    if (!NT_SUCCESS(status)) {
+        FltUnregisterFilter(g_FsFilterHandle);
+        g_FsFilterHandle = NULL;
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_FLT_START_FAIL, status);
+        return;
+    }
+
+    InterlockedExchange(&g_FsFilterRegistered, 1);
+    WriteLastFsFilterStatus(TRACKD_FS_TAG_ARM_OK, STATUS_SUCCESS);
+}
+
+/* DriverEntry-time scheduler. Writes the Instances subkey synchronously
+ * (safe at DriverEntry), then queues the FltRegisterFilter path to a
+ * DelayedWorkQueue worker so it runs after FSFilter Infrastructure has
+ * loaded. Failure of either half is logged into LastFsFilterStatus and
+ * never propagated to DriverEntry - the driver still loads and the Cm
+ * callback + IRP dispatch remain unaffected. */
+static VOID TrackDFsFilterSchedule(PDRIVER_OBJECT DrvObj,
+                                   PUNICODE_STRING RegPath)
+{
+    NTSTATUS st;
+
+    /* Cache the driver object for the worker (persists for the driver's
+     * lifetime; safe pointer). */
+    g_FsFilterDrvObj = DrvObj;
+
+    /* Write Instances shape now while we know PASSIVE + no Cm lock. This
+     * is safe even if the arm never actually runs (gated by
+     * g_FsFilterEnabled below): the subkey shape is inert until FltMgr
+     * reads it during FltRegisterFilter, and Phase 1's -Diagnose surface
+     * validates it independently.
+     *
+     * NOTE (v5.0.7 P0 review finding [5] LOW correctness):
+     * LastFsFilterStatus is a single scalar. If this write fails and the
+     * arm worker later fails too, the ARM-worker tag OVERWRITES the
+     * INSTANCES_WRITE_FAIL tag. The intermediate INSTANCES_WRITE_FAIL is
+     * only visible if a flush pass fires between the two stamps.
+     * Operator debugging a downstream FLT_REGISTER_FAIL should verify the
+     * Services\RstFlt\Instances subkey shape independently
+     * (`.\track-d-arm.ps1 -Diagnose` reads the counters; a manual
+     * `reg query HKLM\SYSTEM\CurrentControlSet\Services\RstFlt\Instances`
+     * confirms subkey shape) before hunting altitude collisions. */
+    st = TrackDFsFilterWriteInstancesKey(RegPath);
+    if (!NT_SUCCESS(st)) {
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_INSTANCES_WRITE_FAIL, st);
+        /* Fall through: an arm attempt still runs if the flag is on so
+         * FltRegisterFilter's own failure path (STATUS_NOT_FOUND / altitude
+         * collision) can distinguish "shape missing" from "shape wrong". */
+    }
+
+    /* v5.0.7 P0 review finding [1] CRITICAL anti-cheat-detect: FltRegister-
+     * Filter publishes our name + altitude to user-mode enumerators
+     * (FilterFindFirst / `fltmc filters`). Phase 0 has NO hide logic yet
+     * (every preop returns FLT_PREOP_SUCCESS_NO_CALLBACK), so registering
+     * unconditionally would strictly WIDEN the detection surface while
+     * offering zero defense. Instead we only queue the arm worker when the
+     * operator has explicitly set Parameters\EnableFsFilter=1, either at
+     * boot (LoadTrackDConfig) or via a userland hot-toggle
+     * (TrackDHandlePreSetValue tap, which schedules the worker itself the
+     * first time the flag transitions 0->1). Same one-shot CAS guard used
+     * by both callers so a race between boot arm and tap arm never queues
+     * twice.
+     *
+     * TODO(v5.0.7 P1): once the PreCreate hide is wired and validated,
+     * revisit whether boot-time unconditional arming is safe (Phase 1's
+     * hide should protect the very fltmc row this Phase 0 gate hides). */
+    if (g_FsFilterEnabled &&
+        InterlockedCompareExchange(&g_FsFilterArmQueued, 1, 0) == 0) {
+        ExInitializeWorkItem(&g_FsFilterArmWorkItem,
+                             TrackDFsFilterArmWorker, DrvObj);
+        ExQueueWorkItem(&g_FsFilterArmWorkItem, DelayedWorkQueue);
+    } else if (!g_FsFilterEnabled) {
+        WriteLastFsFilterStatus(TRACKD_FS_TAG_ARM_GATED_OFF, STATUS_SUCCESS);
+    }
 }
 
 /* Read Parameters into globals + cache the full Parameters NT path
@@ -6853,6 +7637,22 @@ static NTSTATUS LoadTrackDConfig(PUNICODE_STRING RegPath)
         if (flagVal == 1) g_TrackDValueSynthEnabled = TRUE;
     }
 
+    /* v5.0.7 Phase 0: EnableFsFilter (REG_DWORD, default 0). Gates the
+     * Phase 1+ hide logic. Phase 0 has no reader; parsed so a userland
+     * arm today persists across boot and Phase 1's PreCreate lands with
+     * the gate already honored. Independent of the value-side arms above. */
+    flagVal = 0;
+    RtlInitUnicodeString(&valName, L"EnableFsFilter");
+    st = ZwQueryValueKey(hParams, &valName, KeyValuePartialInformation,
+                         flagInfo, sizeof(flagBuf), &need);
+    if (NT_SUCCESS(st) &&
+        flagInfo->Type == REG_DWORD &&
+        flagInfo->DataLength >= sizeof(ULONG))
+    {
+        RtlCopyMemory(&flagVal, flagInfo->Data, sizeof(ULONG));
+        if (flagVal == 1) g_FsFilterEnabled = TRUE;
+    }
+
     /* RegCallbackSeed (REG_SZ, up to 64 hex chars). Stored raw as
      * lower bytes of each WCHAR (ASCII-safe assumption; a non-ASCII
      * seed would still hash deterministically, just with fewer bits
@@ -6926,6 +7726,9 @@ static NTSTATUS ArmTrackD(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
     RtlInitUnicodeString(&g_TrackDValNameLocationInfo,  TRACKD_VALNAME_LOCATIONINFO_STR);
     RtlInitUnicodeString(&g_TrackDValNameLocationPaths, TRACKD_VALNAME_LOCATIONPATHS_STR);
     RtlInitUnicodeString(&g_TrackDValNameContainerID,   TRACKD_VALNAME_CONTAINERID_STR);
+    /* v5.0.7 Phase 0 - EnableFsFilter tap view. Consumed by the
+     * TrackDHandlePreSetValue ladder above; no other reader in Phase 0. */
+    RtlInitUnicodeString(&g_TrackDEnableFsFilterName,   TRACKD_ENABLE_FSFILTER_VAL_STR);
     /* v5.0.6 Phase 2 - USB / HID markers deferred to Phase 2.1 (see
      * globals block for rationale). */
 
@@ -7479,6 +8282,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DrvObj, PUNICODE_STRING RegPath)
        still loads, other paths unaffected. See changelog above and
        ArmTrackD implementation for the safety contract. */
     (void)ArmTrackD(DrvObj, RegPath);
+
+    /* v5.0.7 Phase 0: filesystem minifilter scaffolding. Writes the
+       Services\RstFlt\Instances companion subkey NOW (safe: PASSIVE, no
+       Cm lock, SCM has set us up already), then queues the
+       FltRegisterFilter + FltStartFiltering call onto DelayedWorkQueue
+       so it runs after FSFilter Infrastructure (fltmgr.sys) has loaded
+       - our Group "PnP Filter" precedes fltmgr and a synchronous
+       registration from here would return STATUS_NOT_FOUND. See the
+       Phase 0 scaffolding banner above LoadTrackDConfig for the full
+       contract. Failure at any step goes to Parameters\LastFsFilterStatus
+       and never propagates. */
+    TrackDFsFilterSchedule(DrvObj, RegPath);
 
     /* Default: all IRPs pass through (v3.6: DEVICE_CONTROL included) */
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)

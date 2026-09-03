@@ -386,6 +386,53 @@ function Read-CallbackStatus {
             }
         }
     }
+
+    # ---- v5.0.7 Phase 0: filesystem minifilter scaffolding block ----
+    # LastFsFilterStatus decoded with its own tag table (independent from
+    # tagTable which decodes LastCallbackStatus).
+    $fsTagTable = @{
+        0x00 = '(unset)'
+        0x01 = 'INSTANCES-WRITE-FAIL'
+        0x02 = 'FLT-REGISTER-FAIL'
+        0x03 = 'FLT-START-FAIL'
+        0x04 = 'ARM-OK'
+        0x05 = 'ARM-NULL-DRVOBJ'
+        0x06 = 'MANDATORY-UNLOAD'
+        0x07 = 'ARM-GATED-OFF'
+    }
+    $fsRaw = (Get-ItemProperty -Path $rstflt -Name 'LastFsFilterStatus' `
+                              -ErrorAction SilentlyContinue).LastFsFilterStatus
+    if ($null -ne $fsRaw) {
+        $fsTag  = [int](([uint32]$fsRaw -shr 24) -band 0xFF)
+        $fsSt   = [int]([uint32]$fsRaw -band 0x00FFFFFF)
+        $fsName = if ($fsTagTable.ContainsKey($fsTag)) { $fsTagTable[$fsTag] } else { ('unknown tag 0x{0:X2}' -f $fsTag) }
+        # 0x04 ARM-OK  = healthy Cyan; 0x00 unset / 0x07 ARM-GATED-OFF
+        # = benign DarkGray; 0x06 MANDATORY-UNLOAD = Yellow (unusual but
+        # not necessarily broken); everything else = Red (real fault).
+        $fsColor = if ($fsTag -eq 0x04)                    { 'Cyan' }
+                   elseif ($fsTag -eq 0x00 -or $fsTag -eq 0x07) { 'DarkGray' }
+                   elseif ($fsTag -eq 0x06)                { 'Yellow' }
+                   else                                    { 'Red' }
+        Write-Host ("  [*]    Track D LastFsFilterStatus: {0} (status=0x{1:X6})" -f $fsName, $fsSt) -ForegroundColor $fsColor
+    } else {
+        Write-Host "  [*]    Track D LastFsFilterStatus: ausente (driver pre-v5.0.7 ou arm-worker nao rodou)" -ForegroundColor DarkGray
+    }
+    $fsCountNames = @(
+        'EnableFsFilter','FsFilterRegistered','FsFilterInstanceCount',
+        'FsHideHitCount','FsFilterCreateHit','FsFilterReadHit','FsFilterDirCtlHit',
+        'FsGateMissCount','FsFilterAllocBail',
+        'FsProbe_InstallDir','FsProbe_System32Drivers','FsProbe_CatRoot'
+    )
+    foreach ($n in $fsCountNames) {
+        $v = (Get-ItemProperty -Path $rstflt -Name $n -ErrorAction SilentlyContinue).$n
+        if ($null -ne $v) {
+            $color = if ($n -eq 'FsFilterInstanceCount' -and $v -ge 1) { 'Cyan' }
+                     elseif ($n -eq 'FsFilterRegistered' -and $v -eq 1) { 'Cyan' }
+                     elseif ($v -gt 0) { 'Green' }
+                     else { 'DarkGray' }
+            Write-Host ("  [*]    Track D {0,-25}: {1}" -f $n, $v) -ForegroundColor $color
+        }
+    }
 }
 
 Read-CallbackStatus

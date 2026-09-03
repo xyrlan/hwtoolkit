@@ -80,6 +80,34 @@
       CallbackValHit_LocationPaths         REG_DWORD  idem LocationPaths
       CallbackValHit_ContainerID           REG_DWORD  idem ContainerID
 
+    v5.0.7 Phase 0 additions (filesystem minifilter scaffolding):
+      EnableFsFilter                       REG_DWORD  scaffolding gate do FltMgr minifilter
+                                                       (Phase 1 wira PreCreate/PreDirCtl hide
+                                                       de rstflt.sys). NAO tem reader em Phase 0
+                                                       - persistencia + hot-toggle so.
+      LastFsFilterStatus                   REG_DWORD  breadcrumb do arm-worker (tag<<24|status).
+                                                       Tags: 0x01 INSTANCES-WRITE-FAIL, 0x02
+                                                       FLT-REGISTER-FAIL, 0x03 FLT-START-FAIL,
+                                                       0x04 ARM-OK, 0x05 NULL-DRVOBJ.
+      FsFilterRegistered                   REG_DWORD  1 apos FltRegisterFilter+FltStartFiltering
+                                                       ambos NT_SUCCESS; 0 caso contrario.
+      FsFilterInstanceCount                REG_DWORD  volumes atacheados via InstanceSetup;
+                                                       Phase 0: >=1 comprova registration OK.
+      FsHideHitCount                       REG_DWORD  Phase 1: hides que landaram
+      FsFilterCreateHit                    REG_DWORD  Phase 1: PreCreate invocations em rstflt.sys
+      FsFilterReadHit                      REG_DWORD  Phase 1: PreRead invocations idem
+      FsFilterDirCtlHit                    REG_DWORD  Phase 1: PostDirCtl invocations que
+                                                       encontraram rstflt.sys na enum
+      FsGateMissCount                      REG_DWORD  Phase 1: opens rejeitados pelo image-name
+                                                       gate (nao-rubi tocou rstflt.sys)
+      FsFilterAllocBail                    REG_DWORD  Phase 1: FltGetFileNameInformation fail
+      FsProbe_InstallDir                   REG_DWORD  Phase 1 measure-first: probes em
+                                                       %ProgramFiles*%\RubinOT*\rstflt.sys
+      FsProbe_System32Drivers              REG_DWORD  Phase 1 measure-first: probes em
+                                                       %SystemRoot%\System32\drivers\rstflt.sys
+      FsProbe_CatRoot                      REG_DWORD  Phase 1 measure-first: probes em
+                                                       %SystemRoot%\System32\CatRoot\* (signer)
+
     v5.0.4: RubinOtPid + -SetPid removidos. O gate agora e image-name
     inline (PsGetProcessImageFileName + _strnicmp "rubinot") em vez de
     PID array populado por PsSetCreateProcessNotifyRoutineEx.
@@ -116,6 +144,21 @@
 
       .\track-d-arm.ps1 -DisableSynth
         Escreve EnableValueSynth=0. Efeito imediato via tap.
+
+      .\track-d-arm.ps1 -EnableFsFilter
+        Escreve EnableFsFilter=1 (v5.0.7 Phase 0 scaffolding gate do
+        filesystem minifilter). Phase 0 NAO tem reader - todas as FLT
+        preop callbacks retornam FLT_PREOP_SUCCESS_NO_CALLBACK sem
+        consultar o flag. Serve para validar persistencia + hot-toggle
+        antes de Phase 1 wirar PreCreate/PostDirCtl. FltRegisterFilter e
+        FltStartFiltering ja rodam automaticamente (via workitem em
+        DelayedWorkQueue) no boot, independente deste flag; ver
+        LastFsFilterStatus + FsFilterInstanceCount pra confirmar arm.
+
+      .\track-d-arm.ps1 -DisableFsFilter
+        Escreve EnableFsFilter=0. Efeito imediato via tap; sem efeito
+        observavel em Phase 0. Nao desregistra o filtro (Phase 0 sempre
+        registra no boot; disarm real = Phase 1+).
 
       .\track-d-arm.ps1 -Diagnose
         Le todos os valores Parameters + decoded LastCallbackStatus/
@@ -155,6 +198,16 @@ param(
 
     [Parameter(ParameterSetName = 'DisableSynth')]
     [switch]$DisableSynth,
+
+    # v5.0.7 Phase 0: arm/disarm the filesystem-minifilter scaffolding
+    # gate. NO reader in Phase 0 - IRP preops return SUCCESS_NO_CALLBACK
+    # unconditionally. Kept as a first-class switch so the userland cycle
+    # validates persistence + hot-toggle end-to-end today.
+    [Parameter(ParameterSetName = 'EnableFsFilter')]
+    [switch]$EnableFsFilter,
+
+    [Parameter(ParameterSetName = 'DisableFsFilter')]
+    [switch]$DisableFsFilter,
 
     [Parameter(ParameterSetName = 'Diagnose')]
     [switch]$Diagnose
@@ -314,6 +367,25 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Info 'Efeito imediato. Outros gates (EnableRegCallback, EnableValueReadRewrite, EnableEdidValueRewrite) inalterados.'
     }
 
+    'EnableFsFilter' {
+        Write-Section 'Track D - Enable filesystem minifilter scaffolding (v5.0.7 Phase 0)'
+        Assert-DriverInstalled
+        Set-ItemProperty -Path $paramsKey -Name 'EnableFsFilter' -Value 1 -Type DWord -Force
+        Write-OK 'EnableFsFilter = 1 (v5.0.7 Phase 0 scaffolding gate armed)'
+        Write-Info 'Sem reader em Phase 0 - IRP preops retornam FLT_PREOP_SUCCESS_NO_CALLBACK.'
+        Write-Info 'Persistencia + hot-toggle validation so. Phase 1 vai ler o gate no PreCreate.'
+        Write-Info 'FltRegisterFilter roda automaticamente no boot via workitem; verifique com'
+        Write-Info '  -Diagnose (LastFsFilterStatus deve mostrar 04 ARM-OK, FsFilterInstanceCount >= 1).'
+    }
+
+    'DisableFsFilter' {
+        Write-Section 'Track D - Disable filesystem minifilter scaffolding (v5.0.7)'
+        Assert-DriverInstalled
+        Set-ItemProperty -Path $paramsKey -Name 'EnableFsFilter' -Value 0 -Type DWord -Force
+        Write-OK 'EnableFsFilter = 0'
+        Write-Info 'Efeito imediato via tap. Nao desregistra o filtro (isso e Phase 1+).'
+    }
+
     'Diagnose' {
         Write-Section 'Track D - Diagnose'
         Assert-DriverInstalled
@@ -389,6 +461,50 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Val 'CallbackValHit_LocationInfo'               '(0 = EMAC nao le LocationInformation em parents classificados)'
         Show-Val 'CallbackValHit_LocationPaths'              '(0 = EMAC nao le LocationPaths)'
         Show-Val 'CallbackValHit_ContainerID'                '(0 = EMAC nao le ContainerID)'
+
+        # v5.0.7 Phase 0: filesystem minifilter scaffolding. Phase 0 wires
+        # ONLY FsFilterRegistered + FsFilterInstanceCount + LastFsFilterStatus;
+        # the rest stay 0 until Phase 1 wires the PreCreate/PostDirCtl hide
+        # + counter bumps.
+        Write-Host ''
+        Write-Host '  --- v5.0.7 Phase 0 scaffolding (Fs* counters dormant except InstanceCount + arm status) ---' -ForegroundColor DarkGray
+        Show-Val 'EnableFsFilter'                            '(0 ou ausente = gate off; Phase 1 le no PreCreate)'
+        Show-Val 'FsFilterRegistered'                        '(1 se FltRegisterFilter+FltStartFiltering ambos OK; 0 caso contrario)'
+        Show-Val 'FsFilterInstanceCount'                     '(volumes atacheados; >=1 comprova bind ao filesystem stack)'
+        Show-Val 'FsHideHitCount'                            '(dormant em P0; Phase 1 wira)'
+        Show-Val 'FsFilterCreateHit'                         '(dormant em P0)'
+        Show-Val 'FsFilterReadHit'                           '(dormant em P0)'
+        Show-Val 'FsFilterDirCtlHit'                         '(dormant em P0)'
+        Show-Val 'FsGateMissCount'                           '(dormant em P0)'
+        Show-Val 'FsFilterAllocBail'                         '(dormant em P0)'
+        Show-Val 'FsProbe_InstallDir'                        '(dormant em P0; Phase 1 measure-first)'
+        Show-Val 'FsProbe_System32Drivers'                   '(dormant em P0; Phase 1 measure-first)'
+        Show-Val 'FsProbe_CatRoot'                           '(dormant em P0; Phase 1 measure-first)'
+
+        # LastFsFilterStatus decoded (v5.0.7 Phase 0 arm-worker breadcrumb).
+        # Own tag set independent of tagTable (which decodes Cm callback path).
+        $fsTagTable = @{
+            0x00 = '(unset)'
+            0x01 = 'INSTANCES-WRITE-FAIL (Zw* into Services\RstFlt\Instances)'
+            0x02 = 'FLT-REGISTER-FAIL (FltRegisterFilter)'
+            0x03 = 'FLT-START-FAIL (FltStartFiltering; filter unregistered)'
+            0x04 = 'ARM-OK'
+            0x05 = 'ARM-NULL-DRVOBJ (workitem lost the DrvObj pointer)'
+            0x06 = 'MANDATORY-UNLOAD (FltMgr forced tear-down; state cleared)'
+            0x07 = 'ARM-GATED-OFF (EnableFsFilter=0; arm intentionally skipped)'
+        }
+        $fsLast = $null
+        if ($vals -and $vals.PSObject.Properties.Name -contains 'LastFsFilterStatus') {
+            $fsLast = [uint32]$vals.LastFsFilterStatus
+        }
+        if ($null -eq $fsLast) {
+            Write-Host ('  {0,-22}: (ausente - driver pre-v5.0.7 ou arm-worker nao rodou)' -f 'LastFsFilterStatus') -ForegroundColor DarkGray
+        } else {
+            $fsTag = [int](($fsLast -shr 24) -band 0xFF)
+            $fsSt  = [int]($fsLast -band 0x00FFFFFF)
+            $fsLabel = if ($fsTagTable.ContainsKey($fsTag)) { $fsTagTable[$fsTag] } else { ('unknown tag 0x{0:X2}' -f $fsTag) }
+            Write-Host ('  {0,-22}: tag=0x{1:X2} status=0x{2:X6}  {3}' -f 'LastFsFilterStatus', $fsTag, $fsSt, $fsLabel) -ForegroundColor Cyan
+        }
 
         # LastCallbackStatus decoded (hot path breadcrumb)
         $last = $null
