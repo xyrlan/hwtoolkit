@@ -198,6 +198,44 @@ if /i "!MODE!"=="disarm" (
 echo.
 
 rem ----------------------------------------------------------
+rem  7. Identity spoof audit (v5.0.7 P0.5 preview, per Probe #1
+rem     audit of ban #6: CPU real leaked 16x because Level A CPU
+rem     spoof was not applied. Delegates to scripts\check-identity-
+rem     drift.ps1 which reads profile.json and compares live
+rem     registry / WMI / adapter state field-by-field so an operator
+rem     running --arm without Level A gets a clear fail-fast BEFORE
+rem     booting into a live test.)
+rem ----------------------------------------------------------
+echo [7/6] Identity spoof state ^(vs C:\ProgramData\.hwcfg\profile.json^)
+echo -------------------------------------
+
+set "IDENTITY_DRIFT=0"
+
+if not exist "%~dp0scripts\check-identity-drift.ps1" (
+    echo    scripts\check-identity-drift.ps1 ausente -- step [7/6] pulado
+    echo    ^(este step foi adicionado em v5.0.7 P0.5 preview; se voce
+    echo     esta rodando um checkout mais antigo, atualize o repo.^)
+    goto :identity_done
+)
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\check-identity-drift.ps1"
+set "IDENTITY_STATUS=%errorlevel%"
+
+if !IDENTITY_STATUS! neq 0 (
+    set "IDENTITY_DRIFT=1"
+)
+
+:identity_done
+echo.
+if /i "!MODE!"=="arm" (
+    if !IDENTITY_DRIFT! neq 0 (
+        echo    ^> MODO ARM + identity DRIFT: teste bare-metal seria desperdicio.
+        echo    ^> Nao vou marcar --arm como concluido. Corrija identity primeiro.
+    )
+)
+echo.
+
+rem ----------------------------------------------------------
 rem  Resumo + acao sugerida
 rem ----------------------------------------------------------
 echo ========================================================
